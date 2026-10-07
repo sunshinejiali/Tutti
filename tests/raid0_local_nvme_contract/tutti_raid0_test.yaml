@@ -1,4 +1,4 @@
-# RAID0 contract test: the four namespaces of config/local/tutti_daemon_raid0.yaml.
+# RAID0 contract test: the four namespaces of config/local/tutti_daemon_kv0.yaml.
 # Their daemon views all name one backing mount, so the resolver factory
 # builds the md RAID0 resolver.
 

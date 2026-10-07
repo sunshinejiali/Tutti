@@ -47,7 +47,7 @@ exec python -m vllm.entrypoints.openai.api_server \
             "io_stream": "auto",
             "preset": {
               "type": "local",
-              "daemon_config": "/data/home/ryeqiu/Tutti/config/local/tutti_daemon.yaml",
+              "daemon_config": "/data/home/ryeqiu/Tutti/config/local/tutti_daemon_kv0.yaml",
               "device_id": 0,
               "gpu_id": 0
             }

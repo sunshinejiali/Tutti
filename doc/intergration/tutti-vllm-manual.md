@@ -51,7 +51,7 @@ cmake --build --preset default --parallel 8
 # 2) tutti_daemon（controller bring-up + mount）：
 sudo env TUTTI_VERBOSE=1 nohup \
   /data/home/ryeqiu/Tutti/build/bin/tutti_daemon \
-  --config config/local/tutti_daemon.yaml \
+  --config config/local/tutti_daemon_kv0.yaml \
   > /data/home/ryeqiu/log/tutti_daemon.log 2>&1 &
 # 3) 验证：
 ls /dev/snvme* /dev/ssnvme*   # 设备节点出现

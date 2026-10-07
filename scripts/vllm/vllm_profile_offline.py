@@ -295,8 +295,11 @@ def main() -> int:
     )
     parser.add_argument(
         "--daemon-config",
-        default="/data/home/ryeqiu/Tutti/config/local/tutti_daemon.yaml",
-        help="与运行中的 tutti_daemon 同一份配置（RAID0 用 tutti_daemon_raid0.yaml）",
+        default=(
+            "/data/home/ryeqiu/Tutti/config/local/tutti_daemon_kv0.yaml,"
+            "/data/home/ryeqiu/Tutti/config/local/tutti_daemon_md0.yaml"
+        ),
+        help="运行中各 tutti_daemon 的配置，逗号分隔（合并为一份设备清单）",
     )
     parser.add_argument(
         "--device-groups",

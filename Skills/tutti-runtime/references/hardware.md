@@ -34,11 +34,12 @@ reporting 128 KiB, while the code under test was correct.
 Likewise `queue_depth` is fixed by the kernel module at install time; user space
 must read `ctrl->q_depth` (see invariant 5 in `SKILL.md`).
 
-## `config/local/tutti_daemon.yaml` is the single source of truth
+## `config/local/tutti_daemon_*.yaml` are the single source of truth
 
-It declares, per NVMe: `pci_addr`, `backing_mount_path`, `auto_mount`, and which
-accelerators may use it. This file — not a script, not an environment variable —
-is what must match the physical machine.
+One file per daemon (this host: `kv0` for NVMe 08/4b/57/63, `md0` for
+NVMe d2/df/86/c5). Each declares, per NVMe: `pci_addr`, `backing_mount_path`,
+`auto_mount`, and which accelerators may use it. These files — not a script,
+not an environment variable — are what must match the physical machine.
 
 Two failure shapes when it is wrong:
 
@@ -121,7 +122,7 @@ Do not skip ahead: each step's failure mode is only readable if the previous one
 is known-good.
 
 1. `lspci -tv` — record GPU↔NVMe switch pairing.
-2. Write `config/local/tutti_daemon.yaml` to match it.
+2. Write `config/local/tutti_daemon_<name>.yaml` (one per daemon) to match it.
 3. `scripts/tutti-env.sh bootstrap` (needs sudo for modules + daemon).
 4. `scripts/tutti-env.sh status` — **must be entirely green** before anything
    else. A single red line makes every later symptom ambiguous.

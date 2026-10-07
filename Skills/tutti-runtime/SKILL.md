@@ -73,8 +73,8 @@ and retry.
 
 **On a machine that is not already known-good, read
 `references/hardware.md` first.** It covers the PCIe/IOMMU prerequisites, why
-`config/local/tutti_daemon.yaml` is the single source of truth for hardware
-facts, the module↔user-space ABI handshake, and an ordered new-machine checklist.
+`config/local/tutti_daemon_*.yaml` (one per daemon) are the single source of
+truth for hardware facts, the module↔user-space ABI handshake, and an ordered new-machine checklist.
 A misconfigured host does not run slower — it fails, or destroys data.
 
 ## Safety — Ask Before Doing
@@ -160,7 +160,7 @@ tutti/                Python package (the importable one)
 tests/                C++ hardware contract tests (ctest)
 tests/python/         Python test suite (pytest)
 scripts/              tutti-env.sh + scripts/vllm/ benchmarks
-config/local/         tutti_daemon.yaml — single source of truth for hardware facts
+config/local/         tutti_daemon_{kv0,md0}.yaml — hardware facts, one per daemon
 Skills/               this skill
 ```
 

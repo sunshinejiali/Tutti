@@ -8,7 +8,7 @@
 // offsets, so they cross RAID0 chunk boundaries at every phase, and each
 // batch mixes two files (two RAID0 targets in one device table).
 //
-// Needs: tutti_daemon up with raid0_arrays (config/local/tutti_daemon_raid0.yaml),
+// Needs: tutti_daemon up with raid0_arrays (config/local/tutti_daemon_kv0.yaml),
 // the array mounted. Skips (77) when the directory is not on md RAID0.
 //
 //   tutti_raid0_local_nvme_contract_test [--directory DIR] [--config YAML]

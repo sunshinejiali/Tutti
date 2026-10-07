@@ -25,7 +25,7 @@ Markdown，不依赖任何特定 agent 的运行时。
 | 文件 | 作用 |
 |---|---|
 | `SKILL.md` | `scripts/tutti-env.sh` 单一入口、从零 clone 到跑 benchmark、特权/破坏性操作的确认边界、5 条不可违背的不变量、仓库布局、扩展新框架 |
-| `references/hardware.md` | 软硬件协同前置（PCIe switch 配对、IOMMU、MDTS 由硬件报告）、`tutti_daemon.yaml` 为硬件事实唯一来源、模块↔用户态 ABI 握手、7 类破坏性操作的后果、新机器上机清单 |
+| `references/hardware.md` | 软硬件协同前置（PCIe switch 配对、IOMMU、MDTS 由硬件报告）、`config/local/tutti_daemon_*.yaml` 为硬件事实唯一来源、模块↔用户态 ABI 握手、7 类破坏性操作的后果、新机器上机清单 |
 | `references/architecture.md` | 分层职责、单请求控制流、内存权威索引、KV 布局、对象池、惰性注册 |
 | `references/diagnostics.md` | 排障方法论 + 6 类真实故障的证据链与修法 |
 | `references/benchmarking.md` | 压测参数、容量/队列定容规则、运行隔离、从 nsys 导出量化 IO/compute 重叠 |

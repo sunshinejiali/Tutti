@@ -35,7 +35,9 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly TUTTI_ROOT="${TUTTI_ROOT:-$(cd -- "${SCRIPT_DIR}/.." && pwd)}"
 readonly TUTTI_BUILD="${TUTTI_BUILD:-${TUTTI_ROOT}/build}"
-readonly DAEMON_CONFIG="${TUTTI_DAEMON_CONFIG:-${TUTTI_ROOT}/config/local/tutti_daemon.yaml}"
+# 本机两个阵列各一个 daemon：这里默认管 kv0（NVMe 08/4b/57/63 -> /mnt/tutti_md0）；
+# md0（NVMe d2/df/86/c5 -> /mnt/nvme4）只用 scripts/tutti-md.sh md0 up|down 交接。
+readonly DAEMON_CONFIG="${TUTTI_DAEMON_CONFIG:-${TUTTI_ROOT}/config/local/tutti_daemon_kv0.yaml}"
 readonly PHOENIX_BUILD="${PHOENIX_BUILD:-/data/home/ryeqiu/phoenix/build}"
 readonly PHOENIX_KO="${PHOENIX_BUILD}/module/phoenixfs.ko"
 readonly LOG_DIR="${TUTTI_LOG_DIR:-${TUTTI_ROOT}/.local/log}"

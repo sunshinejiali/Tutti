@@ -1,13 +1,17 @@
 # ============================================================================
-# tutti_daemon #2 of 2 -- the host's md0 (NVMe 4-7), adopted in place.
+# tutti_daemon #2 of 2 -- the host's md0, adopted in place.
 #
-#   md0 = existing md RAID0 over NVMe 4-7 (NUMA 1, PCIe-local to GPU 4-7),
-#         XFS, 512K chunk, /mnt/nvme4 (models, datasets, docker data-root).
-#         The daemon re-assembles the SAME superblocks over /dev/snvme4-7n1;
-#         nothing on disk is rewritten. Array name "tutti1" is only the
-#         /dev/md/<name> node used while assembling; the kernel keeps md0.
+#   md0 = existing md RAID0 over NVMe d2/df/86/c5:00.0 (NUMA 1; each shares a
+#         PCIe switch with GPU 4-7), XFS, 512K chunk, /mnt/nvme4 (models,
+#         datasets, docker data-root). The daemon re-assembles the SAME
+#         superblocks over the members' snvme block devices; nothing on disk
+#         is rewritten. Array name "tutti1" is only the /dev/md/<name> node
+#         used while assembling; the kernel keeps md0.
 #
-# Do not start this file by hand: use scripts/tutti-md0.sh up|down|status. It
+# Devices are identified by pci_addr only (block/chrdev numbers depend on
+# bring-up order).
+#
+# Do not start this file by hand: use scripts/tutti-md.sh md0 up|down|status. It
 # hands md0 over from the kernel nvme driver, supervises this daemon, and on
 # any failure or daemon exit (including a crash) returns NVMe 4-7 to the
 # kernel nvme driver and md0 to its fstab mount.

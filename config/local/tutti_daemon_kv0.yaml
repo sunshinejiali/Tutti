@@ -1,17 +1,22 @@
 # ============================================================================
 # tutti_daemon #1 of 2 -- KV array only.
 #
-#   tutti0 = md RAID0 over NVMe 0-3 (NUMA 0, PCIe-local to GPU 0-3), ext4,
-#            128K chunk, mounted at /mnt/tutti_md0. Holds only Tutti KV pools.
+#   tutti0 = md RAID0 over NVMe 08/4b/57/63:00.0 (NUMA 0; each shares a PCIe
+#            switch with GPU 0-3), ext4, 128K chunk, mounted at /mnt/tutti_md0.
+#            Holds only Tutti KV pools.
 #
-# Runs independently of the md0 daemon (tutti_daemon_md0.yaml, NVMe 4-7):
-# restarting or rebuilding this array never touches /mnt/nvme4. Clients read
-# both files as one device inventory (preset daemon_config: [kv0, md0]);
-# device_id is unique across the two files.
+# Runs independently of the md0 daemon (tutti_daemon_md0.yaml, NVMe
+# d2/df/86/c5): restarting or rebuilding this array never touches /mnt/nvme4.
+# Clients read both files as one device inventory (preset daemon_config:
+# [kv0, md0]); device_id is unique across the two files.
 #
-# Start:  sudo ./build/bin/tutti_daemon --config config/local/tutti_daemon_kv0.yaml
-# Create the array once (destroys NVMe 0-3):
-#   scripts/tutti-raid0-create.sh tutti0 /mnt/tutti_md0 /dev/snvme0n1 ... /dev/snvme3n1
+# Devices are identified by pci_addr only. nvmeN / snvmeN / ssnvmeN numbers
+# depend on bring-up order and differ between them; never use them as identity.
+#
+# Start:  sudo scripts/tutti-md.sh kv0 up   (or tutti_daemon --config <this file>)
+# Create the array once (destroys the four members): find each member's
+# /dev/snvmeXn1 from /sys/bus/pci/devices/<pci_addr>/snvme/, then
+#   scripts/tutti-raid0-create.sh tutti0 /mnt/tutti_md0 <the four block devices>
 # ============================================================================
 
 grpc: {endpoint: '127.0.0.1:50051'}

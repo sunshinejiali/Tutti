@@ -180,14 +180,17 @@ test -x build/bin/tutti_daemon
 
 ## 6. 创建本机 YAML 配置
 
-本机配置应放在 `config/local/` 下。该目录中的 `*.yaml` 和 `*.yml` 已被
-Git 忽略，适合保存不同机器的 PCI、GPU 和挂载路径配置。
+本机配置放在 `config/local/` 下，随仓库提交，作为本机部署的参考：
+`tutti_daemon_kv0.yaml`（NVMe 08/4b/57/63 组成 md RAID0 tutti0，`/mnt/tutti_md0`，
+gRPC 50051）与 `tutti_daemon_md0.yaml`（NVMe d2/df/86/c5 上原有的 md0，
+`/mnt/nvme4`，gRPC 50052），每个阵列一个 daemon。其他机器请按自己的 PCI、GPU
+和挂载路径另写一份。
 
 可以从仓库模板复制：
 
 ```bash
 mkdir -p config/local
-cp config/local_nvme_config.yaml config/local/tutti_daemon.yaml
+cp config/local_nvme_config.yaml config/local/<name>.yaml
 ```
 
 然后删除不属于本机的设备项，并只编辑模板已有的 canonical 字段。不要新建历史
@@ -217,7 +220,7 @@ cp config/local_nvme_config.yaml config/local/tutti_daemon.yaml
 ```bash
 sudo env TUTTI_VERBOSE=1 \
   build/bin/tutti_daemon \
-  --config config/local/tutti_daemon.yaml
+  --config config/local/tutti_daemon_kv0.yaml
 ```
 
 启动过程需要 root 权限，因为 daemon 要执行 controller bind、创建字符设备、

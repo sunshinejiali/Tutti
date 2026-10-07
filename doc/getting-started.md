@@ -25,10 +25,13 @@ build/bin/tutti_daemon
 
 ```bash
 cmake --build --preset default --target insmod
-sudo build/bin/tutti_daemon --config config/local/tutti_daemon.yaml
+sudo build/bin/tutti_daemon --config config/local/tutti_daemon_kv0.yaml
 ```
 
 第二条命令使用本机 daemon YAML；配置方式见 [`tutti_daemon.md`](tutti_daemon.md)。
+本机每个 md RAID0 由独立 daemon 管理：kv0（KV 专用）可直接启动；md0（承载模型等
+主机数据）只用 `sudo scripts/tutti-md.sh md0 up|down` 交接，失败或 daemon 退出时
+自动退回内核 nvme 驱动和原阵列。
 
 ## 测试
 
