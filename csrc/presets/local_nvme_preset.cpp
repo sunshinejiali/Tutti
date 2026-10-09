@@ -18,6 +18,7 @@
 // Private headers — included here ONLY, never by consumer code.
 #include "csrc/data_paths/local_nvme/local_nvme_data_path.h"
 #include "csrc/data_paths/striped_local_nvme/striped_data_path.h"
+#include "csrc/data_paths/striped_local_nvme/striped_async_data_path.h"
 #include "csrc/resolvers/local_file/resolver.h"
 #include "csrc/resolvers/local_file/multi_mount_resolver.h"
 #include "csrc/resolvers/local_file/raid0_resolver.h"
@@ -145,11 +146,20 @@ RuntimeWithTelemetry make_striped_nvme_runtime(const StripedNvmePreset& p) {
                          d.pci_bdf});
     }
 
-    auto* dp = new snvme::StripedDataPath(
-        std::move(sdevs), (std::uint32_t)p.accel_id,
-        /*mdts_override=*/0, /*cq_poll_budget=*/0,
-        p.max_batch_entries, p.max_in_flight_operations,
-        p.prp_cache_capacity);
+    snvme::StripedDataPath* dp = nullptr;
+    if (snvme::StripedAsyncDataPath::requested()) {
+        dp = new snvme::StripedAsyncDataPath(
+            std::move(sdevs), (std::uint32_t)p.accel_id,
+            /*mdts_override=*/0, /*cq_poll_budget=*/0,
+            p.max_batch_entries, p.max_in_flight_operations,
+            p.prp_cache_capacity);
+    } else {
+        dp = new snvme::StripedDataPath(
+            std::move(sdevs), (std::uint32_t)p.accel_id,
+            /*mdts_override=*/0, /*cq_poll_budget=*/0,
+            p.max_batch_entries, p.max_in_flight_operations,
+            p.prp_cache_capacity);
+    }
 
     // All devices behind one mount: that mount is an md RAID0 over them, and
     // one resolver serves the array (payloads carry the md layout).

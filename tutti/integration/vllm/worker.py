@@ -901,7 +901,15 @@ class WorkerImpl:
                     raise RuntimeError(
                         "read plan compute event bridge is unavailable"
                     )
-                wait_compute(fence_event)
+                # 异步完成模式：fence 只表示"已发出"，计算流改等本层 IO 完成。
+                enqueue_wait = getattr(store, "enqueue_compute_wait", None)
+                layer_completion = (
+                    getattr(self._read_plan, "handles", {}).get(callback)
+                    if direct else None
+                )
+                if not (callable(enqueue_wait) and layer_completion is not None
+                        and enqueue_wait([layer_completion])):
+                    wait_compute(fence_event)
                 self._load_waited_callbacks.add(callback)
             except LoadGateError as exc:
                 self._mark_load_failure(exc)

@@ -1803,16 +1803,15 @@ SubmitOutcome StripedDataPath::submit_impl_(const DataPathRequest* requests,
     // Keep the legacy exact marker as a nested range for existing report
     // queries; the outer range carries the direction and color.
     nvtxRangePushA("tutti.striped_nvme.io_kernel");
-    cudaError_t launch_err = launch_fused_submit(
+    cudaError_t launch_err = static_cast<cudaError_t>(launch_io_kernel_(
         d_entries, d_status,
         reinterpret_cast<const DeviceTargetHandle* const*>(lease.d_dev_table),
-        total_entries, total_dev_table, cq_poll_budget_,
-        0,
+        total_entries, total_dev_table,
         (io_timing_enabled_ && total_entries <= timing_capacity_entries_)
             ? d_timing_ : nullptr,
         ctx.stream,
-        pool_workers_,
-        lease.d_task_counter);
+        lease.d_task_counter,
+        lease.slot_index));
     nvtxRangePop();
     nvtxRangePop();
     if (launch_err != cudaSuccess) {
@@ -1891,6 +1890,20 @@ SubmitOutcome StripedDataPath::submit_impl_(const DataPathRequest* requests,
     }
     outcome.op = detail::SpiIdentityMint::mint<detail::DataPathOpTag>(op_token, 1);
     return outcome;
+}
+
+int StripedDataPath::launch_io_kernel_(const StripedDeviceSubmitEntry* d_entries,
+                                       EntryCompletionStatus* d_status,
+                                       const DeviceTargetHandle* const* d_dev_table,
+                                       std::uint32_t entry_count,
+                                       std::uint32_t dev_table_rows,
+                                       unsigned long long* d_timing,
+                                       void* stream,
+                                       unsigned int* d_task_counter,
+                                       std::uint32_t /*arena_slot*/) {
+    return static_cast<int>(launch_fused_submit(
+        d_entries, d_status, d_dev_table, entry_count, dev_table_rows,
+        cq_poll_budget_, 0, d_timing, stream, pool_workers_, d_task_counter));
 }
 
 // =========================================================================

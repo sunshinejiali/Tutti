@@ -10,6 +10,7 @@
 
 add_library(tutti_striped_local_nvme_datapath
     striped_data_path.cpp
+    striped_async_data_path.cpp
     striped_arena.cpp
     fused_submit_kernel.cu
 )

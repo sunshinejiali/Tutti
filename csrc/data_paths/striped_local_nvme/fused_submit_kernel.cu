@@ -50,3 +50,7 @@ cudaError_t launch_fused_submit(
 }
 
 } // namespace tutti::data_paths::striped_local_nvme
+
+// Submit-only and wait kernels of StripedAsyncDataPath (same translation unit
+// so the kernels defined in fused_submit_kernel.cuh exist once).
+#include "csrc/data_paths/striped_local_nvme/async_submit_kernel_impl.cuh"

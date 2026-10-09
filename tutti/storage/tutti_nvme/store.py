@@ -42,6 +42,10 @@ from tutti.index.chunk_index import decode_io_key, derive_io_key
 #: 运行日志（池归属校验等部署问题的非静默说明）。
 _LOG = logging.getLogger(__name__)
 
+# 提交与回收分离（doc/design/async-nvme-completion.md）：与 C++ 侧
+# StripedAsyncDataPath::requested() 读同一个开关。
+_ASYNC_COMPLETION = os.environ.get("TUTTI_ASYNC_COMPLETION") == "1"
+
 # runtime 在"这一批太宽"时给出的 RESOURCE_EXHAUSTED 文案（见 datapath 的
 # max_batch_entries / max_batch_bytes 检查）。这类拒绝可以用拆批解决，不该
 # 升级成 worker 崩溃：一批多宽由本步要搬多少 chunk 决定（长 prompt + 高并发
@@ -1827,6 +1831,31 @@ class TuttiKVStore:
         import torch
 
         torch.cuda.current_stream().wait_event(event)
+
+    def enqueue_compute_wait(self, completions) -> bool:
+        """异步完成模式（TUTTI_ASYNC_COMPLETION=1）：在当前计算流上排一个
+        "等这些 completion 的 IO 完成"的等待（runtime.enqueue_wait）。
+
+        该模式下提交 kernel 发完命令就退出，read/write fence 只表示"已发出"，
+        计算流必须改等这个；完成队列由插在计算流上的等待 kernel 回收，不与
+        GEMM 同时驻留（doc/design/async-nvme-completion.md）。非异步模式返回
+        False，调用方照旧用 fence。
+        """
+        if not _ASYNC_COMPLETION:
+            return False
+        handles = []
+        for completion in completions:
+            if getattr(completion, "_settled", False):
+                continue
+            handles.extend(getattr(completion, "_handles", ()) or ())
+        if not handles:
+            return True
+        import torch
+
+        stream = torch.cuda.current_stream().cuda_stream
+        with nvtx_range(f"tutti.direct.enqueue_wait|handles={len(handles)}"):
+            self._runtime.enqueue_wait(list(handles), int(stream))
+        return True
 
     def read_copy_stream_handle(self) -> int:
         """Return the controlled stream handle used for scatter release fences."""

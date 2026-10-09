@@ -13,6 +13,7 @@
 #if defined(TUTTI_DATA_PATH_FACTORY_HAS_LOCAL_NVME)
 #include "csrc/data_paths/local_nvme/local_nvme_data_path.h"
 #include "csrc/data_paths/striped_local_nvme/striped_data_path.h"
+#include "csrc/data_paths/striped_local_nvme/striped_async_data_path.h"
 #endif
 #include "csrc/resource/memory/memory_resource.h"
 #include "csrc/resource/nvme/nvme_resource.h"
@@ -212,14 +213,25 @@ Result<CreatedDataPath> create_striped_local_nvme(
     }
 
     CreatedDataPath result;
-    result.instance = std::make_unique<striped_local_nvme::StripedDataPath>(
-        std::move(descriptors),
-        static_cast<std::uint32_t>(view->slices.front().accel_id),
-        effective_mdts,
-        0,
-        max_batch_entries.value(),
-        max_in_flight.value(),
-        config.prp_cache_capacity);
+    if (striped_local_nvme::StripedAsyncDataPath::requested()) {
+        result.instance = std::make_unique<striped_local_nvme::StripedAsyncDataPath>(
+            std::move(descriptors),
+            static_cast<std::uint32_t>(view->slices.front().accel_id),
+            effective_mdts,
+            0,
+            max_batch_entries.value(),
+            max_in_flight.value(),
+            config.prp_cache_capacity);
+    } else {
+        result.instance = std::make_unique<striped_local_nvme::StripedDataPath>(
+            std::move(descriptors),
+            static_cast<std::uint32_t>(view->slices.front().accel_id),
+            effective_mdts,
+            0,
+            max_batch_entries.value(),
+            max_in_flight.value(),
+            config.prp_cache_capacity);
+    }
     result.initialize_config = DataPathConfig{"striped-local-nvme"};
     return Result<CreatedDataPath>::Success(std::move(result));
 }

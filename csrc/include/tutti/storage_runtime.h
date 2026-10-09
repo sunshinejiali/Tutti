@@ -18,6 +18,7 @@
 #include <tutti/accelerator_device_guard.h>
 #include <tutti/io_types.h>
 #include <tutti/memory_types.h>
+#include <tutti/spi/async_completion.h>
 #include <tutti/spi/data_path.h>
 #include <tutti/spi/storage_target_resolver.h>
 
@@ -1131,6 +1132,43 @@ public:
                 StatusCode::INTERNAL, "terminal wait returned no result"));
         }
         return Result<IoResult>::Success(std::move(outcome.result.value()));
+    }
+
+    // Enqueue on `stream` a wait for the IO behind `handles`: work enqueued
+    // on `stream` afterwards sees that IO finished. Only DataPaths with
+    // tutti::AsyncCompletion need it (their submit returns once commands are
+    // issued); for the others it is a no-op, as their submit kernel already
+    // finishes the IO. Terminal handles are skipped. See
+    // doc/design/async-nvme-completion.md.
+    Status enqueue_wait(const IoHandle* handles, std::size_t count, void* stream) {
+        std::lock_guard<std::mutex> lock(registry_mutex_);
+        std::vector<std::pair<DataPath*, std::vector<DataPathOp>>> groups;
+        for (std::size_t i = 0; i < count; ++i) {
+            if (!validate_io_(handles[i])) {
+                return Status(StatusCode::NOT_FOUND, "enqueue_wait: invalid IO handle");
+            }
+            const IoEntry& entry = io_entries_[handles[i].slot_];
+            if (entry.terminal) continue;
+            for (const auto& sub_op : entry.data_path_operations) {
+                auto it = std::find_if(groups.begin(), groups.end(),
+                                       [&](const auto& g) { return g.first == sub_op.data_path; });
+                if (it == groups.end()) {
+                    groups.emplace_back(sub_op.data_path, std::vector<DataPathOp>{});
+                    it = std::prev(groups.end());
+                }
+                it->second.push_back(sub_op.op);
+            }
+        }
+        for (auto& [path, ops] : groups) {
+            auto* async = dynamic_cast<AsyncCompletion*>(path);
+            if (async == nullptr) continue;
+            std::mutex* gate = progress_gate_for_(path);
+            std::unique_lock<std::mutex> gate_lock;
+            if (gate != nullptr) gate_lock = std::unique_lock<std::mutex>(*gate);
+            Status status = async->enqueue_wait(ops.data(), ops.size(), stream);
+            if (!status.ok()) return status;
+        }
+        return Status::Ok();
     }
 
     Status release_io(const IoHandle& handle) {

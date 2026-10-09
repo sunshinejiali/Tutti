@@ -72,3 +72,26 @@ target_compile_options(tutti_nvme_segment_bw_probe PRIVATE
 )
 
 message(STATUS "Configured tutti_nvme_bw_probe (single-drive bandwidth probe)")
+
+# Submit/drain split (doc/design/async-nvme-completion.md): correctness and
+# GEMM-overlap benchmark. Mode from TUTTI_ASYNC_COMPLETION (1 = submit-only).
+find_package(CUDAToolkit REQUIRED)
+add_executable(tutti_async_completion_bench
+    async_completion_bench.cpp
+    async_completion_bench_kernels.cu
+)
+target_link_libraries(tutti_async_completion_bench PRIVATE
+    tutti_runtime
+    CUDA::cublas
+    ${TUTTI_ACCEL_RUNTIME_LIBS}
+)
+set_target_properties(tutti_async_completion_bench PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+    LINKER_LANGUAGE CUDA
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+    CUDA_STANDARD 17
+    CUDA_STANDARD_REQUIRED ON
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)

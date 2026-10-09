@@ -1932,6 +1932,14 @@ class KVEngine:
         self._inflight = []
         first_error = None
         drain_started_ns = time.perf_counter_ns()
+        # 异步完成模式：步末写（及尚未被等待的读）的完成要有人回收——在计算
+        # 流末尾排一个等待（全部计算之后才执行），主机下面再等结果。
+        enqueue_wait = getattr(self._store, "enqueue_compute_wait", None)
+        if self.direct and inflight and callable(enqueue_wait):
+            try:
+                enqueue_wait(inflight)
+            except Exception as exc:  # 回收兜底仍在 DataPath 内部
+                _LOG.warning("DIRECT_ENQUEUE_WAIT_FAILED reason=%s", exc)
         context = (
             nvtx_range(
                 f"tutti.direct.completion_drain|completions={len(inflight)}"

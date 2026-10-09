@@ -202,7 +202,23 @@ public:
     bool test_copy_entry_dev_idx(DataPathOp op,
                                  std::vector<std::uint32_t>& out) const;
 
-private:
+// protected (not private): StripedAsyncDataPath (striped_async_data_path.h)
+// derives from this class and reuses its state; nothing here changes for the
+// synchronous path.
+protected:
+    // The IO kernel launch inside submit_impl_. The synchronous path launches
+    // the fused submit-and-wait kernel; StripedAsyncDataPath overrides this
+    // to launch the submit-only kernel. Returns a cudaError_t.
+    virtual int launch_io_kernel_(const StripedDeviceSubmitEntry* d_entries,
+                                  EntryCompletionStatus* d_status,
+                                  const tutti::data_paths::local_nvme::DeviceTargetHandle* const* d_dev_table,
+                                  std::uint32_t entry_count,
+                                  std::uint32_t dev_table_rows,
+                                  unsigned long long* d_timing,
+                                  void* stream,
+                                  unsigned int* d_task_counter,
+                                  std::uint32_t arena_slot);
+
     // Public SPI entry points are thin device-guarded wrappers; impl methods
     // keep resource/error paths free of duplicated current-device plumbing.
     Status initialize_impl_(const DataPathConfig& config,
@@ -397,7 +413,7 @@ public:
     std::uint64_t test_prp_pool_leased_pages() const;
     std::uint64_t test_prp_pool_total_pages() const;
 
-private:
+protected:
     bool timeout_prp_retained_ = false;
 
     std::uint64_t next_target_token_ = 1;

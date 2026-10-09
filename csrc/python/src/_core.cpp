@@ -325,6 +325,23 @@ public:
         }
     }
 
+    // Enqueue on `stream` (cudaStream_t pointer) a wait for the IO behind
+    // `tickets`; no-op unless the DataPath completes asynchronously
+    // (TUTTI_ASYNC_COMPLETION=1). doc/design/async-nvme-completion.md.
+    void enqueue_wait(const std::vector<std::uint64_t>& tickets, py::object stream) {
+        if (stream.is_none()) throw py::value_error("enqueue_wait requires a stream");
+        std::vector<IoHandle> handles;
+        handles.reserve(tickets.size());
+        for (std::uint64_t t : tickets) handles.push_back(lookup_io_(t));
+        void* s = reinterpret_cast<void*>(checked_int<std::uintptr_t>(stream, "stream"));
+        tutti::Status status;
+        {
+            py::gil_scoped_release release;
+            status = rt_->enqueue_wait(handles.data(), handles.size(), s);
+        }
+        if (!status.ok()) throw_status("enqueue_wait failed", status);
+    }
+
     // ---- io lifecycle ----
     void release_io(std::uint64_t ticket) {
         const IoHandle handle = lookup_io_(ticket);
@@ -1233,6 +1250,8 @@ PYBIND11_MODULE(_core, m) {
         .def("submit", &PyRuntime::submit, py::arg("requests"),
              py::arg("accel_id"), py::arg("stream"),
              py::arg("execution") = "device")
+        .def("enqueue_wait", &PyRuntime::enqueue_wait, py::arg("io_handles"),
+             py::arg("stream"))
         .def("release_io", &PyRuntime::release_io, py::arg("io_handle"))
         .def("query_io", &PyRuntime::query_io, py::arg("io_handle"))
         .def("open_io_count", &PyRuntime::open_io_count)
