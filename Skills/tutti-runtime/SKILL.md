@@ -28,13 +28,29 @@ scripts/tutti-env.sh bootstrap     # 从零：build -> build-ext -> modules -> d
 scripts/tutti-env.sh build         # cmake configure + 全部 C++ 目标（含内核模块）
 scripts/tutti-env.sh build-ext     # 两个 Python 扩展
 scripts/tutti-env.sh modules load|unload|rebuild
-scripts/tutti-env.sh daemon start|stop|restart
-scripts/tutti-env.sh up|down       # 加载模块+起 daemon（不编译）/ 停 daemon
+scripts/tutti-env.sh daemon start|stop|restart|status [NAME...]
+scripts/tutti-env.sh up|down [NAME...]  # 加载模块+起 daemon（不编译）/ 停 daemon
 scripts/tutti-env.sh test py|cpp|all
 scripts/tutti-env.sh env           # eval 用的 PYTHONPATH 等
 ```
 
 Options: `--dry-run`, `--no-phoenix`, `--clean`, `-j N`.
+
+One daemon per disk group: `NAME` selects `config/local/tutti_daemon_<NAME>.yaml`;
+without `NAME`, every daemon config in `config/local/` is managed. A daemon
+whose config has `raid0_arrays` is always started and stopped through
+`scripts/tutti-md.sh`, which hands the array over from the kernel nvme/md
+driver and returns it on any failure or daemon exit — so `stop`/`down` on it
+gives the array back to Linux.
+
+Protection levels (`LEVEL` in `scripts/tutti-md.sh`; this host: `md0` =
+protected, `kv0` = normal). A protected array holds host data (models,
+datasets, docker): switching its drivers by hand needs `--confirm NAME`, and
+is refused — not waited out — while its mount, block devices or controllers
+are in use. At every level, `down` refuses while a Tutti client (e.g. a vLLM
+worker) still drives the controllers; releasing them under it can hang or
+crash the client and its GPU. Never send the daemon a second SIGTERM: it then
+releases the controllers even under a mounted filesystem.
 
 **Always run `status` first when something misbehaves.** It distinguishes missing
 build artifacts, an interpreter/ABI mismatch, unloaded modules, a dead daemon and

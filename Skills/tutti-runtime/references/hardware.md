@@ -55,7 +55,7 @@ kernel modules  →  tutti_daemon  →  workload
 ```
 
 The daemon is what creates `/dev/snvme*n1`, performs `auto_mount`, and serves
-gRPC on :50051. Mounting before the daemon runs fails because the block devices
+gRPC on the port in its config (kv0 :50051, md0 :50052). Mounting before the daemon runs fails because the block devices
 do not exist yet. `scripts/tutti-env.sh bootstrap` / `up` enforce this order;
 prefer them over hand-typed `insmod` + `mount`.
 

@@ -2,9 +2,8 @@
 #
 # Tutti 在线服务：Hy3-FP8 × TP8 × 两个 4 盘 RAID0（共 8 盘），与 8 卡离线基准同构。
 #
-# 与 vllm_smoke_server.sh 的区别：那份是 TP4 + 单盘 + 旧模块路径（adapter.connector，
-# 已随包重构失效），这份对齐 scripts/vllm/run/bench-8gpu-striped.sh 的几何与
-# 部署形态，可直接配合 vllm_online_longrun.py 做在线长跑。
+# 几何与部署形态对齐 scripts/vllm/run/bench-8gpu-striped.sh，可直接配合
+# vllm_online_longrun.py 做在线长跑。
 #
 # 用法：
 #   RUN_DIR=/mnt/nvme4/tutti-profile/online/<tag> \
