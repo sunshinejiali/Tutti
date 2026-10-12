@@ -19,7 +19,7 @@ Tutti (Italian for "all instruments together") makes NVMe SSDs a practical KV-ca
 - **GPU io_uring** — the batch-entry array and IO handle are shared CPU↔GPU submission state: one `cudaMemcpyAsync` hands a whole batch across, one kernel launch is the only boundary crossing, and completion rides the CUDA stream so submit and harvest stay decoupled. Each GPU thread resolves LBAs, writes SQEs, rings doorbells, and polls completions on its own. No CPU on the data path.
 - **Register once, then just look up** — PRP descriptors are pre-built at registration; one DMA mapping serves every NVMe controller. The I/O hot path is table lookup, not arithmetic.
 - **Millions of files within GPU reach** — ~200-byte GPU-resident file handles plus two-tier (GPU L1 / pinned-host L2) caching; FIEMAP is walked exactly once per file.
-- **Multi-device striping** — a striped target spans up to 4 NVMe SSDs in tensor-sized units (one K/V tensor lands whole on one drive, round-robin by tensor index); a single fused kernel submits to all drives. 25.0 GB/s on 4 drives.
+- **Multi-device KV storage** — chunks rotate over backing mounts and live in per-rank segment files; one fused submit drives the selected devices. A backing mount may instead be an md RAID0 array: the resolver translates its extents to member namespaces. Controller identity is verified by PCI address, never by device-number coincidence.
 - **Batch open** — `open_batch` resolves hundreds of per-layer files with a parallel FIEMAP pipeline and fail-closed per-item results: 500 files in ~10 ms vs ~50–115 ms serial (5–12×).
 - **snvme — one drive, kernel and GPU together** — the kernel NVMe stack and GPU-side `libnvm` are served by the same Linux kernel: the drive stays a mounted, POSIX-visible block device while GPU processes get their own user I/O queues. `tutti_daemon` mounts the NVMe driver once; every GPU process then leases queues on demand, and a crashed process has its queues reclaimed by the kernel's fd-close cascade — dynamic allocation, isolated failures.
 - **Beyond NVIDIA** — three-layer `cuda_like` framework (profile selector → vendor shim → kernel primitive macros): CUDA proven in production, MUSA/MACA build profiles in place; the kernel P2P layer is split into symmetric per-vendor backends (nvidia done, metax symmetric).
@@ -61,13 +61,36 @@ symmetric per-vendor backends (nvidia done, metax symmetric).
 
 **Environment requirements and module verification**
 
-- OS: Linux. The unified `snvme/` tree selects `5.4-tlinux4`, `5.10`, `5.15`, or `6.8` from the running kernel. See [`PORTING.md`](tutti/device_manager/nvme/kernel_modules/PORTING.md) for the matrix.
+- OS: Linux. The unified `snvme/` tree selects `5.4-tlinux4`, `5.10`, `5.15`, or `6.8` from the running kernel. See [`PORTING.md`](csrc/device_manager/nvme/kernel_modules/PORTING.md) for the matrix.
 - Accelerator: NVIDIA GPU + CUDA toolkit (`nvcc`); bare metal with IOMMU in passthrough mode.
 - Runtime: daemon-only — `tutti_daemon` bring-up creates devices and views; queue depth always takes the controller maximum (NVMe CAP.MQES + 1).
 - Host deps: CMake, protobuf / gRPC / uuid / yaml-cpp. CMake discovers system packages by default; an existing vcpkg tree is an optional fallback.
 - All file I/O is opened with `O_DIRECT` (project policy).
 
-## Build and run the KV Cache workload
+## Deploy the vLLM KV cache connector
+
+**v0.2.0 preparation:** the vLLM connector, deployment scripts and agent skill
+are being prepared for community use. The release version/tag has not yet been
+changed. Supported-layout and compatibility limits are documented explicitly.
+
+Start with [Getting Started](doc/getting-started.md): build the C++ stack and
+both native Python extensions, review host/device ownership, run software and
+byte-exact hardware gates. Then use the
+[vLLM operation manual](doc/intergration/tutti-vllm-manual.md) for offline reuse,
+service configuration preview, `/health`, and SSE streaming acceptance.
+
+Prefer agent-assisted setup? Install the complete
+[Tutti runtime skill](Skills/README.md), including its references. It requires
+host-specific device identity and explicit approval before privileged changes.
+Shipped daemon configurations are examples of the maintainer's machine, not
+safe defaults for arbitrary disks.
+
+MiniMax/DeepSeek new-model adaptation is a subsequent task. Hybrid/multi-group
+KV layouts are not currently supported. Experimental async completion is
+opt-in (`TUTTI_ASYNC_COMPLETION=1`); fault-path validation is still incomplete
+and it is not the production default.
+
+## Manual C++ KV workload
 
 The canonical build flow is [doc/getting-started.md](doc/getting-started.md).
 
@@ -77,16 +100,27 @@ lists all runtime options.
 
 ## Configuration
 
-Two files have strictly separate roles:
+Configuration is organized by its consumer; see the
+[configuration index](config/README.md) and
+[end-to-end configuration/performance guide](doc/configuration-and-performance.md).
 
-- **`config/local_nvme_config.yaml`** is the daemon deployment fact file. It owns controller identity, accelerator ACLs, mount/view paths, queue policy, and lease policy. The application Runtime config parser never reads it or derives device paths from its array order.
-- **`config/tutti_config.yaml`** is the application `TuttiRuntimeSpec` graph. `storage.resources[]` requests a logical resource, `resolvers[]` and `datapaths[]` select implementations, and `backends[]` binds their IDs through a compiled payload contract. Runtime paths, BAR sizes, namespaces, and actual queue grants come only from the daemon allocation response.
+- **`config/device_manager/nvme_daemon.yaml`** is the daemon schema template;
+  reviewed host facts live in `config/local/tutti_daemon_<name>.yaml`.
+- **`config/storage_runtime/{local_nvme,multi_nvme}.yaml`** describes the native
+  `TuttiRuntimeSpec` resource/resolver/datapath/backend graph. Runtime device
+  facts and queue grants come from the daemon allocation response.
+- **`config/integration/vllm/kv_transfer.json`** is the separate Python connector
+  preset schema. It does not implicitly load the native Runtime YAML.
+
+Use the module paths directly; old template aliases and positional daemon
+schemas are removed. The daemon requires an explicit `--config` pointing to
+reviewed host facts. Python uses only unit-bearing `capacity`, while engines
+and object stores calculate bytes and slot counts internally.
 
 Legacy application fields (`gpu`, `nvme_service`, `nvme`, `local_nvme`,
 `local_nvme_config`, `storage.backend`, and `storage.default_stripe_unit`) were
-removed in P6 on 2026-08-11. There is no compatibility grace period or legacy
-adapter; legacy-only and mixed files fail with a migration diagnostic. This
-does not change the daemon configuration compatibility policy.
+are not supported. There is no legacy configuration adapter; native Runtime
+and daemon inputs must use their current schemas.
 
 DataPath cache precedence remains programmatic override > DataPath spec
 config > test-only `TUTTI_*_CACHE_CAP` environment override > built-in default.
@@ -139,7 +173,7 @@ If you use Tutti in your research, please cite our paper — and the GeminiFS wo
 Tutti's pluggable GPU-vendor framework (`cuda_like`) draws on the design patterns
 pioneered by [Mooncake](https://github.com/kvcache-ai/Mooncake) (Apache 2.0),
 which similarly decouples the GPU runtime API surface from the kernel that
-consumes it. See [`third_pkgs/Mooncake/LICENSE-APACHE`](third_pkgs/Mooncake/LICENSE-APACHE)
+consumes it. See [Mooncake's Apache license](https://github.com/kvcache-ai/Mooncake/blob/main/LICENSE-APACHE)
 for the full license text.
 
 ## Contact & community

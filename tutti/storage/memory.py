@@ -158,7 +158,7 @@ class MemoryKVStore:
         It is not optional. Without this method (and without a ``wait_event``
         fallback) the engine refuses the write path outright with "write stream
         fence bridge is unavailable", which is what broke
-        ``tests/python/transfer/test_pipeline.py``: the reference backend could
+        ``tests/python/kv_transfer/test_pipeline.py``: the reference backend could
         not perform staged writes at all, so three pipeline tests failed on
         every run and were mistaken for harness noise.
         """

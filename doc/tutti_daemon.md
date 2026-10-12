@@ -190,7 +190,7 @@ gRPC 50051）与 `tutti_daemon_md0.yaml`（NVMe d2/df/86/c5 上原有的 md0，
 
 ```bash
 mkdir -p config/local
-cp config/local_nvme_config.yaml config/local/<name>.yaml
+cp config/device_manager/nvme_daemon.yaml config/local/tutti_daemon_<name>.yaml
 ```
 
 然后删除不属于本机的设备项，并只编辑模板已有的 canonical 字段。不要新建历史
@@ -220,7 +220,7 @@ cp config/local_nvme_config.yaml config/local/<name>.yaml
 ```bash
 sudo env TUTTI_VERBOSE=1 \
   build/bin/tutti_daemon \
-  --config config/local/tutti_daemon_kv0.yaml
+  --config config/local/tutti_daemon_<name>.yaml
 ```
 
 启动过程需要 root 权限，因为 daemon 要执行 controller bind、创建字符设备、
@@ -377,7 +377,7 @@ ls -l /dev/snvm_control
 
 ## 10. 资源分配补充
 
-第 6 节和 `config/local_nvme_config.yaml` 是唯一的 daemon YAML schema。`device_id`
+第 6 节和 `config/device_manager/nvme_daemon.yaml` 是唯一的 daemon YAML schema。`device_id`
 和 `accel_id` 都是显式、唯一的身份；数组顺序不参与 `/dev`、block device 或 view
 路径推导。daemon 通过 libnvm owner bring-up 返回实际 `chrdev_path`/minor 和
 `block_path`，并在 BDF、设备节点、mount/view 校验失败时将资源保持为不可用。
@@ -393,3 +393,48 @@ PID/starttime reaper 都经过同一回收路径。
 compute context。最终 hardware gate 必须使用 owner/RPC 返回的实际路径完成 scratch
 区域 write/read/verify；`--skip-io` 只能用于 attach 诊断，不能证明
 `validated_available`。
+
+## 11. RAID0：先安全交接，再启动 daemon
+
+独立盘的 `nvmes[].auto_mount` 配置不能直接代替阵列配置。一个 daemon 可以在
+`raid0_arrays` 中声明阵列，成员使用显式 `device_id`；这些 ID 必须对应本文件的 NVMe。
+例如下面只是 schema 示例，**不表示可以直接接管现有盘**：
+
+```yaml
+raid0_arrays:
+  - name: kv-array
+    device_ids: [0, 1]
+    mount_path: /mnt/your-kv
+    auto_mount: true
+```
+
+先核对成员 PCI、namespace、磁盘序列号和 md UUID；盘已经有阵列/文件系统时，保留其
+superblocks，禁止为“改驱动”执行 mkfs、wipefs 或 zero-superblock。先停止全部 IO 客户端、
+正常卸载文件系统并停止 md，再让 daemon bring-up。默认创建脚本会破坏成员盘，不能把它
+当成已有阵列接管步骤。daemon 识别 ext4/XFS；未验证的文件系统不会自动挂载。
+
+社区机器须自行选择独立盘或登记阵列 handover。`scripts/tutti-md.sh` 当前只登记维护者
+`kv0` 和 `md0` 的 PCI 集合、UUID、挂载点/端口；它不是通用自动检测工具。新阵列在其
+阵列表添加自己的配置，并先用可丢弃测试数据演练启动失败、正常停止和恢复 Linux nvme/md。
+`tutti-env.sh` 对未登记的阵列配置拒绝直接启动。
+
+每个阵列可以独立 daemon，endpoint 不同，控制器集合不能重叠。客户端以逗号分隔多份
+`DAEMON_CONFIG` 合并清单时，所有 `device_id` 跨文件也不能重复。
+
+### 安全级别与停止顺序
+
+- `normal`：仅含可丢失的 KV；仍不能在 GPU 客户端持有控制器时解绑定。
+- `protected`：含模型、Docker 或业务数据；手动切驱动需 `--confirm <name>`，忙的挂载点/
+  块设备/客户端直接拒绝。确认只授权该阵列，不绕过检查。
+- 所有级别：先停止 API 与全部 worker，再停止 daemon/退回原阵列。不要 lazy unmount，
+  不对 daemon 连发两次信号来强制结束。
+
+Supervisor 会尝试在 daemon 退出后返回 Linux nvme 与原 md 阵列，但仍受客户端占用、
+进程存活、设备/内核健康等条件约束；杀掉 supervisor 或无法结束的 IO 客户端不在自动回退
+保证内。不能宣称“所有失败都自动恢复”。
+
+### 段文件与实例隔离
+
+Connector 在设备挂载点的 `r<rank>/segments/` 放数据，索引在 `kv_root`。
+`POOL_TAG` 只改变索引目录，不改变这些数据路径。同一个 mount/rank 上不要并发运行
+线上实例和 benchmark，也不要以为换 tag 可以安全复用仍在使用的段文件。

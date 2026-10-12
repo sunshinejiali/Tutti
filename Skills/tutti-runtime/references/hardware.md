@@ -1,134 +1,90 @@
-# Hardware & Host Environment
+# Hardware and safe host setup
 
-Tutti is a hardware/software co-designed system: it takes NVMe devices away from
-the kernel driver, drives their queues from CUDA kernels, and DMAs into GPU
-memory. Consequently a wrong *host* configuration does not degrade performance —
-it makes the system non-functional, or destroys data. Read this before touching a
-machine that is not already known-good.
+Read this before any privileged deployment. A wrong controller or DMA mapping
+can corrupt unrelated files; a successful model response does not certify it.
 
-## Prerequisites that are not negotiable
+## Host checklist
 
-| Requirement | Why | How to verify |
-|---|---|---|
-| GPU and NVMe under the same PCIe switch | P2P DMA between them; crossing the root complex either fails or collapses bandwidth | `lspci -tv`, compare the switch ancestry of both BDFs |
-| NVMe devices free for Tutti to claim | Tutti binds them itself; they must not be in use by the kernel `nvme` driver or hold a mounted filesystem you care about | `lsblk`, `lsof` on the mount points |
-| IOMMU in passthrough | the GPU-BAR path assumes physical == bus address | `status` checks it (`iommu=pt` on the kernel cmdline) |
-| Kernel headers matching the **running** kernel | out-of-tree modules | `uname -r` vs `/lib/modules/$(uname -r)/build` |
-| CUDA toolkit + a CUDA-capable `torch` in the target interpreter | extensions link against both | `status` |
+| Item | Verify |
+|---|---|
+| NVIDIA GPU / CUDA / torch | Driver/toolkit compatibility; torch CUDA availability in the selected Python |
+| Supported running kernel | Matching headers and the verification matrix in `csrc/device_manager/nvme/kernel_modules/PORTING.md` |
+| P2P route | GPU/SSD ancestry with `lspci -tv`; prefer same switch or NUMA, verify other routes experimentally |
+| IOMMU | Passthrough or disabled; translated DMA addresses are not this runtime's supported assumption |
+| SSD identity | PCI BDF, serial/model/capacity, namespace, filesystem and array UUID, not ordinal names |
+| Ownership | No active filesystem/array/client can be disrupted by the intended handover |
+| Space | Scratch/JIT/logs and first segment group have room on the intended NVMe |
 
-IOMMU is worth spelling out because its failure mode is silent: with an IOMMU
-enabled but *not* in passthrough, physical ≠ bus address, and DMA lands at the
-wrong place rather than returning an error. IOMMU fully disabled is also fine —
-`phys == bus` holds either way.
+`pci_topology_check.sh` prints topology and writes a JSON inventory. Its output
+path is a host artifact, not automatically a safe place for large logs. The
+mapping needs an operator's interpretation before selecting device groups.
 
-The only prerequisite in this table `status` cannot check is the PCIe pairing,
-because deciding which GPU should own which NVMe requires reading intent, not just
-topology. Do it by hand on a new machine.
+MDTS and queue depth are kernel/controller authority. `ranks_per_device ×
+queues_per_rank` must fit the actual granted user-QID pool, not another host's
+measured capacity.
 
-`MDTS` (maximum data transfer size) is **reported by the device, not configured**.
-It bounds a single IO and therefore how many sub-IOs one logical transfer splits
-into. Never hardcode a value derived from one machine — read it from the
-controller. A contract test once encoded "MDTS ≥ 256 KiB" and failed on hardware
-reporting 128 KiB, while the code under test was correct.
+## Deployment facts
 
-Likewise `queue_depth` is fixed by the kernel module at install time; user space
-must read `ctrl->q_depth` (see invariant 5 in `SKILL.md`).
+Create `config/local/tutti_daemon_<name>.yaml` from the canonical schema after
+checking the physical machine. Each daemon owns a disjoint controller set and
+an endpoint. Client inventories merging files require globally unique
+`device_id` values. `allowed_accel_ids` must cover every GPU that uses a group.
 
-## `config/local/tutti_daemon_*.yaml` are the single source of truth
+The shipped kv0/md0 files are maintainer deployment examples, not auto-detected
+configs. `scripts/tutti-md.sh` also contains maintainer-specific PCI sets, UUIDs,
+mounts and `normal`/`protected` levels. Register a new array explicitly and
+exercise rollback with disposable data before using it with important files.
 
-One file per daemon (this host: `kv0` for NVMe 08/4b/57/63, `md0` for
-NVMe d2/df/86/c5). Each declares, per NVMe: `pci_addr`, `backing_mount_path`,
-`auto_mount`, and which accelerators may use it. These files — not a script,
-not an environment variable — are what must match the physical machine.
+The daemon controls ownership; clients obtain/validate actual controller and
+namespace identities. Block-controller and character-device numbers may differ.
+Never synthesize `/dev/ssnvmeN` from a block-controller number.
 
-Two failure shapes when it is wrong:
+## Order and gates
 
-- **A `pci_addr` that does not exist** → daemon bring-up fails loudly. Harmless.
-- **A `pci_addr` that exists but pairs a GPU with a topologically distant NVMe**
-  → everything works and throughput silently collapses. Only `lspci -tv` catches
-  this. Verify the pairing whenever the file is edited.
+Build/install does not load modules. With explicit operator permission:
 
-## Bring-up order is fixed
+1. Verify filesystem preparation on the intended KV-only devices. Formatting
+   and RAID recreation are not default installation steps.
+2. Load matching snvme modules (sign according to host policy if required).
+3. For an existing array: stop clients, safely unmount and stop the array via
+   the reviewed supervisor handover; only then bind to snvme.
+4. Start the named daemon, verify endpoint, mount source/members and views.
+   Devices on snvme appear only after daemon bring-up.
+5. Run software tests, then reviewed hardware byte-exact tests on allowed paths.
+6. Run small reuse benchmark, then online acceptance.
 
-```
-kernel modules  →  tutti_daemon  →  workload
-```
+Use `tutti-env.sh --dry-run` before operations. Never invoke all local daemons
+blindly or use `bootstrap` on a new host just because the repository contains
+working maintainer configuration.
 
-The daemon is what creates `/dev/snvme*n1`, performs `auto_mount`, and serves
-gRPC on the port in its config (kv0 :50051, md0 :50052). Mounting before the daemon runs fails because the block devices
-do not exist yet. `scripts/tutti-env.sh bootstrap` / `up` enforce this order;
-prefer them over hand-typed `insmod` + `mount`.
+## Stop and rollback
 
-## Kernel module / user space ABI handshake
+Stop API/workers first. At every safety level, controller release is unsafe
+while GPU IO clients still drive it. Protected arrays additionally refuse a
+busy mount and require explicit `--confirm NAME` for handover.
 
-The module and `libnvm` negotiate `TUTTI_SNVME_ABI_VERSION` through a shared
-`uapi` header, and the check is **fail-closed** (`ENODEV`). Replacing the module
-without rebuilding user space — or the reverse — produces a device-not-found
-error that looks like missing hardware.
+The supervisor attempts return to Linux nvme and the same md superblocks on a
+daemon exit. This is not an unconditional guarantee: busy clients, dead/hung
+hardware, stale process state, or killing the supervisor may require manual
+recovery. Do not override this with a second daemon signal or lazy unmount.
+Do not modify fstab or mdadm configuration without an explicit site decision.
 
-Use `scripts/tutti-env.sh modules rebuild`, which rebuilds both sides. Do not
-`insmod` a `.ko` from an older build tree.
+## Module and library maintenance
 
-Module sources exist per kernel version under
-`csrc/device_manager/nvme/kernel_modules/`. Modules are never signed by the
-script: if load fails and `dmesg` reports "Required key not available", sign
-`build/module/*.ko` per your site's procedure.
+Module and userspace UAPI must match. Sources are under
+`csrc/device_manager/nvme/kernel_modules/`; baseline presence is not a hardware
+certification. `modules rebuild` only rebuilds modules: rebuild libnvm/userspace
+and relink Python too if the shared ABI changes. Never replace live mapped
+libraries or delete a deployed build tree.
 
-## Destructive operations — require explicit user confirmation
+Phoenix weight loading is optional. Its BAR remapping can conflict with
+nvidia_peermem DMA mapping; do not load/unload it automatically to resolve RDMA
+errors. Record module state and follow the site's driver procedure.
 
-An agent must **not** perform any of the following on its own initiative. Each
-has consequences outside the repository, and several are irreversible.
+## Cleanup
 
-1. **`rmmod snvme` / `modules unload`** — every `/dev/snvme*` and `/dev/ssnvme*`
-   disappears instantly. Any running workload dies; mounted filesystems on those
-   devices must be unmounted first. Check for other users first:
-   `pgrep -a -f 'vllm|tutti|python' ` and `mount | grep snvme`.
-
-2. **Starting/stopping `tutti_daemon`, loading/unloading modules** — these are
-   *host-level* actions with root privilege, not per-venv. They affect every
-   process on the machine, including other people's jobs.
-
-3. **Loading `phoenixfs` alongside `nvidia_peermem`** — structurally mutually
-   exclusive. `phoenixfs` remaps the whole GPU BAR with `devm_memremap_pages`,
-   giving those physical addresses a `struct page`; NVIDIA's peer-memory path
-   then hits `dma_map_resource`, which refuses addresses backed by `struct page`
-   ("Don't allow RAM to be mapped") and surfaces as `EIO` on RDMA memory
-   registration. `status` reports this as a **warning**, not a failure — the
-   local-NVMe path is unaffected, so it only blocks machines that also run RDMA.
-   **Before any RDMA path, `rmmod phoenixfs`.** Use `--no-phoenix` to keep the
-   script from loading it.
-
-4. **Editing `pci_addr`** — once claimed, a device is written as raw LBAs.
-   Pointing Tutti at the wrong disk destroys whatever is on it. Confirm with
-   `lsblk` / `blkid` before changing the value.
-
-5. **Deleting `build/`** — the deployed extensions' RUNPATH points into the build
-   tree, so every `.so` on the machine breaks at import (`ImportError:
-   libnvm.so`). Sources are unaffected, but recovery requires a rebuild. Never
-   run `rm -rf` with a relative path from the repository root.
-
-6. **`fsfreeze -f`** — if any dead process still holds a superblock reference,
-   this blocks forever in `percpu_down_write` and hangs *all* writes to that
-   filesystem, unrecoverable without a reboot. Do not use it to "make an
-   experiment safe".
-
-7. **Bulk deletes of KV pool directories** — may be intercepted by a safe-delete
-   shim; use `shutil.rmtree` from Python. Better: an interrupted benchmark
-   poisons its pool, so switch to a new pool root instead of cleaning the old one.
-
-## Bringing up a new machine, in order
-
-Do not skip ahead: each step's failure mode is only readable if the previous one
-is known-good.
-
-1. `lspci -tv` — record GPU↔NVMe switch pairing.
-2. Write `config/local/tutti_daemon_<name>.yaml` (one per daemon) to match it.
-3. `scripts/tutti-env.sh bootstrap` (needs sudo for modules + daemon).
-4. `scripts/tutti-env.sh status` — **must be entirely green** before anything
-   else. A single red line makes every later symptom ambiguous.
-5. `scripts/tutti-env.sh test cpp` — hardware contract tests; they write to the
-   real devices and need their mount points to exist and be writable.
-6. `scripts/tutti-env.sh test py` — no hardware needed.
-7. One single-GPU, small-capacity benchmark run.
-8. Only then multi-GPU / striped configurations, sizing capacity and queues per
-   `benchmarking.md`.
+`kv_root` / `POOL_TAG` isolate indexes but segment data lives at
+`<mount>/r<rank>/segments`. Multiple deployments with the same mount/rank collide.
+Inventory users and references before deleting anything. A new tag is not a
+safe workaround for concurrent IO, and fsfreeze is not a correctness test.
+Full filesystem repair/checks require an unmounted, inactive filesystem.

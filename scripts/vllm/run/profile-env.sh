@@ -1,28 +1,24 @@
 #!/usr/bin/env bash
 
-# Machine-local environment for vLLM/Tutti profiling. Source this file.
-#
-# Every path below is verified to exist on this host. Previous revisions of this
-# file pointed at /data2/ryeqiu, /data/home/ryeqiu/tutti-env and a vendored CUDA
-# toolkit under third_pkgs -- none of which exist any more, so sourcing it
-# silently produced a broken PATH.
-#
-# Scratch and profile output deliberately live on /mnt/nvme4 rather than the
-# root filesystem: root is 20G and typically over 90% full, and nsys reports
-# alone run to hundreds of megabytes.
+# Source this file after selecting a Python environment and an NVMe scratch
+# directory. It never selects GPUs, loads modules, or resets PATH/compilers.
 
-_TUTTI_CUDA=/usr/local/cuda-13.0
-_TUTTI_PROFILE_ROOT=/mnt/nvme4/tutti-profile
-_TUTTI_VENV=/data/home/ryeqiu/vllm-env
-_TUTTI_REPO=/data/home/ryeqiu/Tutti
-# flashinfer JIT-compiles CUTLASS kernels at engine startup, and CUTLASS needs a
-# modern C++ frontend. The system compiler here is GCC 8.5, whose libstdc++
-# headers fail to instantiate cute::tuple ("incomplete type ... is not allowed"),
-# which surfaces only as "Engine core initialization failed". This toolset must
-# be ahead of /usr/bin on PATH.
-_TUTTI_GCC=/opt/rh/gcc-toolset-13/root/usr
-
-export TUTTI_PROFILE_ROOT="$_TUTTI_PROFILE_ROOT"
+_TUTTI_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+: "${TUTTI_PROFILE_ROOT:?Set TUTTI_PROFILE_ROOT to a scratch directory on NVMe}"
+if [[ "$TUTTI_PROFILE_ROOT" != /* ]]; then
+    echo "TUTTI_PROFILE_ROOT must be an absolute path" >&2
+    return 1
+fi
+_TUTTI_PROFILE_ROOT="$TUTTI_PROFILE_ROOT"
+_TUTTI_PYTHON="${TUTTI_PYTHON:-${PYTHON_BIN:-${VIRTUAL_ENV:+$VIRTUAL_ENV/bin/python}}}"
+if [[ -z "$_TUTTI_PYTHON" ]]; then
+    _TUTTI_PYTHON="$(command -v python3 || true)"
+fi
+if ! command -v "$_TUTTI_PYTHON" >/dev/null 2>&1; then
+    echo "Python interpreter not found: $_TUTTI_PYTHON" >&2
+    return 1
+fi
+export TUTTI_PROFILE_ROOT
 export TMPDIR="$_TUTTI_PROFILE_ROOT/tmp"
 export XDG_CACHE_HOME="$_TUTTI_PROFILE_ROOT/cache/xdg"
 export VLLM_CACHE_ROOT="$XDG_CACHE_HOME/vllm"
@@ -34,19 +30,7 @@ export PYTHONPYCACHEPREFIX="$XDG_CACHE_HOME/pycache"
 
 # NVTX ranges are what make a Tutti nsys report readable: without them the
 # storage work is an undifferentiated band of CUDA API calls.
-export TUTTI_NVTX=1
-
-# GPU selection is left to the caller. Exporting a fixed list here is what made
-# the previous revision silently TP4-only.
-: "${CUDA_VISIBLE_DEVICES:=0,1,2,3,4,5,6,7}"
-export CUDA_VISIBLE_DEVICES
-
-export PATH="$_TUTTI_VENV/bin:$_TUTTI_GCC/bin:$_TUTTI_CUDA/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin"
-
-# nvcc picks its host compiler from CUDAHOSTCXX, not from PATH alone.
-export CUDAHOSTCXX="$_TUTTI_GCC/bin/g++"
-export CC="$_TUTTI_GCC/bin/gcc"
-export CXX="$_TUTTI_GCC/bin/g++"
+export TUTTI_NVTX="${TUTTI_NVTX:-1}"
 
 # Three separate source roots, all required:
 #   repo root          the `tutti` Python package
@@ -56,11 +40,9 @@ export CXX="$_TUTTI_GCC/bin/g++"
 # "No module named 'tutti_kv_transfer'" behind a generic
 # "Engine core initialization failed".
 export PYTHONPATH="$_TUTTI_REPO/csrc/python/src:$_TUTTI_REPO/csrc/kv_transfer:$_TUTTI_REPO${PYTHONPATH:+:$PYTHONPATH}"
-export LD_LIBRARY_PATH="$_TUTTI_GCC/lib64:$_TUTTI_CUDA/lib64:/usr/local/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-
-export TUTTI_PYTHON="$_TUTTI_VENV/bin/python"
+export TUTTI_PYTHON="$_TUTTI_PYTHON"
 
 mkdir -p "$TMPDIR" "$XDG_CACHE_HOME" "$TORCHINDUCTOR_CACHE_DIR" \
   "$TUTTI_PROFILE_ROOT/logs" "$TUTTI_PROFILE_ROOT/reports"
 
-unset _TUTTI_CUDA _TUTTI_PROFILE_ROOT _TUTTI_VENV _TUTTI_REPO _TUTTI_GCC
+unset _TUTTI_PROFILE_ROOT _TUTTI_PYTHON _TUTTI_REPO

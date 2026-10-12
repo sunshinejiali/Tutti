@@ -22,11 +22,7 @@ from vllm.logger import init_logger
 
 from tutti.integration.vllm.factory import scheduler_index_for, worker_engine_for
 from tutti.integration.vllm.geometry import (
-    apply_capacity_bytes,
-    apply_device_groups,
     cdiv,
-    deployment_rank,
-    expand_placeholders,
     extra_config,
     flatten_blocks,
     resolve_geometry,
@@ -70,16 +66,6 @@ _ensure_impl_logging_visible()
 
 if TYPE_CHECKING:
     from tutti.integration.vllm.worker import WorkerImpl
-
-# 兼容别名：配置解析已迁至 adapter.geometry / adapter.factory，以下同名
-# 私有符号保留供既有调用点与测试 import 使用（行为完全一致）。
-_resolve_geometry = resolve_geometry
-_deployment_rank = deployment_rank
-_expand_placeholders = expand_placeholders
-_apply_device_groups = apply_device_groups
-_apply_capacity_bytes = apply_capacity_bytes
-_worker_engine_for = worker_engine_for
-_scheduler_index_for = scheduler_index_for
 
 # 在途写入预留的步龄上限（步）。TP rank 的完成可能落在不同步，窗口需
 # 覆盖该偏差；过小会误回收正常预留（confirm 落空 → 驻留不发布 → 重复
@@ -174,7 +160,7 @@ class TuttiConnectorV1(KVConnectorBase_V1):
     def __init__(self, vllm_config, role, kv_cache_config=None):
         """三参与 vLLM 工厂签名对齐；role 决定本实例承载的回调面。"""
         super().__init__(vllm_config, role, kv_cache_config)
-        extra = _resolve_geometry(extra_config(vllm_config), kv_cache_config)
+        extra = resolve_geometry(extra_config(vllm_config), kv_cache_config)
         dcp = getattr(
             getattr(vllm_config, "parallel_config", None),
             "decode_context_parallel_size",
@@ -189,13 +175,13 @@ class TuttiConnectorV1(KVConnectorBase_V1):
             )
         # 两个角色承载的对象类型不同，分开命名以免同一个字段承载两种语义：
         # WORKER 持有数据面引擎（KVEngine），SCHEDULER 持有仅元数据索引
-        # （SchedulerMetadataIndex）。`_engine` 属性保留为兼容别名。
+        # （SchedulerMetadataIndex）。
         self._data_engine = None
         self._index = None
         if role is KVConnectorRole.WORKER:
-            self._data_engine = _worker_engine_for(vllm_config, extra)
+            self._data_engine = worker_engine_for(vllm_config, extra)
         else:
-            self._index = _scheduler_index_for(vllm_config, extra)
+            self._index = scheduler_index_for(vllm_config, extra)
         self._chunk_tokens = extra["chunk_tokens"]
         self._min_retrieve_tokens = extra.get("min_retrieve_tokens", 0)
         self._max_tokens_per_load = extra.get("max_tokens_per_load", 0)
@@ -268,9 +254,7 @@ class TuttiConnectorV1(KVConnectorBase_V1):
 
             self._impl = WorkerImpl(
                 self._data_engine,
-                lookahead_k=extra.get(
-                    "lookahead_k", extra.get("prefetch_k", 2)
-                ),
+                lookahead_k=extra.get("lookahead_k", 2),
                 failure_collective_timeout_s=extra.get(
                     "failure_collective_timeout_s", 30.0
                 ),
@@ -280,20 +264,9 @@ class TuttiConnectorV1(KVConnectorBase_V1):
                 chunk_kv_bytes=extra["chunk_kv_bytes"],
                 max_chunks_per_wave=extra["max_chunks_per_wave"],
                 block_size=self._block_size,
-                lookahead_k=extra.get(
-                    "lookahead_k", extra.get("prefetch_k", 2)
-                ),
+                lookahead_k=extra.get("lookahead_k", 2),
                 kv_group_layer_names=extra.get("kv_group_layer_names"),
             )
-
-    @property
-    def _engine(self):
-        """兼容别名：返回本角色实际承载的对象（scheduler→索引，worker→引擎）。
-
-        历史上同一个字段承载两种类型（评审 N1 指出的命名歧义）；现已拆为
-        ``_index`` / ``_data_engine``，此属性仅为既有调用点与测试保留。
-        """
-        return self._index if self._index is not None else self._data_engine
 
     @property
     def prefer_cross_layer_blocks(self) -> bool:

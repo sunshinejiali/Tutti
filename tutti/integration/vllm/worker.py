@@ -481,9 +481,7 @@ class WorkerImpl:
         self._engine = engine
         if lookahead_k is None:
             engine_config = getattr(engine, "_config", {})
-            lookahead_k = engine_config.get(
-                "lookahead_k", engine_config.get("prefetch_k", 2)
-            )
+            lookahead_k = engine_config.get("lookahead_k", 2)
         if not isinstance(lookahead_k, int) or isinstance(lookahead_k, bool) \
                 or lookahead_k <= 0:
             raise ValueError(
@@ -1877,7 +1875,7 @@ class WorkerImpl:
         callback = self._callback_by_name.get(layer_name)
         if callback is not None:
             return callback, self._callback_to_physical[callback]
-        physical = self._resolve_layer(layer_name)
+        physical = self._resolve_physical_layer(layer_name)
         if not self._callback_to_physical:
             return physical, physical
         try:
@@ -1913,7 +1911,7 @@ class WorkerImpl:
         )
         self._load_error_request_ids.add(str(meta.req_id))
 
-    def _resolve_layer(self, layer_name: str) -> int:
+    def _resolve_physical_layer(self, layer_name: str) -> int:
         """把层名解析为层序号。
 
         两种登记模式统一按名解析：优先提取层名中的序号

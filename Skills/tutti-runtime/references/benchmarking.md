@@ -1,105 +1,69 @@
-# Benchmarking and Profiling
+# Benchmarking and profiling
 
-## Workload Driver
+Runnable examples live in `doc/intergration/tutti-vllm-manual.md`; wrappers are
+under `scripts/vllm/run`. Set Python, MODEL, NVMe scratch, daemon inventory,
+DEVICE_GROUPS, KV_MOUNT and TP explicitly. Set `CAPACITY` or pass `--capacity`
+for the per-rank payload budget; HBM baseline does not need storage capacity.
+The online wrapper uses `TOTAL_CAPACITY` for the service total, divided by TP.
+Scripts preserve GPU/compiler choices.
 
-`scripts/vllm/vllm_profile_offline.py` runs an offline A/B pair per round:
+## Reuse proof
 
-- **A-cold** — populates the cache (writes KV, no reads).
-- **B** — shares a `--reuse-pct` prefix with A, so it loads that prefix from NVMe
-  and only prefills the remainder.
+The offline driver issues A to populate, B to reuse a prefix, with distinct
+first tokens across rounds to avoid cross-round hits at the same shape.
+Tutti wrapper resets only local HBM prefix cache between A and B. Without it,
+a fast B can be served wholly by HBM and prove nothing about NVMe offload.
 
-Per-round token ids are perturbed at the first token so rounds do not collide in
-the store while keeping shapes identical. `--rounds N` reports `first` and
-`steady_mean` separately — always judge performance on **steady**, because the
-first round pays one-time per-process costs (see diagnostics).
+Require successful commit/read evidence, external hits and matching output
+before reporting performance. `--kv-load-failure-policy fail` exposes broken
+loads; recompute can mask loss of offload benefit. `--baseline` is an HBM prefix
+reference, not a full-recompute B reference.
 
-Flags that change behaviour materially:
+Use at least three rounds; separate first-round JIT/registration/precreation
+costs from steady mean. Small single-sample changes are not a performance claim.
+Include model revision, TP, dtype, block/chunk size, context/reuse, load format,
+concurrency, cache state, completion mode and tool versions with results.
 
-| Flag | Effect |
-|---|---|
-| `--device-groups "0,1,2,3"` | which ranks share which devices (omit = one device per rank) |
-| `--num-queues` | per-rank queues; oversubscription causes `EAGAIN` |
-| `--kv-load-failure-policy {fail,recompute}` | `fail` surfaces bugs; `recompute` masks them as silent full recompute |
-| `--rounds`, `--reset-local-prefix-between-{requests,rounds}` | steady-state measurement |
-| `--torch-profiler-dir`, `--profile-window {all,b-only}` | torch profiler with Python stacks |
-| `--torch-profiler-skip-table` | skip the post-run `key_averages()` table |
+## Size and isolation
 
-`--kv-root` accepts a `{LOCAL_RANK}` placeholder; every rank **must** get a
-distinct root.
+- Queue counts per rank multiply across ranks on each device. Use real daemon
+  grants/available capacity, not a fixed per-drive number from another machine.
+- Pool capacity is an upper bound. Segment groups are real-zero-filled and
+  FIEMAP-verified, and cold startup can be significant. Background growth can
+  compete for bandwidth; admission beyond ready capacity may be trimmed.
+- `POOL_TAG` only isolates checkpoint/index roots. Segment payloads are shared
+  under `<mount>/r<rank>/segments`; no concurrent benchmark/live instance there.
+- After interruption inspect clients and committed state. Do not blindly delete
+  segments or assert that a fresh tag alone protects existing live data.
+- Logs, reports, caches and pytest basetemp must remain on NVMe scratch.
 
-## Sizing Rules That Cause Hangs When Wrong
+## nsys
 
-- **Pool capacity** is only an upper bound; the driver sizes it from tokens and
-  rounds. Growth happens one file group at a time in the background and never
-  blocks the forward thread — but while a group is being zero-filled it competes
-  with KV IO for disk bandwidth, and writes beyond the published groups are
-  trimmed. A cold pool pays ~1 min at start-up for the first group.
-- **Queues**: `ranks_per_device × num_queues` must fit the device's user
-  queue-ID pool (≈119 here). The striped preset default is too high for 4 ranks
-  per device.
-- **Segment files are per rank** (`<mount>/r<rank>/segments/`); ranks sharing a
-  set of disks never touch each other's files.
+Use wrapper `--nsys` after normal correctness acceptance. Keep profiler overhead
+separate from non-profiled wall-time comparisons. Reports need real request
+execution and expected CUDA/NVTX activity, not only startup.
 
-## Run Isolation — Non-Obvious and Bites Hard
+Classify submit, wait, transfer and compute kernels separately. In synchronous
+mode the IO kernel submits and polls; in experimental async mode submit-only
+and `wait_batches` are distinct. Direction comes from NVTX `op=read|write` and
+the actual stream/path, not grid size. A waiting kernel's busy time is not bytes
+transferred, and low async kernel residency does not imply SSD inactivity.
 
-- **A killed or interrupted run leaves the pool in a state that makes the next
-  run on the same `kv_root` produce zero IO.** Always use a fresh pool tag when a
-  previous run was aborted, and never compare numbers across a polluted pool.
-- Give every run its own log directory (a run id) and write a summary file once.
-  Re-running with the same output paths silently overwrites the authoritative
-  numbers — verify against the summary/meta files, not a possibly-overwritten log.
-- Check for leftover worker processes before starting: orphaned vLLM workers hold
-  GPU memory and the next run fails during engine init with a confusing error.
+For one step across CPU/GPU asynchronous boundaries, attribute kernels by their
+launch correlation and process, not simply CPU-window start/end. Merge busy
+intervals to measure overlap; never add concurrent rank/kernel durations and
+call that wall time. Compare all ranks: NCCL duration may include skew waiting
+for a slow rank rather than transport alone.
 
-## Measuring IO/Compute Overlap From an nsys Export
+PCIe metrics need calibration against a known byte volume. Prefer throughput
+from known completed request bytes and elapsed time; do not infer absolute
+bandwidth from a device-specific utilization percentage.
 
-Export and query the SQLite directly:
+## Failure paths and rollout
 
-```bash
-nsys export --type sqlite --force-overwrite true --output run.sqlite run.nsys-rep
-```
+`TUTTI_ASYNC_COMPLETION=1` is experimental, synchronous is default. Successful
+normal-path/256K runs do not certify timeout, late CQE or slot/PRP lifetime.
+Fault-injection acceptance remains required before enabling a production default.
 
-Classification that actually works:
-
-- **IO kernels** — demangled name contains `tutti::`. There is effectively one
-  such kernel (`fused_submit_kernel`). **`gridX` is the batch size, not the
-  direction** — do not use it to separate reads from writes.
-- **Compute kernels** — everything else (attention, GEMM, all-reduce, MoE).
-
-Then, per rank (`globalPid`): merge each class's busy intervals, intersect them,
-and report `intersection / io_busy`. High values mean reads and compute are truly
-concurrent. A high value with `io_busy ≈ span` means IO is saturated and is the
-limiter; a low value with `io_busy ≪ span` means the device is not being fed.
-
-Kernel timings live in `CUPTI_ACTIVITY_KIND_KERNEL` joined to `StringIds` on
-`demangledName`. NVTX ranges are often absent from the export even when NVTX is
-enabled — prefer kernel-derived windows over NVTX for automated analysis.
-
-## PCIe Counters
-
-nsys GPU metrics expose `PCIe RX/TX Throughput [Throughput %]`. Calibrate the
-percentage against a known pinned H2D/D2H transfer before trusting absolute
-numbers; the counters can overstate peer-to-peer traffic. Use them for relative
-trends, not for byte accounting.
-
-## Torch Profiler
-
-Prefer `--profile-window b-only`: a long-context cold prefill produces an
-enormous trace with little added information. Each rank writes its own
-`*.pt.trace.json.gz` (tens of MB); load one or two in Perfetto, not all.
-
-For "where does Python time go", compute per-function **self time** from
-`python_function` events: `dur` minus the summed `dur` of children (children are
-linked via the `Python parent id` argument). `dur` is in **microseconds**.
-
-Note that `stop_profile` runs `key_averages()`, which can take minutes on a large
-trace and may look like a hang — the trace files are already flushed by then.
-
-## Reporting Results Honestly
-
-- Quote steady-state numbers; state the first-round cost separately.
-- Verify the data plane actually ran (write-plan and read-plan counts, commit
-  markers) before attributing a speedup to caching. A run that silently fell back
-  to full recompute looks like "no regression" rather than a failure.
-- When a metric changes by a few percent on a single sample, do not claim an
-  effect; repeat with more rounds.
+Online `/metrics` and client traces complement server logs. HTTP 200 alone
+neither proves external cache hits nor absence of writes to unrelated files.

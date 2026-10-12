@@ -46,7 +46,7 @@ cmake --build --preset default --target modules
 
 ## Kernel baseline
 
-统一模块树位于 `tutti/device_manager/nvme/kernel_modules/snvme/`。其 Kbuild 根据运行
+统一模块树位于 `csrc/device_manager/nvme/kernel_modules/snvme/`。其 Kbuild 根据运行
 内核自动选择 baseline：
 
 | 运行内核 | baseline |
@@ -59,7 +59,7 @@ cmake --build --preset default --target modules
 查看可用 baseline：
 
 ```bash
-find tutti/device_manager/nvme/kernel_modules/snvme/baseline \
+find csrc/device_manager/nvme/kernel_modules/snvme/baseline \
   -mindepth 1 -maxdepth 1 -type d -printf '%f\n'
 ```
 

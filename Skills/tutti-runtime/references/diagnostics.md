@@ -138,8 +138,9 @@ and hangs only after enough completions accumulate.
 
 - Run `scripts/tutti-env.sh status` first; a non-zero exit explains most
   "mysterious" failures immediately.
-- Hardware contract tests need their mount points to exist and be writable
-  (e.g. `/mnt/nvme0/GPU0`); a missing directory looks like a functional failure.
+- Hardware contract tests need reviewed configuration and an explicitly allowed
+  writable KV test directory. Do not assume maintainer mount paths exist on a
+  new host, and do not run them on arbitrary host-data arrays.
 - Before judging a test failure as a regression, **reproduce it on the previous
   commit** (`git worktree add` a detached checkout and build there). A test can
   encode a hardware assumption that was never true on this machine.

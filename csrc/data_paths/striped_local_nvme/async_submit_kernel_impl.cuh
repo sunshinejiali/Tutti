@@ -61,6 +61,7 @@ void wait_batches_kernel(CompletionTables tables, WaitList list,
     const std::uint32_t lane = TUTTI_THREAD_IDX_X;
     const unsigned long long start = TUTTI_GLOBALTIMER_NS();
     unsigned int ns = 32;
+    bool timeout_reported = false;
     for (;;) {
         for (std::uint32_t q = lane; q < tables.num_queues; q += 32) {
             async_io::drain_completions(tables, q, 256);
@@ -71,13 +72,13 @@ void wait_batches_kernel(CompletionTables tables, WaitList list,
                        &tables.finished_batch_id[list.slot[lane]]) == list.batch_id[lane];
         }
         if (__all_sync(0xffffffffu, done)) return;
-        if (TUTTI_GLOBALTIMER_NS() - start > timeout_ns) {
+        if (!timeout_reported && TUTTI_GLOBALTIMER_NS() - start > timeout_ns) {
             if (!done) {
                 __threadfence_system();
                 *reinterpret_cast<volatile std::uint32_t*>(
                     &tables.timed_out_host[list.slot[lane]]) = 1u;
             }
-            return;
+            timeout_reported = true;
         }
         __nanosleep(ns);
         if (ns < 1024) ns *= 2;

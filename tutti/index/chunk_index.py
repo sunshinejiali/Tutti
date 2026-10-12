@@ -278,9 +278,10 @@ class ChunkIndex:
         new_keys 进入在途状态，由 confirm_store 结算。
         返回 None（不改变任何状态）当且仅当：
         - 批内任一 key 已处于在途状态（在途重复计划，整批不受理）；
-        - 容量不足且可驱逐的驻留 key 不够（其余全部受 pin 保护）。
+        - 容量不足且可驱逐的驻留 key 不够（其余属于本批或受 pin 保护）。
         """
         batch = list(dict.fromkeys(keys))
+        batch_keys = set(batch)
         if any(k in self._pending for k in batch):
             return None
         new_keys = [k for k in batch if k not in self._resident]
@@ -291,7 +292,7 @@ class ChunkIndex:
             for k in self._resident:  # 最旧在前
                 if len(evicted) == deficit:
                     break
-                if self._pins.get(k, 0) == 0:
+                if k not in batch_keys and self._pins.get(k, 0) == 0:
                     evicted.append(k)
             if len(evicted) < deficit:
                 return None

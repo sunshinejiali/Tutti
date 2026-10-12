@@ -1088,7 +1088,9 @@ class _TuttiCompletion:
                 if callable(query_io) and query_io(submitted.handle) == "IN_FLIGHT":
                     return
                 result = self._observe(submitted, 0)
-                if (result.observation == "TIMEOUT" or
+                if result.observation == "TIMEOUT":
+                    return
+                if (result.observation == "OK" and
                         result.state not in ("COMPLETED", "FAILED")):
                     return
                 observed.append(result)
@@ -1165,7 +1167,7 @@ class _TuttiCompletion:
             else:
                 failed_batch_indices.update(result.batch_indices)
         return TuttiBatchResult(
-            ok=not failures,
+            ok=self._terminal is True and not failures,
             failed_batch_indices=tuple(sorted(failed_batch_indices)),
             timeout_seen=any(result.timeout_seen for result in failures),
             failures=failures,
@@ -1228,7 +1230,13 @@ class _TuttiCompletion:
 
 
 class TuttiKVStore:
-    """tutti runtime 之上的 KVStore SPI 实现（层盲，io_key 纯映射）。"""
+    """tutti runtime 之上的 KVStore SPI 实现（层盲，io_key 纯映射）。
+
+    io_stream='auto'在runtime所属GPU创建专用读写CUDA流；vLLM connector
+    省略此参数时自动选auto。直接构造store仍默认None，保留host/fake兼容。
+    CUDA流是GPU有序执行队列，不是网络流或Python线程数；整数句柄仅供
+    高级调用方提供，不能随意使用0或另一GPU的句柄。
+    """
 
     def __init__(self, root, num_chunks: int, segment_bytes: int,
                  runtime=None, io_stream=None, preset=None,
@@ -1863,7 +1871,7 @@ class TuttiKVStore:
 
     def put_batch(self, batch) -> _TuttiCompletion:
         self._require_open()
-        entries = self._normalize(batch, require_live=False)
+        entries = self._validate_and_normalize_batch(batch, require_live=False)
         io_keys = [io_key for io_key, _, _ in entries]
         chunk_ids = tuple(dict.fromkeys(
             decode_io_key(io_key)[0] for io_key in io_keys
@@ -1912,7 +1920,7 @@ class TuttiKVStore:
 
     def get_batch(self, batch) -> _TuttiCompletion:
         self._require_open()
-        entries = self._normalize(batch, require_live=True)
+        entries = self._validate_and_normalize_batch(batch, require_live=True)
         targets = self._ensure_targets(entries)
         chunk_ids = tuple(dict.fromkeys(
             decode_io_key(io_key)[0] for io_key, _, _ in entries
@@ -2069,7 +2077,7 @@ class TuttiKVStore:
 
     # ---------- 内部 ----------
 
-    def _normalize(self, batch, require_live: bool):
+    def _validate_and_normalize_batch(self, batch, require_live: bool):
         entries = []
         for item in batch:
             if not isinstance(item, tuple) or len(item) != 3:

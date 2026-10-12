@@ -20,8 +20,8 @@
 //   dp.set_capabilities({...});       // custom capabilities
 //
 // Migration target: this kit supersedes the inline FakeDataPath in
-// tests/data_path_contract/ and RuntimeFakeDataPath in
-// tests/storage_runtime_contract/.
+// tests/data_paths/contract/ and RuntimeFakeDataPath in
+// tests/storage_runtime/contract/.
 
 #include <tutti/spi/data_path.h>
 #include <tutti/status.h>

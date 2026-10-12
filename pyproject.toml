@@ -1,7 +1,7 @@
 [build-system]
-# torch / vllm 由 tutti-env 提供（third_pkgs 源码 editable 安装，
-# doc/intergration/tutti-vllm-manual.md）；隔离构建会去 PyPI 拉 cu130
-# wheel 而失败，故只声明 setuptools 并用 --no-build-isolation 安装。
+# Install torch and vLLM in the selected Python environment first; see
+# doc/getting-started.md. Native extensions are separate distributions and
+# must be built against that environment with --no-build-isolation.
 requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
 

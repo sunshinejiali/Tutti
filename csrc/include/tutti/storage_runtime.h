@@ -310,11 +310,19 @@ public:
     }
 
     // If the runtime was not explicitly shut down (state != STOPPED),
-    // attempt a non-blocking drain. If inflight operations remain, we
-    // conservatively LEAK runtime-owned allocations rather than free
-    // memory that a still-active DataPath operation might be DMA-ing to.
-    // This matches the shutdown(timeout=0) contract: never UAF to free.
+    // Async destruction waits for retirement so member destruction cannot
+    // invalidate an in-flight DMA lease. The legacy synchronous/stub path
+    // retains its non-blocking, runtime-owned-allocation leak behavior.
     ~StorageRuntime() {
+        const bool async_owned = std::any_of(initialized_data_paths_.begin(), initialized_data_paths_.end(),
+            [](DataPath* path) { return dynamic_cast<AsyncCompletion*>(path) != nullptr; });
+        // Returning from this destructor would still destroy target leases
+        // and owned components. Keep them alive until async DMA is drained.
+        while (async_owned && state_.load() != RuntimeState::STOPPED) {
+            const Status stopped = shutdown(1000);
+            if (stopped.ok()) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
         if (state_.load() != RuntimeState::STOPPED) {
             (void)shutdown(0);
         }
@@ -330,6 +338,10 @@ public:
                 std::free(e.address);
             }
         }
+        // ResourceProvider must outlive the components that may use it.
+        owned_.data_paths.clear();
+        owned_.resolvers.clear();
+        owned_.resources.reset();
     }
 
     StorageRuntime(const StorageRuntime&) = delete;
@@ -1022,6 +1034,7 @@ public:
         entry.terminal = false;
         entry.released = false;
         entry.io_status = Status::Ok();
+        entry.async_observation_error = Status::Ok();
         entry.completion_detail = IoCompletionDetail{};
         entry.data_path_operations.clear();
         entry.memory_slots.clear();
@@ -1059,6 +1072,9 @@ public:
             return IoSnapshot{io_entries_[slot].state};
         }
         drive_progress_unlocked_(lock);
+        if (!validate_io_(handle)) {
+            return Result<IoSnapshot>::Failure(Status(StatusCode::NOT_FOUND, "IO released during query"));
+        }
         return IoSnapshot{io_entries_[slot].state};
     }
 
@@ -1092,6 +1108,11 @@ public:
                        + std::chrono::milliseconds(timeout_ms);
         for (;;) {
             drive_progress_unlocked_(lock);
+            auto released = released_results_.find(handle_key_(handle));
+            if (released != released_results_.end()) return WaitOutcome{Status::Ok(), released->second};
+            if (!validate_io_(handle)) {
+                return WaitOutcome{Status(StatusCode::NOT_FOUND, "IO released during wait"), std::nullopt};
+            }
             if (io_entries_[slot].terminal) {
                 return WaitOutcome{
                     Status::Ok(),
@@ -1109,7 +1130,7 @@ public:
             // wait, a batch whose kernel finishes mid-sleep used to be
             // observed ~0.4ms late.
             io_cv_.wait_for(lock, std::chrono::microseconds(50),
-                            [this, slot]{ return io_entries_[slot].terminal; });
+                            [this, handle, slot]{ return !validate_io_(handle) || io_entries_[slot].terminal; });
         }
     }
 
@@ -1150,6 +1171,7 @@ public:
             const IoEntry& entry = io_entries_[handles[i].slot_];
             if (entry.terminal) continue;
             for (const auto& sub_op : entry.data_path_operations) {
+                if (sub_op.released) continue;
                 auto it = std::find_if(groups.begin(), groups.end(),
                                        [&](const auto& g) { return g.first == sub_op.data_path; });
                 if (it == groups.end()) {
@@ -1251,6 +1273,8 @@ private:
         // to DataPath::submit(). Preserve the corresponding public Runtime
         // indices so REQUEST_INDICES can be translated without guessing.
         std::vector<std::size_t> request_indices;
+        std::optional<DataPathSnapshot> terminal_snapshot;
+        bool released = false;
     };
 
     struct IoEntry {
@@ -1261,6 +1285,7 @@ private:
         bool released = false;
         bool references_released = false;
         Status io_status;
+        Status async_observation_error;
         IoCompletionDetail completion_detail;
         std::vector<DataPathOperation> data_path_operations;
         std::vector<std::uint32_t> memory_slots;
@@ -1988,6 +2013,7 @@ private:
         entry.released = false;
         entry.references_released = false;
         entry.io_status = Status::Ok();
+        entry.async_observation_error = Status::Ok();
         entry.completion_detail = IoCompletionDetail{};
         entry.data_path_operations.clear();
         entry.memory_slots.clear();
@@ -2044,6 +2070,26 @@ private:
                         group.requests.data(), group.requests.size(), context);
                     guard_status = guard.restore();
                 }
+            }
+            const bool async_op = submitted.op.has_value() &&
+                dynamic_cast<AsyncCompletion*>(group.data_path) != nullptr;
+            const bool bad_states = submitted.initial_states.size() != group.requests.size();
+            if (async_op && (!guard_status.ok() || bad_states)) {
+                // An opaque op proves irreversible work may exist. Preserve
+                // conservative credits until it can be drained and released.
+                const Status error = !guard_status.ok() ? guard_status :
+                    Status(StatusCode::INTERNAL, "DataPath returned invalid state count");
+                if (entry.async_observation_error.ok()) entry.async_observation_error = error;
+                entry.data_path_operations.push_back(DataPathOperation{
+                    group.data_path, *submitted.op, group.indices, std::nullopt, false});
+                for (std::size_t index : group.indices) {
+                    outcome.initial_states[index].state = IoRequestState::ACCEPTED;
+                    outcome.initial_states[index].status = error;
+                }
+                any_accepted = true;
+                have_rejection = true;
+                if (first_rejection.ok()) first_rejection = error;
+                continue;
             }
             if (!guard_status.ok()) {
                 // A DataPath may have accepted the group before the outer
@@ -2107,7 +2153,7 @@ private:
             if (has_op && group_has_accepted) {
                 entry.data_path_operations.push_back(
                     DataPathOperation{group.data_path, submitted.op.value(),
-                                      group.indices});
+                                      group.indices, std::nullopt, false});
             } else if (has_op) {
                 // DataPath returned an op but no request in this group
                 // was accepted — release the orphan op.
@@ -2248,9 +2294,12 @@ private:
             return;
         }
 
+        const bool async_completion = std::any_of(
+            entry.data_path_operations.begin(), entry.data_path_operations.end(),
+            [](const auto& op) { return dynamic_cast<AsyncCompletion*>(op.data_path) != nullptr; });
         bool all_terminal = true;
-        bool failed = false;
-        Status first_failure = Status::Ok();
+        bool failed = !entry.async_observation_error.ok();
+        Status first_failure = entry.async_observation_error;
         IoCompletionDetail completion_detail;
         std::uint64_t confirmed_bytes = 0;
         bool have_failure_detail = false;
@@ -2260,12 +2309,19 @@ private:
             auto* gate = progress_gate_for_(sub_op.data_path);
             std::unique_lock<std::mutex> gate_lock;
             if (gate) gate_lock = std::unique_lock<std::mutex>(*gate);
-            auto snapshot = call_data_path_result_<DataPathSnapshot>(
-                *sub_op.data_path,
-                [&] { return sub_op.data_path->query(sub_op.op); });
+            auto snapshot = sub_op.terminal_snapshot.has_value()
+                ? Result<DataPathSnapshot>::Success(sub_op.terminal_snapshot.value())
+                : call_data_path_result_<DataPathSnapshot>(
+                      *sub_op.data_path,
+                      [&] { return sub_op.data_path->query(sub_op.op); });
             gate_lock.unlock();
 
             if (!snapshot.ok()) {
+                if (async_completion) {
+                    if (entry.async_observation_error.ok()) entry.async_observation_error = snapshot.status();
+                    all_terminal = false;
+                    continue;
+                }
                 // DataPath query error → terminal FAILED.  Do not wait
                 // for other sub-ops; the op is unrecoverable.
                 failed = true;
@@ -2342,8 +2398,8 @@ private:
                 }
             }
         }
-        if (!all_terminal && !failed) {
-            // Without a terminal failure, retain the public operation until
+        if (!all_terminal && (async_completion || !failed)) {
+            // Async failure is not cancellation: retain resources until
             // every accepted sub-op is observable as terminal.
             return;
         }
@@ -2358,13 +2414,37 @@ private:
         // Release all DataPath ops that are safe to release (terminal or
         // query-failed).  Ops still IN_FLIGHT (because a different sub-op
         // had a query error) are left for a subsequent progress cycle.
-        for (const auto& sub_op : entry.data_path_operations) {
+        for (auto& sub_op : entry.data_path_operations) {
+            if (async_completion && sub_op.released) continue;
             auto* gate = progress_gate_for_(sub_op.data_path);
             std::unique_lock<std::mutex> gate_lock;
             if (gate) gate_lock = std::unique_lock<std::mutex>(*gate);
-            (void)call_data_path_status_(
-                *sub_op.data_path,
-                [&] { return sub_op.data_path->release(sub_op.op); });
+            if (async_completion) {
+                if (!sub_op.terminal_snapshot.has_value()) {
+                    auto snapshot = call_data_path_result_<DataPathSnapshot>(
+                        *sub_op.data_path,
+                        [&] { return sub_op.data_path->query(sub_op.op); });
+                    if (!snapshot.ok() || snapshot.value().state == IoState::IN_FLIGHT) return;
+                    sub_op.terminal_snapshot = snapshot.value();
+                }
+                const Status released = call_data_path_status_(
+                    *sub_op.data_path,
+                    [&] {
+                        auto* async = dynamic_cast<AsyncCompletion*>(sub_op.data_path);
+                        if (async) return async->release_retired(sub_op.op, sub_op.released);
+                        const Status result = sub_op.data_path->release(sub_op.op);
+                        sub_op.released = result.ok();
+                        return result;
+                    });
+                if (!released.ok()) {
+                    if (entry.async_observation_error.ok()) entry.async_observation_error = released;
+                    return;
+                }
+            } else {
+                (void)call_data_path_status_(
+                    *sub_op.data_path,
+                    [&] { return sub_op.data_path->release(sub_op.op); });
+            }
         }
         entry.data_path_operations.clear();
         finish_io_(entry, failed ? IoState::FAILED : IoState::COMPLETED,
@@ -2433,6 +2513,13 @@ private:
                 if (entry.active && !entry.terminal) {
                     for (const auto& sub_op : entry.data_path_operations) {
                         if (sub_op.data_path == error.first) {
+                            const bool async_completion = std::any_of(
+                                entry.data_path_operations.begin(), entry.data_path_operations.end(),
+                                [](const auto& op) { return dynamic_cast<AsyncCompletion*>(op.data_path) != nullptr; });
+                            if (async_completion) {
+                                if (entry.async_observation_error.ok()) entry.async_observation_error = error.second;
+                                break;
+                            }
                             finish_io_(entry, IoState::FAILED, error.second);
                             break;
                         }

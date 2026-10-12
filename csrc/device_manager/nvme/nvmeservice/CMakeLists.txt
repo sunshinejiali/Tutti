@@ -149,7 +149,7 @@ add_subdirectory(examples)
 
 if(BUILD_TESTING)
     add_executable(nvmeservice_phase3_contract_test
-        "${TUTTI_REPOSITORY_ROOT}/tests/nvmeservice_phase3_contract/nvmeservice_phase3_contract_test.cpp"
+        "${TUTTI_REPOSITORY_ROOT}/tests/device_manager/nvmeservice/nvmeservice_phase3_contract_test.cpp"
     )
     target_link_libraries(nvmeservice_phase3_contract_test PRIVATE
         nvmeservice
@@ -166,6 +166,6 @@ if(BUILD_TESTING)
     add_test(NAME nvmeservice_phase3_contract
              COMMAND nvmeservice_phase3_contract_test)
     set_tests_properties(nvmeservice_phase3_contract PROPERTIES
-        LABELS "contract;nvmeservice;phase3"
+        LABELS "contract;nvmeservice;phase3;module_device_manager"
         TIMEOUT 60)
 endif()

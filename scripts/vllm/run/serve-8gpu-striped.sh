@@ -1,23 +1,27 @@
 #!/usr/bin/env bash
 #
-# Tutti 在线服务：Hy3-FP8 × TP8 × 两个 4 盘 RAID0（共 8 盘），与 8 卡离线基准同构。
+# Tutti 在线服务。预置参数来自 Hy3-FP8 / TP8 双 RAID0；新机器须覆盖部署参数。
+# 在线与离线 wrapper 的 block / KV dtype 默认不同，不能直接混用性能数据。
+# 完整部署和 SSE 验收：doc/intergration/tutti-vllm-manual.md。
 #
-# 几何与部署形态对齐 scripts/vllm/run/bench-8gpu-striped.sh，可直接配合
-# vllm_online_longrun.py 做在线长跑。
+# 用法：先设置 MODEL、TUTTI_PROFILE_ROOT（NVMe 暂存目录）和本机盘组配置。
+#   bash scripts/vllm/run/serve-8gpu-striped.sh [--dry-run]
+# --dry-run 只打印 connector JSON 与启动命令，不启动服务。
 #
-# 用法：
-#   RUN_DIR=/mnt/nvme4/tutti-profile/online/<tag> \
-#     nohup bash scripts/vllm/run/serve-8gpu-striped.sh > $RUN_DIR/server.log 2>&1 &
-#
-# 数据布局：每 rank 的槽位在 4 盘间轮转，打包进固定大段文件
-# <mount>/r<rank>/segments/<id>.seg（每文件 2048 槽 ≈ 20 GiB）。冷池启动时
-# 每 rank 同步建首个文件组（每盘一个段文件，约 1 分钟），之后由后台线程在
-# 分配前沿逼近时补建下一组；写路径永不建文件。
+# 数据文件位于 <mount>/r<rank>/segments，POOL_TAG 不隔离这些文件。
+# 不得在同一 mount/rank 上并发运行多个服务或 benchmark。
 #
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+
+DRY_RUN=0
+case "${1:-}" in
+    --dry-run) DRY_RUN=1; shift ;;
+    -h|--help) sed -n '3,16p' "$0"; exit 0 ;;
+esac
+[[ $# == 0 ]] || { echo "unknown argument: $1" >&2; exit 2; }
 
 PORT="${PORT:-8192}"
 # 工具调用（tool choice=auto 必需）。默认 hermes，与平台此前的 Mooncake 基线
@@ -26,7 +30,7 @@ PORT="${PORT:-8192}"
 # 在平台 max_tokens=1 的测法下正文为空、被判"答案为空"。需要结构化 tool_calls
 # 时改用 TOOL_CALL_PARSER=hy_v3。不影响 Tutti 的 key 命名空间，旧池数据可复用。
 TOOL_CALL_PARSER="${TOOL_CALL_PARSER:-hermes}"
-MODEL="${MODEL:-/mnt/nvme4/models/Hy3-FP8}"
+: "${MODEL:?Set MODEL to a local model path or Hugging Face model ID}"
 # 对外服务名：流量平台按服务组名 base_model_zh7 路由请求，必须挂成 vLLM
 # 别名，否则 404 "model does not exist"。tutti 保留给本地脚本（driver 默认
 # --model tutti）。vLLM 的 --served-model-name 接受空格分隔的多名字。
@@ -46,7 +50,6 @@ CHUNK_TOKENS="${CHUNK_TOKENS:-512}"
 BLOCK_SIZE="${BLOCK_SIZE:-512}"
 # 在线驱动只发不超过该长度的 prompt（脚本默认 --max-prompt-tokens 与之一致）。
 MAX_PROMPT_TOKENS="${MAX_PROMPT_TOKENS:-262144}"
-SAMPLES="${SAMPLES:-4}"
 POOL_TAG="${POOL_TAG:-online1}"
 # 模型上限来自 config.json 的 max_position_embeddings；MAX_MODEL_LEN 允许比
 # prompt 上限多 16（vLLM 惯例），但不得超过模型上限（264144 会直接启动失败）。
@@ -64,13 +67,12 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-$(( MAX_PROMPT_TOKENS + 16 < MODEL_MAX_LEN ? MAX
 # 调度器无法容纳一个请求。
 NUM_GPU_BLOCKS_OVERRIDE="${NUM_GPU_BLOCKS_OVERRIDE:-}"
 
-# 数据盘物理总量（方案 A）：**服务级总量**（8 卡加起来的总占用），默认 8 TiB。
-# 注意 apply_capacity_bytes 的语义是"每个 rank 的容量"，而 8 个 rank 共享同一
-# 组盘、各占一份 KV 分片，所以这里必须除以 TP_SIZE 再传给 store，否则每个
-# rank 都按整份总量建槽 = TP 倍超发，盘会被预建线程铺满（2026-09-22 事故：
-# 8TiB × 8 rank = 64TiB 需求铺满 4×5.8TB 盘，ENOSPC 后 KV 写全失败）。
-# 换算示例：8 TiB 总量 → 每 rank 1 TiB → 每盘（8 rank / 4 盘）2 TiB。
-TOTAL_CAPACITY_BYTES="${TOTAL_CAPACITY_BYTES:-$(( 8 * 1024 * 1024 * 1024 * 1024 ))}"
+# 服务总payload预算；解析后除TP，不把整份预算传给每个rank。
+TOTAL_CAPACITY="${TOTAL_CAPACITY:-8 TiB}"
+if [[ -v TOTAL_CAPACITY_BYTES ]]; then
+    echo "TOTAL_CAPACITY_BYTES 已删除，请用 TOTAL_CAPACITY，例如 8 TiB" >&2
+    exit 2
+fi
 
 # 盘组部署（默认：两个 md RAID0，各由独立 daemon 管理）：
 #   DAEMON_CONFIG  客户端设备清单 = 各 daemon 配置，逗号分隔（device_id 全局唯一）
@@ -78,16 +80,39 @@ TOTAL_CAPACITY_BYTES="${TOTAL_CAPACITY_BYTES:-$(( 8 * 1024 * 1024 * 1024 * 1024 
 #                  /mnt/tutti_md0），rank 4-7 → md0（NVMe 4-7，/mnt/nvme4），与 GPU
 #                  所在 NUMA/PCIe switch 对应
 #   KV_MOUNT       各 rank 池根（索引/检查点）所在挂载点
-# md0 需先用 scripts/tutti-md0.sh up 交给 Tutti，kv0 daemon 单独启动。
+# 本机配置只是参考；新机器须覆盖这三个值。不要直接接管含主机数据的盘。
 DAEMON_CONFIG="${DAEMON_CONFIG:-$REPO_ROOT/config/local/tutti_daemon_kv0.yaml,$REPO_ROOT/config/local/tutti_daemon_md0.yaml}"
 DEVICE_GROUPS="${DEVICE_GROUPS:-0,1,2,3;4,5,6,7}"
 KV_MOUNT="${KV_MOUNT:-/mnt/tutti_md0}"
+NUM_QUEUES="${NUM_QUEUES:-8}"
+if ! [[ "$NUM_QUEUES" =~ ^[1-9][0-9]*$ && "$TP_SIZE" =~ ^[1-9][0-9]*$ && "$CHUNK_TOKENS" =~ ^[1-9][0-9]*$ &&
+        "$BLOCK_SIZE" =~ ^[1-9][0-9]*$ ]]; then
+    echo "NUM_QUEUES, TP_SIZE, CHUNK_TOKENS, BLOCK_SIZE must be positive integers" >&2
+    exit 2
+fi
+if (( CHUNK_TOKENS % BLOCK_SIZE != 0 )); then
+    echo "CHUNK_TOKENS must be divisible by BLOCK_SIZE" >&2
+    exit 2
+fi
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/profile-env.sh"
+PYTHON="${TUTTI_PYTHON:?profile-env.sh did not set TUTTI_PYTHON}"
+CAPACITY_BYTES="$("$PYTHON" - "$TOTAL_CAPACITY" "$TP_SIZE" <<'PY'
+import sys
+from tutti.common.utils import parse_capacity
+
+try:
+    size = parse_capacity(sys.argv[1]) // int(sys.argv[2])
+    if size == 0:
+        raise ValueError("TOTAL_CAPACITY must allocate at least one byte per rank")
+except ValueError as exc:
+    raise SystemExit(str(exc))
+print(size)
+PY
+)"
 DEVICE_GROUPS_JSON="[[${DEVICE_GROUPS//;/], [}]]"
-DAEMON_CONFIG_JSON="[\"${DAEMON_CONFIG//,/\", \"}\"]"
-CAPACITY_BYTES=$(( TOTAL_CAPACITY_BYTES / TP_SIZE ))
 # 工作集（仅用于日志展示）
 CHUNKS_PER_REQ=$(( (MAX_PROMPT_TOKENS + CHUNK_TOKENS - 1) / CHUNK_TOKENS ))
-WORKING_SET=$(( SAMPLES * CHUNKS_PER_REQ ))
 
 echo "[serve] model=$MODEL tp=$TP_SIZE port=$PORT max_model_len=$MAX_MODEL_LEN (prompt≤$MAX_PROMPT_TOKENS) kv_cache_dtype=$KV_CACHE_DTYPE"
 if [ -n "$NUM_GPU_BLOCKS_OVERRIDE" ]; then
@@ -96,64 +121,74 @@ if [ -n "$NUM_GPU_BLOCKS_OVERRIDE" ]; then
 else
     echo "[serve] HBM KV 池: vLLM 自然池（未覆盖；实际容量见 vLLM 启动日志）"
 fi
-echo "[serve] chunks_per_req=$CHUNKS_PER_REQ working_set=$WORKING_SET"
+echo "[serve] chunks_per_req=$CHUNKS_PER_REQ"
 echo "[serve] IO 几何: block_size=$BLOCK_SIZE tokens/block" \
      "blocks_per_chunk=$(( CHUNK_TOKENS / BLOCK_SIZE ))" \
      "device_groups=$DEVICE_GROUPS_JSON kv_mount=$KV_MOUNT"
-echo "[serve] daemon_config=$DAEMON_CONFIG"
-echo "[serve] pool: 服务级总量 $(( TOTAL_CAPACITY_BYTES / 1024 / 1024 / 1024 / 1024 )) TiB" \
-     "(每 rank $(( CAPACITY_BYTES / 1024 / 1024 / 1024 )) GiB，容量仅为上限)"
+echo "[serve] daemon_config=$DAEMON_CONFIG num_queues_per_rank_per_device=$NUM_QUEUES"
+echo "[serve] pool: 服务级payload预算 $TOTAL_CAPACITY (每rank $CAPACITY_BYTES B)"
 echo "[serve] pool_tag=$POOL_TAG (换 tag = 全新索引；段文件按 rank 共享，脚本不删)"
 
-# shellcheck source=/dev/null
-source "$SCRIPT_DIR/profile-env.sh"
-PYTHON="${TUTTI_PYTHON:?profile-env.sh did not set TUTTI_PYTHON}"
 
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-
-# Phoenix GDS 权重加载器（phxloader）：直接从 NVMe 读到显存，绕过 page cache。
-# 冷缓存下标准 safetensors 加载每 shard 10s+（300GB 要 ~18 分钟），GDS 不受
-# page cache 冷热影响。phxloader 未编译/未安装时自动回退 --load-format auto。
-PHXLOADER_DIR="${PHXLOADER_DIR:-/data/home/ryeqiu/phoenix/adapters/vLLM/phxloader}"
-if [ -f "$PHXLOADER_DIR/phxloader/__init__.py" ] &&
-   ls "$PHXLOADER_DIR"/phxloader/_phxloader*.so >/dev/null 2>&1; then
+# Standard vLLM weight loading is independent of Tutti KV offload.
+LOAD_FORMAT="${LOAD_FORMAT:-auto}"
+PHXLOADER_DIR="${PHXLOADER_DIR:-}"
+if [[ -n "$PHXLOADER_DIR" ]]; then
     export PYTHONPATH="$PHXLOADER_DIR${PYTHONPATH:+:$PYTHONPATH}"
-    LOAD_FORMAT="${LOAD_FORMAT:-phxsafetensors}"
-else
-    echo "[serve] 警告：phxloader 不可用（缺 _phxloader*.so）→ 回退标准加载"
-    LOAD_FORMAT="${LOAD_FORMAT:-auto}"
 fi
 echo "[serve] load_format=$LOAD_FORMAT phxloader_dir=$PHXLOADER_DIR"
 
-# 每组 rank 共用一个阵列（DEVICE_GROUPS）；每 rank 自己的池根（检查点/
-# 元数据）。{LOCAL_RANK} 由 connector 的 expand_placeholders 展开（大括号、无 $）。
-read -r -d '' KV_CONFIG <<JSON || true
-{
-  "kv_connector": "TuttiConnectorV1",
-  "kv_connector_module_path": "tutti.integration.vllm.connector",
-  "kv_role": "kv_both",
-  "kv_load_failure_policy": "fail",
-  "kv_connector_extra_config": {
-    "chunk_tokens": $CHUNK_TOKENS,
-    "max_chunks_per_wave": 512,
-    "store": {
-      "type": "tutti_nvme",
-      "options": {
-        "root": "$KV_MOUNT/tutti-kv-online-${POOL_TAG}-{LOCAL_RANK}",
-        "capacity_bytes": $CAPACITY_BYTES,
-        "io_stream": "auto",
-        "preset": {
-          "type": "striped",
-          "daemon_config": $DAEMON_CONFIG_JSON,
-          "gpu_id": "{LOCAL_RANK}",
-          "device_groups": $DEVICE_GROUPS_JSON,
-          "num_queues": 8
-        }
-      }
-    }
-  }
-}
-JSON
+# json.dumps also handles spaces and quotes in paths. Validate device IDs
+# against the daemon inventory before any model or KV allocation is started.
+KV_CONFIG="$("$PYTHON" - "$DAEMON_CONFIG" "$DEVICE_GROUPS" "$KV_MOUNT" \
+    "$POOL_TAG" "$TP_SIZE" "$CHUNK_TOKENS" "$CAPACITY_BYTES" "$NUM_QUEUES" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+import yaml
+
+paths, group_text, mount, tag, tp, chunk_tokens, capacity, queues = sys.argv[1:]
+paths = [item.strip() for item in paths.split(",") if item.strip()]
+groups = [[int(item) for item in group.split(",")] for group in group_text.split(";")]
+if not groups or int(tp) % len(groups):
+    raise SystemExit("DEVICE_GROUPS group count must divide TP_SIZE")
+devices = set()
+for path in paths:
+    config = yaml.safe_load(Path(path).read_text())
+    for entry in config["nvmes"]:
+        device_id = entry["device_id"]
+        if device_id in devices:
+            raise SystemExit(f"duplicate device_id: {device_id}")
+        devices.add(device_id)
+if not paths or any(device not in devices for group in groups for device in group):
+    raise SystemExit("DEVICE_GROUPS contains devices missing from DAEMON_CONFIG")
+if not Path(mount).is_absolute() or not tag or Path(tag).name != tag or tag in (".", ".."):
+    raise SystemExit("KV_MOUNT must be absolute and POOL_TAG must be a directory name")
+print(json.dumps({
+    "kv_connector": "TuttiConnectorV1",
+    "kv_connector_module_path": "tutti.integration.vllm.connector",
+    "kv_role": "kv_both",
+    "kv_load_failure_policy": "fail",
+    "kv_connector_extra_config": {
+        "chunk_tokens": int(chunk_tokens),
+        "store": {"type": "tutti_nvme", "options": {
+            "root": str(Path(mount) / f"tutti-kv-online-{tag}-{{LOCAL_RANK}}"),
+            "capacity": f"{capacity} B",
+            "preset": {
+                "type": "striped", "daemon_config": paths,
+                "gpu_id": "{LOCAL_RANK}", "device_groups": groups,
+                "num_queues": int(queues),
+            },
+        }},
+    },
+}))
+PY
+)"
+if (( ! DRY_RUN )) && ! mountpoint -q "$KV_MOUNT"; then
+    echo "KV_MOUNT is not mounted: $KV_MOUNT (refusing to write metadata on the root disk)" >&2
+    exit 1
+fi
 
 # HBM 池只在显式给了覆盖值时才传参（默认留空 = vLLM 自然池，生产口径）。
 HBM_ARGS=()
@@ -161,20 +196,29 @@ if [ -n "$NUM_GPU_BLOCKS_OVERRIDE" ]; then
     HBM_ARGS+=(--num-gpu-blocks-override "$NUM_GPU_BLOCKS_OVERRIDE")
 fi
 
-exec "$PYTHON" -m vllm.entrypoints.openai.api_server \
-    "${HBM_ARGS[@]}" \
-    --model "$MODEL" \
-    --served-model-name $SERVED_NAME \
-    --tensor-parallel-size "$TP_SIZE" \
-    --block-size "$BLOCK_SIZE" \
-    --kv-cache-dtype "$KV_CACHE_DTYPE" \
-    --enforce-eager \
-    --max-model-len "$MAX_MODEL_LEN" \
-    --load-format "$LOAD_FORMAT" \
-    --enable-prefix-caching \
-    --enable-log-requests \
-    --enable-auto-tool-choice \
-    --tool-call-parser "$TOOL_CALL_PARSER" \
-    --port "$PORT" \
-    --no-enable-flashinfer-autotune \
+read -r -a SERVED_NAMES <<< "$SERVED_NAME"
+COMMAND=(
+    "$PYTHON" -m vllm.entrypoints.openai.api_server
+    "${HBM_ARGS[@]}"
+    --model "$MODEL"
+    --served-model-name "${SERVED_NAMES[@]}"
+    --tensor-parallel-size "$TP_SIZE"
+    --block-size "$BLOCK_SIZE"
+    --kv-cache-dtype "$KV_CACHE_DTYPE"
+    --enforce-eager
+    --max-model-len "$MAX_MODEL_LEN"
+    --load-format "$LOAD_FORMAT"
+    --enable-prefix-caching
+    --enable-log-requests
+    --enable-auto-tool-choice
+    --tool-call-parser "$TOOL_CALL_PARSER"
+    --port "$PORT"
+    --no-enable-flashinfer-autotune
     --kv-transfer-config "$KV_CONFIG"
+)
+if (( DRY_RUN )); then
+    echo "[serve] kv_config=$KV_CONFIG"
+    printf '[serve] command:'; printf ' %q' "${COMMAND[@]}"; printf '\n'
+    exit 0
+fi
+exec "${COMMAND[@]}"

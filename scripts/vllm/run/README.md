@@ -1,226 +1,63 @@
-# vLLM connector runtime rules
+# vLLM 运行入口
 
-This directory contains machine-local run artifacts and the reproducible
-profiling contract for the Hy3-FP8 TP4 deployment.
+社区完整流程见 [快速开始](../../../doc/getting-started.md) 和
+[Tutti × vLLM 操作手册](../../../doc/intergration/tutti-vllm-manual.md)。这里不复制第二套安装流程。
 
-## Storage rules
+| 文件 | 职责 |
+|---|---|
+| `profile-env.sh` | 从用户环境获得 Python、NVMe scratch，设置 JIT/cache/PYTHONPATH；不修改 GPU 或编译器 |
+| `serve-8gpu-striped.sh` | 生成并校验 connector 配置，启动在线 API；`--dry-run` 打印真实配置，不加载模型 |
+| `bench-8gpu-striped.sh` | 离线 A→B、HBM 对照、nsys wrapper；TP 可覆盖，历史名称不代表强制 8 卡 |
+| `../vllm_profile_offline.py` | 直接 `LLM.generate()`，参数和 profiler 门控见 `--help` |
+| `../vllm_online_longrun.py` | 在线 trace 客户端，保存客户端侧请求/延迟统计 |
+| `nsys-bubble.py` | SQLite 时间线分析；按报告中的进程和 kernel 语义解释结果 |
 
-- Logs, profiles, temporary files, compiler caches, and Python caches must be
-  under `/data/home/ryeqiu` or `/data2`. Never use `/tmp`, `/root/.cache`, or
-  another directory on `/`.
-- Profile logs, reports, temporary files, FlashInfer caches, vLLM caches, and
-  Python caches are under `/data2/ryeqiu/tutti-profile`.
-- KV payload files are the exception: the local-NVMe preset for `device_id=0`
-  resolves FIEMAP extents on `/mnt/nvme0`, so connector KV roots must remain on
-  that backing mount. `/mnt/nvme0` is a separate 5.8 TB device, not `/`.
-
-Source `profile-env.sh` before starting vLLM or Nsight Systems:
+## 必须由调用者指定的环境
 
 ```bash
-source integration/vllm-connector/run/profile-env.sh
+export TUTTI_PYTHON="$(command -v python)"
+export MODEL=/path/to/model
+export TUTTI_PROFILE_ROOT=/path/on/nvme/tutti-profile
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+export TP_SIZE=4
+export DAEMON_CONFIG="$PWD/config/local/tutti_daemon_kv.yaml"
+export DEVICE_GROUPS="0,1,2,3"
+export KV_MOUNT=/mnt/your-kv
 ```
 
-## Daemon/reboot monitor
+`DAEMON_CONFIG`、盘组和 mount 的未覆盖默认值来自维护者的双阵列部署，**不是任意新机器
+的可用配置**。上例的`tutti_daemon_kv.yaml`须自行创建并审核，不是预装文件。
+`MODEL`和NVMe scratch必须明确提供。权重加载默认为`auto`；Phoenix
+loader 仅在显式选择 `LOAD_FORMAT=phxsafetensors` / `PHXLOADER_DIR` 时使用。
 
-`monitor_tutti_daemon.sh` is a read-only watchdog. It records boot ID, uptime,
-daemon/port transitions, daemon log tail, GPU/NVMe state, and relevant kernel
-messages under `/data/home/ryeqiu/tutti-daemon-watch`. It never restarts the
-daemon or submits CUDA/NVMe work.
+参数的模块归属、默认/单位/优先级见 [配置与性能指南](../../../doc/configuration-and-performance.md)。
+`NUM_QUEUES` 支持serve/bench覆盖，默认8；这是每rank每设备值，不是全服务队列总量。
+服务用`TOTAL_CAPACITY="128 GiB"`指定服务总预算；离线用`CAPACITY="64 GiB"`或
+`--capacity "64 GiB"`指定每rank预算，HBM baseline无需KV容量。
+模型 block/context/KV dtype/parser 的选择和 SSE 验收在操作手册中。启动前必须先
+`serve-8gpu-striped.sh --dry-run` 检查，脚本不会自动准备驱动或接管 RAID。
 
-The optional systemd unit uses `Restart=on-failure`; if another monitor already
-holds the lock, the unit exits cleanly and does not enter a restart loop.
+## 日志和测试纪律
 
-For a one-session observation:
+- 临时文件、缓存、报告放 `TUTTI_PROFILE_ROOT`，不使用根盘 `/tmp`。
+- 新 `POOL_TAG` 只隔离索引，**不隔离** `<mount>/r<rank>/segments` 的数据文件。
+  测试与在线服务不得同时占用同一 mount/rank 工作区。
+- benchmark 默认在 A/B 间只清本地 HBM cache，保留 connector cache。检查真实读计划和
+  输出一致后才报告性能；首轮与稳态分开。
+- 报告名包含 TP/长度/复用率/tag/时间戳，另存运行参数；不能拿被覆盖的日志作证据。
+- nsys 需要匹配驱动和工具版本。系统范围 metrics 可能需要额外权限，不自动提权。
+
+## nsys 最小流程
 
 ```bash
-mkdir -p /data/home/ryeqiu/tutti-daemon-watch
-TUTTI_MONITOR_INTERVAL_S=2 nohup \
-  integration/vllm-connector/run/monitor_tutti_daemon.sh \
-  >/data/home/ryeqiu/tutti-daemon-watch/stdout.log 2>&1 &
+bash scripts/vllm/run/bench-8gpu-striped.sh \
+  --capacity "64 GiB" --nsys --tokens 10000 --reuse-pct 90 --rounds 3 --pool-tag profile-check
+nsys stats --report cuda_gpu_kern_sum,nvtx_sum /path/to/report.nsys-rep
 ```
 
-For monitoring across reboots, install the supplied
-`tutti-daemon-monitor.service` into systemd and inspect
-`/data/home/ryeqiu/tutti-daemon-watch/events.log` after the machine returns.
+读/写方向以 `tutti.*|op=read` / `|op=write` 和实际 stream/请求路径为准，不使用 grid 大小
+猜测。同步路径是 fused submit-and-wait；实验异步路径包含 submit-only 与 `wait_batches`。
+等待 kernel 的耗时不能当成独立 NVMe 数据吞吐。
 
-## Profile workload
-
-The acceptance workload is Hy3-FP8, TP4, eager execution, 65,528 prompt
-tokens, and two requests. Request B shares 80 percent of request A's prefix.
-The service uses the real `TuttiConnectorV1` and local NVMe data path.
-
-Before profiling a new software/cache state, start vLLM once without `nsys`
-and wait for `/health` so FlashInfer JIT compilation and autotuning complete.
-Do not profile first-time compilation.
-
-The request driver is:
-
-```bash
-python integration/vllm-connector/scripts/vllm_profile_dummy.py \
-  --port 8193 --model /data2/tencent/Hy3-FP8 \
-  --tokens 65528 --reuse-pct 80 --requests 2
-```
-
-The equivalent offline `LLM.generate()` driver is:
-
-```bash
-python integration/vllm-connector/scripts/vllm_profile_offline.py \
-  --model /data2/tencent/Hy3-FP8 --load-format phxsafetensors \
-  --tokens 65528 --reuse-pct 80 \
-  --reset-local-prefix-between-requests
-```
-
-The reset flag clears only vLLM's local GPU prefix-cache hashes between A and
-B. It leaves the connector cache intact, forcing B's shared prefix through the
-external Tutti load path. Without this reset, the sequential offline workload
-can be satisfied by vLLM's local APC and produce no NVMe reads.
-
-Qwen3.8-27B is used for fast model/profiler lifecycle iteration. It is a
-hybrid GDN/full-attention model, while `TuttiConnectorV1` currently supports
-one KV cache group and does not implement vLLM HMA. Use `--without-tutti` for
-these profiler-only checks; this mode does not validate the Tutti data path:
-
-```bash
-python integration/vllm-connector/scripts/vllm_profile_offline.py \
-  --model /data2/qwen --load-format auto --without-tutti \
-  --tokens 2040 --reuse-pct 80
-```
-
-For an interactive Nsight capture, use both file gates. Launch the application
-into a new session first; after the driver reports `profile ready`, start
-collection and release the workload. When it reports `profile workload
-complete`, stop collection, wait for the report, and release process shutdown:
-
-```bash
-source integration/vllm-connector/run/profile-env.sh
-run_dir=/data2/ryeqiu/tutti-profile/run/qwen-r1
-NSYS=/data2/ryeqiu/tools/nsight-systems-2026.4.1/opt/nvidia/nsight-systems-cli/2026.4.1/target-linux-x64/nsys
-mkdir -p "$run_dir"
-
-"$NSYS" launch --session-new=tutti_qwen_r1 \
-  --trace=cuda,nvtx --cudabacktrace=none \
-  --cuda-event-trace=false --cuda-memory-usage=false \
-  --cuda-um-cpu-page-faults=false --cuda-um-gpu-page-faults=false \
-  python integration/vllm-connector/scripts/vllm_profile_offline.py \
-    --model /data2/qwen --load-format auto --without-tutti \
-    --tokens 2040 --reuse-pct 80 \
-    --wait-for-start-file "$run_dir/profile.start" \
-    --wait-for-exit-file "$run_dir/profile.exit"
-
-# In another shell, after "profile ready":
-source integration/vllm-connector/run/profile-env.sh
-run_dir=/data2/ryeqiu/tutti-profile/run/qwen-r1
-NSYS=/data2/ryeqiu/tools/nsight-systems-2026.4.1/opt/nvidia/nsight-systems-cli/2026.4.1/target-linux-x64/nsys
-"$NSYS" start --session=tutti_qwen_r1 \
-  --sample=none --cpuctxsw=none --gpu-metrics-devices=none \
-  --gpuctxsw=false --output="$TUTTI_PROFILE_ROOT/reports/qwen-r1"
-touch "$run_dir/profile.start"
-
-# After "profile workload complete":
-"$NSYS" stop --session=tutti_qwen_r1
-"$NSYS" shutdown --kill=none --session=tutti_qwen_r1
-touch "$run_dir/profile.exit"
-```
-
-The gate files must not exist when the driver starts. Do not call
-`llm.stop_profile()`; stopping all TP workers through `cudaProfilerStop()` can
-disconnect Nsight agents before they flush.
-
-Keep verbose per-Module NVTX off for routine captures. Enable it only with
-`--layerwise-nvtx` when a Module-range proof is explicitly required; on the
-64K Hy3 eager workload it expands the event volume substantially. CUDA kernel
-activity itself remains large even without these hooks.
-
-## NVTX colors
-
-With `TUTTI_NVTX=1`, connector and DataPath ranges use a fixed palette:
-
-- read/load/scatter: cyan (`0xFF00B8D9`);
-- write/save/store/gather: orange (`0xFFFF8C00`);
-- waits or mixed-direction batches: gray (`0xFF8D99A6`).
-
-The C++ launch ranges use a colored outer range named
-`tutti.local_nvme.io_kernel|op=read` or `|op=write` (and equivalent striped
-names), with the legacy exact `tutti.local_nvme.io_kernel` marker nested inside
-it. In the Nsight Systems GUI, select NVTX-based coloring/projection when
-kernel rectangles do not inherit the range color automatically. vLLM compute
-kernels keep Nsight's compute/kernel color, so storage work remains visually
-distinct while existing exact-marker queries continue to work.
-
-## System metrics capture
-
-The low-overhead timeline command above deliberately uses
-`--gpu-metrics-devices=none`; such a report cannot show GPU utilization or
-PCIe counters. Run a separate metrics capture by replacing the `nsys start`
-command with:
-
-```bash
-"$NSYS" start --session=tutti_qwen_r1 \
-  --sample=none --cpuctxsw=none --gpuctxsw=false \
-  --gpu-metrics-devices=cuda-visible --gpu-metrics-frequency=1000 \
-  '--storage-metrics=--storage-devices=snvme0n1,--interval=10,--cache-samples=10' \
-  --output="$TUTTI_PROFILE_ROOT/reports/qwen-r1-metrics"
-```
-
-GPU and storage metrics are system-scope features and can require elevated
-perf/driver permissions. The available GPU metric set is device-specific; if
-it does not expose PCIe RX/TX on this platform, record that limitation and use
-DCGM/NVML or system PCIe counters alongside the Nsight report. Keep the 1 kHz
-sampling rate initially to limit overhead and report growth.
-
-DataPath progress must perform one CUDA event query per work unit. An inner
-spin-until-deadline loop generated more than 147 million `cudaEventQuery`
-calls in one 64K capture. The one-query implementation reduced the same report
-from 4.4 GiB to 145 MiB while preserving request latency and overlap evidence.
-
-Before capturing C++ IO NVTX, build Tutti with
-[`doc/getting-started.md`](../../../doc/getting-started.md), then re-link the
-Python binding against `build/` and verify both marker strings:
-
-```bash
-cd integration/vllm-connector/bindings/python
-TUTTI_ROOT=/data/home/ryeqiu/Tutti \
-TUTTI_BUILD_DIR=/data/home/ryeqiu/Tutti/build \
-  python setup.py build_ext --inplace --force
-strings src/tutti_runtime/_core*.so | \
-  grep -E 'tutti\.(local|striped)_nvme\.io_kernel'
-```
-
-## Acceptance
-
-An `.nsys-rep` is valid only when all of the following hold:
-
-- both offline requests finish without exception and return completed outputs
-  (the server driver, when used, must return HTTP 200);
-- CUDA GPU kernel activity is present for the vLLM TP workers;
-- `tutti.*` NVTX ranges are present;
-- `tutti.local_nvme.io_kernel|op=read` or `|op=write` is present;
-- `submit_one_kernel` is present as CUDA GPU activity;
-- an external-reuse run contains `tutti.runtime.submit|op=read` and
-  `tutti.request.load` (the local APC reset is required for the offline
-  two-request driver);
-- request-time collection includes real model execution, not only startup,
-  replay code, or a minimal CUDA diagnostic.
-
-Validate the report from the CLI before handing it off:
-
-```bash
-nsys stats --report cuda_gpu_kern_sum,nvtx_sum \
-  /data2/ryeqiu/tutti-profile/reports/<report>.nsys-rep
-```
-
-For a TP worker profile, use the interactive launch/start/stop ordering above.
-Starting collection only after model initialization keeps weight loading and
-JIT setup out of the report. End collection with `nsys stop --session=<name>`
-while the driver and workers are held alive, then release the driver. Do not
-use the vLLM stop-profile API: four workers call `cudaProfilerStop()`
-concurrently, which can disconnect the Nsight agent before it flushes a valid
-report.
-
-Nsight Systems 2025.3.2 with NVIDIA open driver 580.105.08 currently emits
-`pSmIssueThrottleCtrl` and `refcntRequestReference_IMPL` assertions during
-profiler injection. Minimal PyTorch reproduction shows these happen without
-vLLM, Tutti, SNVMe, or even CUDA API tracing (`--trace=nvtx,osrt` is enough).
-Treat this as an unresolved profiler/driver compatibility problem, not a clean
-health check. Record assertion counts as well as Xid, ECC, and PCIe AER after
-each run.
+需要跨 CPU/GPU 异步边界比较同一步时，使用 launch correlation 归属而非 CPU step 时间窗。
+异步功能状态与实测见 [async-nvme-completion.md](../../../doc/design/async-nvme-completion.md)。

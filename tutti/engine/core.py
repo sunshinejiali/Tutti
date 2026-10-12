@@ -1610,7 +1610,7 @@ class KVEngine:
                     raise
             if not async_reuse and fence_event is None:
                 handles.append(
-                    self._settle(
+                    self._register_wave_completion(
                         wave, wave_keys, layer_idx, wave_blocks, slots,
                         completion, is_load=True
                     )
@@ -1912,7 +1912,7 @@ class KVEngine:
                 if recorded is not None:
                     reuse_event = recorded
             handles.append(
-                self._settle(
+                self._register_wave_completion(
                     wave, wave_keys, layer_idx, wave_blocks, slots,
                     completion, is_load=False
                 )
@@ -2104,7 +2104,7 @@ class KVEngine:
             raise ValueError("keys 不能为空")
         return keys
 
-    def _settle(
+    def _register_wave_completion(
         self,
         wave: int,
         keys: list[bytes],

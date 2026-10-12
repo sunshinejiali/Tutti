@@ -13,8 +13,9 @@ from typing import Any
 from tutti.integration.vllm.geometry import (
     _ENGINE_KEYS,
     _ENGINE_OPTIONAL_KEYS,
-    apply_capacity_bytes,
+    apply_capacity,
     apply_device_groups,
+    apply_wave_default,
     deployment_rank,
     expand_placeholders,
     key_namespace,
@@ -73,6 +74,11 @@ def worker_engine_for(vllm_config, extra: dict):
     injected = extra.get("tutti_engine_instance")
     if injected is not None:
         return injected
+    extra = apply_wave_default(extra)
+    store_spec = extra.get("store") or {"type": "memory", "options": {}}
+    segment_bytes = extra["chunk_kv_bytes"] // extra["num_layers"]
+    raw_options = apply_capacity(dict(store_spec.get("options") or {}),
+                                 segment_bytes=segment_bytes, num_layers=int(extra["num_layers"]))
     keys = tuple(sorted(
         (k, extra.get(k))
         for k in (*_ENGINE_KEYS, *_ENGINE_OPTIONAL_KEYS, "num_layers")
@@ -86,21 +92,17 @@ def worker_engine_for(vllm_config, extra: dict):
         from tutti.engine.core import KVEngine
         from tutti.storage.registry import create_store
 
-        store_spec = extra.get("store") or {"type": "memory", "options": {}}
         worker_rank = deployment_rank(vllm_config, worker=True)
         options = expand_placeholders(
-            dict(store_spec.get("options") or {}), vllm_config,
+            raw_options, vllm_config,
             rank=worker_rank,
         )
-        segment_bytes = extra["chunk_kv_bytes"] // extra["num_layers"]
-        # capacity_bytes（数据盘物理总量）→ num_chunks：必须在
-        # apply_device_groups 之前换算——那时 preset.device_groups 仍完整，
-        # 才算得出总盘数（它决定同样的槽位数铺满多少物理盘）。
-        options = apply_capacity_bytes(
-            options, segment_bytes=segment_bytes,
-            num_layers=int(extra["num_layers"]),
-        )
         if store_spec["type"] == "tutti_nvme":
+            # vLLM用户不需要提供CUDA句柄；只补缺省，不改变通用store行为。
+            options.setdefault("io_stream", "auto")
+            if isinstance(options.get("preset"), dict):
+                options["preset"] = dict(options["preset"])
+                options["preset"].setdefault("num_queues", 8)
             tp_size = int(getattr(
                 getattr(vllm_config, "parallel_config", None),
                 "tensor_parallel_size", 1,
@@ -143,12 +145,13 @@ def worker_engine_for(vllm_config, extra: dict):
 def scheduler_index_for(vllm_config, extra: dict):
     """Build/cache the scheduler metadata client without data-plane imports."""
     injected = extra.get("tutti_scheduler_index_instance")
-    if injected is None:
-        # Compatibility for existing pure-Python test harnesses. Production
-        # configurations never carry an object in connector extra_config.
-        injected = extra.get("tutti_engine_instance")
     if injected is not None:
         return injected
+    extra = apply_wave_default(extra)
+    store_spec = extra.get("store") or {"type": "memory", "options": {}}
+    segment_bytes = extra["chunk_kv_bytes"] // extra["num_layers"]
+    raw_options = apply_capacity(dict(store_spec.get("options") or {}),
+                                 segment_bytes=segment_bytes, num_layers=int(extra["num_layers"]))
     keys = tuple(sorted(
         (k, extra.get(k))
         for k in (*_ENGINE_KEYS, "num_layers")
@@ -162,14 +165,6 @@ def scheduler_index_for(vllm_config, extra: dict):
         from tutti.engine.metadata import SchedulerMetadataIndex
         from tutti.storage.metadata import create_metadata_store
 
-        store_spec = extra.get("store") or {"type": "memory", "options": {}}
-        raw_options = dict(store_spec.get("options") or {})
-        segment_bytes = extra["chunk_kv_bytes"] // extra["num_layers"]
-        # 与 worker 侧同序：换算必须在 apply_device_groups 之前（见上）。
-        raw_options = apply_capacity_bytes(
-            raw_options, segment_bytes=segment_bytes,
-            num_layers=int(extra["num_layers"]),
-        )
         tp_size = int(getattr(
             getattr(vllm_config, "parallel_config", None),
             "tensor_parallel_size", 1,

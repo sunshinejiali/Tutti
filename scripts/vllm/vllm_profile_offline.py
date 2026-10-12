@@ -197,15 +197,12 @@ def _generate(
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default="/data2/qwen")
+    parser.add_argument("--model", required=True)
     parser.add_argument("--load-format", default="auto")
+    parser.add_argument("--capacity", help="每rank KV payload预算，须带单位，例如 1 TiB")
     parser.add_argument("--tensor-parallel-size", type=int, default=4)
     parser.add_argument(
         "--block-size", type=int, choices=(64, 128, 256), default=64
-    )
-    parser.add_argument(
-        "--direct-transfer-strict", action="store_true",
-        help="已恒真（直连准入失败一律抛出）；保留以兼容既有脚本。",
     )
     parser.add_argument(
         "--without-tutti",
@@ -295,10 +292,8 @@ def main() -> int:
     )
     parser.add_argument(
         "--daemon-config",
-        default=(
-            "/data/home/ryeqiu/Tutti/config/local/tutti_daemon_kv0.yaml,"
-            "/data/home/ryeqiu/Tutti/config/local/tutti_daemon_md0.yaml"
-        ),
+        default=",".join(str(Path(__file__).resolve().parents[2] / "config" / "local" / name)
+                         for name in ("tutti_daemon_kv0.yaml", "tutti_daemon_md0.yaml")),
         help="运行中各 tutti_daemon 的配置，逗号分隔（合并为一份设备清单）",
     )
     parser.add_argument(
@@ -315,10 +310,8 @@ def main() -> int:
         type=int,
         default=8,
         help=(
-            "striped 每设备用户队列数（per-device）。每盘用户 QID 池约 "
-            "119（QID 17..135，见内核 GET_DEV_INFO），须满足 "
-            "num_queues × 每盘 rank 数 ≤ 119——8 卡每 4 rank 共用一组盘 "
-            "时取 8（4×8=32），32（StripedNvmePreset 默认）会撑爆池"
+            "每rank每设备用户队列数；rank数×队列数须在实际控制器可用QID预算内。"
+            "默认8只是起点，不修改内核queue depth；参见配置与性能指南"
         ),
     )
     parser.add_argument(
@@ -372,6 +365,13 @@ def main() -> int:
         if path and path.exists():
             parser.error(f"{option} already exists: {path}")
 
+    if not args.without_tutti:
+        from tutti.common.utils import parse_capacity
+        try:
+            parse_capacity(args.capacity)
+        except ValueError as exc:
+            parser.error(str(exc))
+
     request_a, request_b = _tokens(args.model, args.tokens, args.reuse_pct)
     shared = args.tokens * args.reuse_pct // 100
     print(
@@ -383,18 +383,9 @@ def main() -> int:
 
     kv_transfer_config = None
     if not args.without_tutti:
-        chunk_tokens = 256
-        per_request_chunks = -(-(args.tokens + args.max_tokens) // chunk_tokens)
-        # 池容量（槽位上限）：测试规模 1w 槽位。容量只是上限：段文件按文件组
-        # （每盘一个段文件）在 open 时建首组、之后由后台跟随分配前沿补建。
-        # batch_size 会放大唯一 chunk 集：一批 N 个请求各占 per_request_chunks
-        # （首 token 扰动保证互不共享前缀）。
-        per_round_chunks = per_request_chunks * max(1, args.batch_size)
-        num_chunks = max(10000, per_round_chunks * 2 * args.rounds + 16)
         store_options = {
             "root": args.kv_root,
-            "num_chunks": num_chunks,
-            "io_stream": "auto",
+            "capacity": args.capacity,
             "preset": {
                 "daemon_config": args.daemon_config,
                 "gpu_id": "{LOCAL_RANK}",
@@ -427,16 +418,12 @@ def main() -> int:
             )
         connector_extra = {
             "chunk_tokens": 256,
-            "max_chunks_per_wave": 512,
             "store": {
                 "type": "tutti_nvme",
                 "options": store_options,
             },
         }
-        if args.direct_transfer_strict:
-            # strict 语义已恒真（准入失败一律抛出）；保留 CLI 参数避免
-            # 打断既有脚本，这里只再声明 direct 准入。
-            connector_extra["direct_transfer"] = True
+        connector_extra["direct_transfer"] = True
         kv_transfer_config = KVTransferConfig(
             kv_connector="TuttiConnectorV1",
             kv_connector_module_path="tutti.integration.vllm.connector",

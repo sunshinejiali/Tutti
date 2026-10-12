@@ -15,10 +15,6 @@
 namespace nvmeservice {
 namespace {
 
-// The parser keeps schema selection explicit so canonical and legacy fields
-// can never be silently preferred within the same file or resource entry.
-enum class SchemaMode { Canonical, Legacy };
-
 template <typename T>
 T get_or(const YAML::Node& node, const char* key, T fallback) {
     if (!node || !node[key]) return fallback;
@@ -54,33 +50,21 @@ std::string normalize_pci_bdf(const std::string& input) {
     return out.str();
 }
 
-// Reject a legacy/canonical field pair at the individual NVMe entry boundary.
-void reject_mixed_nvme_fields(const YAML::Node& node, SchemaMode mode,
-                              size_t index) {
-    const bool has_canonical = node["device_id"] ||
-                               node["backing_mount_path"] ||
-                               node["allowed_accel_ids"];
-    const bool has_legacy = node["mount_path"] || node["allowed_gpus"];
-    if ((mode == SchemaMode::Canonical && has_legacy) ||
-        (mode == SchemaMode::Legacy && has_canonical)) {
+void reject_removed_nvme_fields(const YAML::Node& node, size_t index) {
+    if (node["mount_path"] || node["allowed_gpus"]) {
         throw std::runtime_error("nvmes[" + std::to_string(index) +
-                                 "] mixes canonical and legacy fields");
+                                 "] requires backing_mount_path/allowed_accel_ids");
     }
 }
 
-// Apply the same fail-closed mixed-schema rule to accelerator entries.
-void reject_mixed_accelerator_fields(const YAML::Node& node, SchemaMode mode,
-                                     size_t index) {
-    const bool has_canonical = node["accel_id"] || node["view_root"];
-    const bool has_legacy = node["id"] || node["mount_path"];
-    if ((mode == SchemaMode::Canonical && has_legacy) ||
-        (mode == SchemaMode::Legacy && has_canonical)) {
-        throw std::runtime_error("accelerators/gpus[" + std::to_string(index) +
-                                 "] mixes canonical and legacy fields");
+void reject_removed_accelerator_fields(const YAML::Node& node, size_t index) {
+    if (node["id"] || node["mount_path"]) {
+        throw std::runtime_error("accelerators[" + std::to_string(index) +
+                                 "] requires accel_id/view_root");
     }
 }
 
-// Parse fields shared by both schema generations.
+// Parse service policies and array declarations.
 void parse_common(const YAML::Node& root, ServiceConfig& config) {
     if (root["grpc"]) {
         config.grpc.endpoint =
@@ -136,7 +120,7 @@ void parse_canonical(const YAML::Node& root, ServiceConfig& config) {
     }
     size_t accelerator_index = 0;
     for (const auto& node : root["accelerators"]) {
-        reject_mixed_accelerator_fields(node, SchemaMode::Canonical, accelerator_index);
+        reject_removed_accelerator_fields(node, accelerator_index);
         AcceleratorEntry entry;
         entry.accel_id =
             parse_nonnegative_id(node["accel_id"], "accelerators[].accel_id");
@@ -150,7 +134,7 @@ void parse_canonical(const YAML::Node& root, ServiceConfig& config) {
     }
     size_t index = 0;
     for (const auto& node : root["nvmes"]) {
-        reject_mixed_nvme_fields(node, SchemaMode::Canonical, index);
+        reject_removed_nvme_fields(node, index);
         NvmeEntry entry;
         entry.device_id =
             parse_nonnegative_id(node["device_id"], "nvmes[].device_id");
@@ -175,82 +159,18 @@ void parse_canonical(const YAML::Node& root, ServiceConfig& config) {
     }
 }
 
-// Legacy-only compatibility reader. Missing legacy NVMe IDs are assigned the
-// array index and reported through the injectable diagnostics sink.
-void parse_legacy(const YAML::Node& root, ServiceConfig& config,
-                  ConfigDiagnostics* diagnostics) {
-    if (!root["gpus"] || !root["gpus"].IsSequence()) {
-        throw std::runtime_error("gpus must be a sequence");
-    }
-    if (diagnostics) {
-        diagnostics->warnings.push_back(
-            "legacy daemon YAML schema is deprecated; use accelerators/accel_id/view_root, "
-            "device_id/backing_mount_path/allowed_accel_ids");
-    }
-    size_t accelerator_index = 0;
-    for (const auto& node : root["gpus"]) {
-        reject_mixed_accelerator_fields(node, SchemaMode::Legacy, accelerator_index);
-        AcceleratorEntry entry;
-        entry.accel_id = parse_nonnegative_id(node["id"], "gpus[].id");
-        entry.view_root = get_or<std::string>(node, "mount_path", "");
-        config.accelerators.push_back(std::move(entry));
-        ++accelerator_index;
-    }
-
-    if (!root["nvmes"] || !root["nvmes"].IsSequence()) {
-        throw std::runtime_error("nvmes must be a sequence");
-    }
-    size_t index = 0;
-    for (const auto& node : root["nvmes"]) {
-        reject_mixed_nvme_fields(node, SchemaMode::Legacy, index);
-        NvmeEntry entry;
-        entry.device_id = static_cast<int32_t>(index);
-        entry.pci_addr = normalize_pci_bdf(
-            get_or<std::string>(node, "pci_addr", ""));
-        entry.backing_mount_path =
-            get_or<std::string>(node, "mount_path", "");
-        entry.namespace_id = get_or<uint32_t>(node, "namespace_id", 1u);
-        entry.kernel_ioq_cap = get_or<uint32_t>(node, "kernel_ioq_cap", 0u);
-        entry.auto_mount = get_or<bool>(node, "auto_mount", true);
-        if (node["allowed_gpus"]) {
-            for (const auto& id : node["allowed_gpus"]) {
-                entry.allowed_accel_ids.push_back(
-                    parse_nonnegative_id(id, "nvmes[].allowed_gpus[]"));
-            }
-        }
-        config.nvmes.push_back(std::move(entry));
-        if (diagnostics) {
-            diagnostics->warnings.push_back(
-                "legacy nvmes[" + std::to_string(index) +
-                "] has no device_id; assigned array index " +
-                std::to_string(index));
-        }
-        ++index;
-    }
-}
-
 } // namespace
 
 std::optional<ServiceConfig> parse_config_file(
-    const std::string& path, std::string* error,
-    ConfigDiagnostics* diagnostics) {
+    const std::string& path, std::string* error) {
     try {
         YAML::Node root = YAML::LoadFile(path);
-        const bool canonical = static_cast<bool>(root["accelerators"]);
-        const bool legacy = static_cast<bool>(root["gpus"]);
-        if (canonical == legacy) {
-            throw std::runtime_error(
-                canonical ? "cannot mix top-level accelerators and gpus"
-                          : "exactly one of accelerators or gpus is required");
+        if (root["gpus"]) {
+            throw std::runtime_error("gpus schema removed; use accelerators with explicit accel_id/view_root");
         }
-
         ServiceConfig config;
         parse_common(root, config);
-        if (canonical) {
-            parse_canonical(root, config);
-        } else {
-            parse_legacy(root, config, diagnostics);
-        }
+        parse_canonical(root, config);
 
         std::string validation_error;
         if (!validate_config(config, &validation_error)) {

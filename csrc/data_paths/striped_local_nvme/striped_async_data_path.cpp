@@ -11,11 +11,13 @@
 #include <tutti/accelerator_device_guard.h>
 #include <tutti/cuda_like.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 
 namespace tutti::data_paths::striped_local_nvme {
 
@@ -42,7 +44,43 @@ std::uint32_t volatile_load(const std::uint32_t* p) {
 
 } // namespace
 
-StripedAsyncDataPath::~StripedAsyncDataPath() { destroy_tables_(); }
+StripedAsyncDataPath::~StripedAsyncDataPath() {
+    // Explicit shutdown is bounded and retryable. Destruction cannot safely
+    // release resources still used by a controller or another CUDA stream.
+    while (initialized_) {
+        const Status stopped = shutdown(1000000000ULL);
+        if (stopped.ok()) break;
+        std::fprintf(stderr, "[tutti] async destruction waiting for safe drain: %s\n",
+                     stopped.message().c_str());
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+}
+
+StripedAsyncDataPath::WaitFence::~WaitFence() {
+    if (event) cudaEventDestroy(static_cast<cudaEvent_t>(event));
+}
+
+Status StripedAsyncDataPath::wait_fences_finished_(const OpWaitState& state) const {
+    for (const auto& fence : state.waits) {
+        if (!fence->event) {
+            // Recording failed after launch: retry a fence on the same
+            // stream, never treat a missing event as completed work.
+            cudaEvent_t retry = nullptr;
+            cudaError_t error = cudaEventCreateWithFlags(&retry, cudaEventDisableTiming);
+            if (error != cudaSuccess) return cuda_status(error, "async retirement retry create");
+            error = cudaEventRecord(retry, static_cast<cudaStream_t>(fence->stream));
+            if (error != cudaSuccess) {
+                cudaEventDestroy(retry);
+                return cuda_status(error, "async retirement retry record");
+            }
+            fence->event = retry;
+        }
+        const cudaError_t result = cudaEventQuery(static_cast<cudaEvent_t>(fence->event));
+        if (result == cudaErrorNotReady) return Status(StatusCode::BUSY, "async wait still running");
+        if (result != cudaSuccess) return cuda_status(result, "async wait retirement");
+    }
+    return Status::Ok();
+}
 
 bool StripedAsyncDataPath::requested() {
     const char* v = std::getenv("TUTTI_ASYNC_COMPLETION");
@@ -60,17 +98,20 @@ Status StripedAsyncDataPath::initialize(const DataPathConfig& config,
     DeviceGuard guard(static_cast<std::int32_t>(cuda_device_));
     if (!guard.ok()) return guard.status();
     st = create_tables_();
-    Status restored = guard.restore();
     if (!st.ok()) {
         destroy_tables_();
         StripedDataPath::shutdown(0);
         return st;
     }
-    return restored;
+    return guard.restore();
 }
 
 Status StripedAsyncDataPath::create_tables_() {
     const std::uint32_t num_slots = arena_.capacity();
+    if (num_slots > 65536) return Status(StatusCode::INVALID_ARGUMENT, "async slot encoding exceeded");
+    stopping_ = false;
+    device_failure_ = Status::Ok();
+    host_slot_states_.assign(num_slots, SlotState{});
     std::vector<QueuePair*> queues;
     std::vector<QueuePair*> device_base;
     std::vector<std::uint32_t> device_offset;
@@ -180,20 +221,71 @@ void StripedAsyncDataPath::destroy_tables_() {
 }
 
 Status StripedAsyncDataPath::shutdown(std::uint64_t timeout_ns) {
-    // In-flight ops need a drainer to finish: give each a wait on the
-    // internal stream, then let the base drain them through progress().
-    if (fallback_stream_) {
-        DeviceGuard guard(static_cast<std::int32_t>(cuda_device_));
-        std::vector<OpEntry*> pending;
-        for (auto& [tok, op] : ops_) {
-            if (op.state == IoState::IN_FLIGHT) pending.push_back(&op);
-        }
-        if (!pending.empty()) enqueue_wait_locked_(pending, fallback_stream_);
-    }
-    Status st = StripedDataPath::shutdown(timeout_ns);
+    if (!initialized_) return Status::Ok();
     DeviceGuard guard(static_cast<std::int32_t>(cuda_device_));
+    if (!guard.ok()) return guard.status();
+    stopping_ = true;
+    const std::uint64_t start = now_ns();
+    std::vector<OpEntry*> pending;
+    for (auto& [token, op] : ops_) {
+        if (op.state == IoState::IN_FLIGHT) pending.push_back(&op);
+    }
+    if (!pending.empty()) {
+        Status st = enqueue_wait_locked_(pending, fallback_stream_);
+        if (!st.ok()) return st;
+    }
+    for (;;) {
+        auto advanced = progress(ProgressBudget{max_in_flight_operations_, 1000000});
+        if (!advanced.ok()) return advanced.status();
+        bool inflight = false;
+        for (const auto& [token, op] : ops_) {
+            inflight |= op.state == IoState::IN_FLIGHT;
+        }
+        if (!inflight) break;
+        if (timeout_ns == 0 || now_ns() - start >= timeout_ns) {
+            return Status(StatusCode::TIMEOUT, "async shutdown: resources retained for drain retry");
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
+    }
+    // progress publishes terminal only after every waiter fence retires.
+    Status st = StripedDataPath::shutdown(0);
+    if (!st.ok()) return st;
     destroy_tables_();
-    return st;
+    return guard.restore();
+}
+
+SubmitOutcome StripedAsyncDataPath::submit(const DataPathRequest* requests,
+                                           std::size_t count,
+                                           const HostSubmitContext& ctx) {
+    if (stopping_ || !device_failure_.ok()) {
+        SubmitOutcome out;
+        out.status = device_failure_.ok()
+            ? Status(StatusCode::NOT_READY, "async DataPath is draining") : device_failure_;
+        out.initial_states.resize(count);
+        for (auto& state : out.initial_states) {
+            state.state = IoRequestState::REJECTED;
+            state.status = out.status;
+        }
+        return out;
+    }
+    return StripedDataPath::submit(requests, count, ctx);
+}
+
+Result<DataPathTarget> StripedAsyncDataPath::open(const ResolvedTarget& target) {
+    if (stopping_ || !device_failure_.ok()) {
+        return Result<DataPathTarget>::Failure(
+            Status(StatusCode::NOT_READY, "async DataPath is draining or faulted"));
+    }
+    return StripedDataPath::open(target);
+}
+
+Result<DataPathMemory> StripedAsyncDataPath::register_memory(
+    const DataPathMemoryView& view, const RegistrationDomainKey& domain) {
+    if (stopping_ || !device_failure_.ok()) {
+        return Result<DataPathMemory>::Failure(
+            Status(StatusCode::NOT_READY, "async DataPath is draining or faulted"));
+    }
+    return StripedDataPath::register_memory(view, domain);
 }
 
 // ---------------------------------------------------------------------------
@@ -211,8 +303,8 @@ int StripedAsyncDataPath::launch_io_kernel_(
     unsigned int* d_task_counter,
     std::uint32_t arena_slot) {
     if (arena_slot >= tables_.num_slots) return static_cast<int>(cudaErrorInvalidValue);
-    std::uint32_t batch_id = next_batch_id_++;
-    if (batch_id == 0) batch_id = next_batch_id_++;  // 0 means "no batch yet"
+    if (next_batch_id_ == 0) return static_cast<int>(cudaErrorInvalidValue);
+    const std::uint32_t batch_id = next_batch_id_++;
     slot_batch_id_[arena_slot] = batch_id;
     wait_state_[arena_slot] = OpWaitState{};
     // The slot's previous batch has finished and been released (the arena
@@ -220,7 +312,7 @@ int StripedAsyncDataPath::launch_io_kernel_(
     h_finished_[arena_slot] = 0;
     h_timed_out_[arena_slot] = 0;
 
-    SlotState state;
+    SlotState& state = host_slot_states_[arena_slot];
     state.status = d_status;
     state.pending_entries = entry_count;
     state.batch_id = batch_id;
@@ -230,7 +322,7 @@ int StripedAsyncDataPath::launch_io_kernel_(
     if (e != cudaSuccess) return static_cast<int>(e);
     if (entry_count == 0) {
         // Nothing to submit: the batch is finished as of now.
-        e = cudaMemcpyAsync(&d_finished_[arena_slot], &batch_id, sizeof(batch_id),
+        e = cudaMemcpyAsync(&d_finished_[arena_slot], &state.batch_id, sizeof(state.batch_id),
                             cudaMemcpyHostToDevice, static_cast<cudaStream_t>(stream));
         h_finished_[arena_slot] = batch_id;
         return static_cast<int>(e);
@@ -242,6 +334,19 @@ int StripedAsyncDataPath::launch_io_kernel_(
         tables_, arena_slot, batch_id));
 }
 
+void StripedAsyncDataPath::handle_submit_event_failure_(OpEntry& op) {
+    auto& state = wait_state_[op.arena_slot];
+    const cudaError_t result = cudaStreamSynchronize(static_cast<cudaStream_t>(op.stream));
+    if (result == cudaSuccess) {
+        state.submit_retired = true;
+    } else {
+        device_failure_ = cuda_status(result, "async submit stream retirement");
+    }
+    // The commands may still be on the device even after the stream exits.
+    op.state = IoState::IN_FLIGHT;
+    op.status = Status::Ok();
+}
+
 // ---------------------------------------------------------------------------
 // enqueue_wait
 // ---------------------------------------------------------------------------
@@ -251,31 +356,51 @@ Status StripedAsyncDataPath::enqueue_wait_locked_(const std::vector<OpEntry*>& o
     WaitList list;
     auto flush = [&]() -> Status {
         if (list.count == 0) return Status::Ok();
-        Status st = cuda_status(launch_wait_batches(tables_, list, kWaitTimeoutNs, stream),
-                                "wait_batches launch");
+        auto fence = std::make_shared<WaitFence>();
+        fence->stream = stream;
+        cudaEvent_t event = nullptr;
+        Status st = cuda_status(cudaEventCreateWithFlags(&event, cudaEventDisableTiming),
+                                "async retirement event");
+        if (!st.ok()) return st;
+        fence->event = event;
+        st = cuda_status(launch_wait_batches(tables_, list, wait_timeout_ns_, stream),
+                         "wait_batches launch");
+        if (!st.ok()) return st;
+        st = cuda_status(cudaEventRecord(event, static_cast<cudaStream_t>(stream)),
+                         "async retirement record");
+        if (!st.ok()) {
+            cudaEventDestroy(event);
+            fence->event = nullptr;
+            device_failure_ = st;
+        }
+        // A successful launch is retained even if recording its fence fails.
+        for (std::uint32_t i = 0; i < list.count; ++i) {
+            wait_state_[list.slot[i]].waits.push_back(fence);
+        }
         list = WaitList{};
         return st;
     };
     for (OpEntry* op : ops) {
         if (op == nullptr || op->state != IoState::IN_FLIGHT) continue;
         if (op->arena_slot >= tables_.num_slots) continue;
-        auto& ws = wait_state_[op->arena_slot];
-        // Already waited for on this stream: work after it is ordered already.
-        if (ws.wait_enqueued && ws.waited_stream == stream) continue;
-        // The wait may only start once this batch's commands are issued:
-        // otherwise it could wait for a submit queued behind it.
-        Status st = cuda_status(
-            cudaStreamWaitEvent(static_cast<cudaStream_t>(stream),
-                                static_cast<cudaEvent_t>(op->event), 0),
-            "wait for submit");
-        if (!st.ok()) return st;
+        auto& state = wait_state_[op->arena_slot];
+        if (std::any_of(state.waits.begin(), state.waits.end(),
+                        [&](const auto& fence) { return fence->stream == stream; })) continue;
+        bool already_listed = false;
+        for (std::uint32_t i = 0; i < list.count; ++i) already_listed |= list.slot[i] == op->arena_slot;
+        if (already_listed) continue;
+        if (!state.submit_retired) {
+            Status st = cuda_status(
+                cudaStreamWaitEvent(static_cast<cudaStream_t>(stream),
+                                    static_cast<cudaEvent_t>(op->event), 0),
+                "wait for submit");
+            if (!st.ok()) return st;
+        }
         list.slot[list.count] = op->arena_slot;
         list.batch_id[list.count] = slot_batch_id_[op->arena_slot];
         ++list.count;
-        ws.wait_enqueued = true;
-        ws.waited_stream = stream;
         if (list.count == kWaitBatchesPerKernel) {
-            st = flush();
+            const Status st = flush();
             if (!st.ok()) return st;
         }
     }
@@ -305,6 +430,12 @@ Status StripedAsyncDataPath::enqueue_wait(const DataPathOp* ops, std::size_t cou
 // ---------------------------------------------------------------------------
 
 Result<ProgressResult> StripedAsyncDataPath::progress(ProgressBudget budget) {
+    if (budget.max_work_units == 0 || budget.timeout_ns == 0) {
+        ProgressResult skipped{};
+        skipped.more_work_likely = !ops_.empty();
+        return Result<ProgressResult>::Success(skipped);
+    }
+    const std::uint64_t started = now_ns();
     DeviceGuard guard(static_cast<std::int32_t>(cuda_device_));
     if (!guard.ok()) return Result<ProgressResult>::Failure(guard.status());
 
@@ -313,49 +444,52 @@ Result<ProgressResult> StripedAsyncDataPath::progress(ProgressBudget budget) {
     std::vector<OpEntry*> unwaited;
     for (auto& [tok, op] : ops_) {
         if (op.state != IoState::IN_FLIGHT) continue;
-        if (budget.max_work_units == 0 || work >= budget.max_work_units) {
+        if (work >= budget.max_work_units || now_ns() - started >= budget.timeout_ns) {
             result.more_work_likely = true;
             break;
         }
         ++work;
         // The submit kernel must have exited before the slot can be reused.
-        const cudaError_t submitted = cudaEventQuery(static_cast<cudaEvent_t>(op.event));
+        const std::uint32_t slot = op.arena_slot;
+        auto& ws = wait_state_[slot];
+        const cudaError_t submitted = ws.submit_retired
+            ? cudaSuccess : cudaEventQuery(static_cast<cudaEvent_t>(op.event));
         if (submitted == cudaErrorNotReady) {
             ++result.operations_advanced;
             continue;
         }
         if (submitted != cudaSuccess) {
-            cudaGetLastError();
-            op.state = IoState::FAILED;
-            op.status = Status(StatusCode::DEVICE_ERROR,
-                               std::string("submit kernel failed: ") +
-                                   cudaGetErrorString(submitted));
-            op.completion_detail = IoCompletionDetail{};
-            op.completion_detail.failure_kind = IoFailureKind::CUDA_QUERY_ERROR;
-            ++result.operations_terminal;
-            continue;
+            device_failure_ = cuda_status(submitted, "async submit retirement");
+            return Result<ProgressResult>::Failure(device_failure_);
         }
-        const std::uint32_t slot = op.arena_slot;
+        bool timed_out = volatile_load(&h_timed_out_[slot]) != 0;
+        if (timed_out && device_failure_.ok()) {
+            device_failure_ = Status(StatusCode::TIMEOUT, "async completion deadline exceeded; draining");
+        }
         if (volatile_load(&h_finished_[slot]) == slot_batch_id_[slot]) {
+            Status retired = wait_fences_finished_(ws);
+            if (retired.code() == StatusCode::BUSY) {
+                ++result.operations_advanced;
+                continue;
+            }
+            if (!retired.ok()) {
+                device_failure_ = retired;
+                return Result<ProgressResult>::Failure(retired);
+            }
+            timed_out = volatile_load(&h_timed_out_[slot]) != 0;
             aggregate_completion_status_(op);
-            ++result.operations_terminal;
-            continue;
-        }
-        if (volatile_load(&h_timed_out_[slot]) != 0) {
-            // Commands may still complete later: keep the slot out of use.
-            op.state = IoState::FAILED;
-            op.has_timeout = true;
-            op.status = Status(StatusCode::DEVICE_ERROR,
-                               "async completion wait timed out");
-            op.completion_detail = IoCompletionDetail{};
-            op.completion_detail.timeout_seen = true;
-            op.completion_detail.failure_kind = IoFailureKind::CQ_TIMEOUT;
+            if (timed_out) {
+                op.state = IoState::FAILED;
+                op.status = Status(StatusCode::TIMEOUT, "async deadline exceeded; DMA safely drained");
+                op.completion_detail.timeout_seen = true;
+                op.completion_detail.failure_kind = IoFailureKind::CQ_TIMEOUT;
+                op.completion_detail.failure_scope = IoFailureScope::WHOLE_OPERATION;
+            }
             ++result.operations_terminal;
             continue;
         }
         ++result.operations_advanced;
-        auto& ws = wait_state_[slot];
-        if (!ws.wait_enqueued) {
+        if (ws.waits.empty()) {
             const std::uint64_t t = now_ns();
             if (ws.submit_seen_done_ns == 0) {
                 ws.submit_seen_done_ns = t;
@@ -364,7 +498,7 @@ Result<ProgressResult> StripedAsyncDataPath::progress(ProgressBudget budget) {
             }
         }
     }
-    if (!unwaited.empty()) {
+    if (!unwaited.empty() && now_ns() - started < budget.timeout_ns) {
         if (!fallback_logged_) {
             fallback_logged_ = true;
             std::fprintf(stderr,
@@ -388,11 +522,27 @@ Result<ProgressResult> StripedAsyncDataPath::progress(ProgressBudget budget) {
 }
 
 Status StripedAsyncDataPath::release(DataPathOp op) {
+    bool retired = false;
+    return release_retired(op, retired);
+}
+
+Status StripedAsyncDataPath::release_retired(DataPathOp op, bool& retired) {
+    retired = false;
+    DeviceGuard guard(static_cast<std::int32_t>(cuda_device_));
+    if (!guard.ok()) return guard.status();
     const OpEntry* entry = find_op_(op);
     const std::uint32_t slot = entry ? entry->arena_slot : UINT32_MAX;
-    Status st = StripedDataPath::release(op);
-    if (st.ok() && slot != UINT32_MAX) wait_state_.erase(slot);
-    return st;
+    if (entry && entry->state != IoState::IN_FLIGHT && slot != UINT32_MAX) {
+        const Status fence_status = wait_fences_finished_(wait_state_[slot]);
+        if (!fence_status.ok()) return fence_status;
+    }
+    const Status st = release_impl_(op);
+    if (st.ok()) {
+        retired = true;
+        if (slot != UINT32_MAX) wait_state_.erase(slot);
+    }
+    const Status restored = guard.restore();
+    return st.ok() ? restored : st;
 }
 
 } // namespace tutti::data_paths::striped_local_nvme

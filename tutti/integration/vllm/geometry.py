@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import os
 
+from tutti.common.utils import parse_capacity
+
 # 引擎构造所需的配置键（全部与硬件无关）。chunk_kv_bytes 与
 # num_layers 优先从 vLLM KVCacheConfig 推导，extra_config 仅作兼容覆盖。
 _ENGINE_REQUIRED_KEYS = ("chunk_tokens", "max_chunks_per_wave")
@@ -49,6 +51,32 @@ def extra_config(vllm_config) -> dict:
     return dict(extra) if extra else {}
 
 
+def apply_wave_default(extra: dict, *, blocks_per_chunk: int = 1) -> dict:
+    """缺省波次最多512个chunk；已知preset批次额度时按block几何缩小。
+
+    wave是引擎工作窗口，不是盘条带、NVMe队列深度或整个请求大小。
+    显式配置原样保留，继续由原准入路径校验。
+    """
+    if "max_chunks_per_wave" in extra:
+        return extra
+    wave = 512
+    store = extra.get("store") or {}
+    preset = (store.get("options") or {}).get("preset")
+    if store.get("type") == "tutti_nvme" and isinstance(preset, dict):
+        max_batch = preset.get("max_batch_entries")
+        if isinstance(max_batch, str) and max_batch.strip().isdigit():
+            max_batch = int(max_batch)
+        if max_batch is None:
+            max_batch = 16384 if preset.get("type") == "striped" else 4096
+        if isinstance(max_batch, int) and not isinstance(max_batch, bool) and max_batch > 0:
+            wave = min(wave, max_batch // blocks_per_chunk)
+            if wave == 0:
+                raise ValueError("preset.max_batch_entries 不足一个chunk，不能推导max_chunks_per_wave")
+    resolved = dict(extra)
+    resolved["max_chunks_per_wave"] = wave
+    return resolved
+
+
 def resolve_geometry(extra: dict, kv_cache_config) -> dict:
     """从 vLLM cache spec 推导 Tutti 的单组、定宽逐层几何。
 
@@ -56,8 +84,12 @@ def resolve_geometry(extra: dict, kv_cache_config) -> dict:
     chunk_kv_bytes。生产路径有 KVCacheConfig 时，显式值只允许与权威
     spec 一致，避免 scheduler 与 worker 使用不同字节布局。
     """
+    if "prefetch_k" in extra:
+        raise ValueError("prefetch_k 已删除，请使用 lookahead_k")
     resolved = dict(extra)
     for key in _ENGINE_REQUIRED_KEYS:
+        if key == "max_chunks_per_wave" and key not in resolved:
+            continue
         value = resolved.get(key)
         if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
             raise ValueError(f"extra_config 缺少正整数引擎键 {key!r}")
@@ -71,7 +103,7 @@ def resolve_geometry(extra: dict, kv_cache_config) -> dict:
                     f"无法从 KVCacheConfig 推导几何；extra_config 须提供"
                     f"正整数 {key!r}"
                 )
-        return resolved
+        return apply_wave_default(resolved)
     if len(groups) != 1:
         raise ValueError(
             "TuttiConnectorV1 当前仅支持单 KV cache group；"
@@ -125,7 +157,7 @@ def resolve_geometry(extra: dict, kv_cache_config) -> dict:
             )
         resolved[key] = derived
     resolved["kv_group_layer_names"] = tuple(layer_names)
-    return resolved
+    return apply_wave_default(resolved, blocks_per_chunk=blocks_per_chunk)
 
 
 def deployment_rank(vllm_config=None, *, worker: bool = False) -> str:
@@ -171,40 +203,24 @@ def expand_placeholders(value, vllm_config=None, *, rank: str | None = None):
     return value
 
 
-def apply_capacity_bytes(options: dict, *, segment_bytes: int,
-                         num_layers: int) -> dict:
-    """把 ``capacity_bytes``（物理总容量，方案 A）换算成 ``num_chunks``。
+def apply_capacity(options: dict, *, segment_bytes: int,
+                   num_layers: int) -> dict:
+    """把每rank带单位的 ``capacity`` payload预算换算成内部 ``num_chunks``。
 
-    语义：``capacity_bytes`` 是**数据盘上的物理总量**（用户视角的总占用），
-    换算成槽位数后交给对象层——底层仍只按槽位数创建文件（Python 层负责
-    换算，与 ``apply_device_groups`` 之前调用：当时 ``preset.device_groups``
-    仍完整，可算出总盘数）。
-
-    换算依据放置几何：一个 slot 在段文件里占 ``payload + 槽位前缀`` 字节
-    （前缀 32KiB 由对象层加入；这里按 payload 的整数倍近似，误差 <0.5%），
-    slot 在 N 块盘间轮转，于是
-
-        物理总量 = num_chunks × 每 slot 字节
-
-    对 HY3 的实例：payload 10 MiB/槽，4 盘共 4 TiB 时
-    num_chunks = 4 TiB ÷ 10 MiB = 419430。
+    当前公式只用层数和每层段字节数，不依赖设备组或盘数。不扣除对象层
+    加入的槽位前缀（默认 128 KiB）、预建文件组取整或文件系统开销，因而
+    不是严格的物理总占用上限。服务总预算应由调用者先除以 TP，再传入。
     """
-    if "capacity_bytes" not in options:
+    removed = {"capacity_bytes", "num_chunks"}.intersection(options)
+    if removed:
+        raise ValueError(f"vLLM store options 不支持 {sorted(removed)}；请设置 capacity，例如 '64 GiB'")
+    if "capacity" not in options:
         return options
-    capacity_bytes = options.pop("capacity_bytes")
-    if (not isinstance(capacity_bytes, int) or isinstance(capacity_bytes, bool)
-            or capacity_bytes <= 0):
-        raise ValueError(
-            f"store options.capacity_bytes 须为正整数，got {capacity_bytes!r}"
-        )
-    if "num_chunks" in options:
-        raise ValueError(
-            "store options 的 capacity_bytes 与 num_chunks 互斥："
-            "前者是物理总量（自动换算），后者是槽位数"
-        )
+    options = dict(options)
+    capacity_bytes = parse_capacity(options.pop("capacity"))
     if segment_bytes <= 0 or num_layers <= 0:
         raise ValueError(
-            f"capacity_bytes 换算需要正的正几何，got segment_bytes="
+            f"capacity 换算需要正几何，got segment_bytes="
             f"{segment_bytes}, num_layers={num_layers}"
         )
 
@@ -212,7 +228,7 @@ def apply_capacity_bytes(options: dict, *, segment_bytes: int,
     num_chunks = capacity_bytes // per_slot
     if num_chunks < 1:
         raise ValueError(
-            f"capacity_bytes({capacity_bytes}) 小于单槽位物理占用"
+            f"capacity({capacity_bytes} B) 小于单槽位payload"
             f"({per_slot} 字节 × 槽位)"
         )
     options["num_chunks"] = int(num_chunks)
@@ -222,9 +238,10 @@ def apply_capacity_bytes(options: dict, *, segment_bytes: int,
 def apply_device_groups(options: dict, *, rank: str, tp_size: int) -> dict:
     """按 rank 把 preset.device_groups 展开为 preset.devices。
 
-    多卡共用盘组的部署形态（如 8 卡、每 4 个 rank 共用一组 2 盘条带）：
-    ``device_groups=[[0, 1], [2, 3]]`` 表示前一半 rank 用盘 0-1、后一半
-    用盘 2-3；组数必须整除 tp_size，组内 rank 数 = tp_size / 组数。
+    device_groups是部署映射，不是IO并行度：设备ID来自daemon配置。
+    ``device_groups=[[0, 1], [2, 3]]`` 在TP4时让rank0-1使用设备0-1，
+    rank2-3使用设备2-3；组数必须整除tp_size，每组rank数=tp_size/组数。
+    P2P、ACL和已有阵列成员必须由部署者审核，不能从设备编号自动猜测。
     无 device_groups 时原样返回（单设备/单组部署不变）。
     """
     preset = options.get("preset")

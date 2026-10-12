@@ -10,6 +10,9 @@ stores/memory.py 各自复制了一份 `_is_int` / `_positive_int` / `_group_sca
 
 from __future__ import annotations
 
+import re
+from fractions import Fraction
+
 from tutti.index.chunk_index import IO_KEY_BYTES, chunk_key_of, layer_of
 
 
@@ -24,6 +27,20 @@ def positive_int(config: dict, key: str) -> int:
     if not is_int(value) or value <= 0:
         raise ValueError(f"config[{key!r}] 须为正整数，got {value!r}")
     return value
+
+
+def parse_capacity(value: str) -> int:
+    """将明确单位的容量精确转换成正整数字节，GB用1000、GiB用1024。"""
+    match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*(B|[KMGT]i?B)\s*", value,
+                         flags=re.IGNORECASE) if isinstance(value, str) else None
+    if match is None:
+        raise ValueError(f"store options.capacity 须带单位，例如 '64 GiB'，got {value!r}")
+    unit = match[2].upper()
+    exponent = "BKMGT".index(unit[0])
+    amount = Fraction(match[1]) * (1024 if "I" in unit else 1000) ** exponent
+    if amount <= 0 or amount.denominator != 1:
+        raise ValueError(f"store options.capacity 须对应正整数字节，got {value!r}")
+    return int(amount)
 
 
 def flatten_block_ids(block_tables) -> tuple[int, ...]:

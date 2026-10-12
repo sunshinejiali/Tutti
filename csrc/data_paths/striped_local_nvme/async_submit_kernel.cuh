@@ -5,7 +5,8 @@
 //   * submit-only kernel: the worker pool of fused_submit_kernel_pool, but
 //     each entry is issued with submit_no_wait (no completion wait);
 //   * wait_batches kernel: one warp that drains every queue of the DataPath
-//     until the listed batches have finished, or a time limit passes.
+//     until the listed batches have finished; a deadline reports timeout but
+//     is not permission to retire a kernel before the IO has completed.
 
 #include <cstdint>
 

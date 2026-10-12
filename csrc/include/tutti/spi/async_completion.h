@@ -24,6 +24,14 @@ public:
     // those ops have finished. The caller holds the DataPath's progress gate.
     virtual Status enqueue_wait(const DataPathOp* ops, std::size_t count,
                                 void* stream) = 0;
+
+    // Report the irreversible release separately from device-guard restore
+    // errors. Runtime must not retry an op already removed by the DataPath.
+    virtual Status release_retired(DataPathOp op, bool& retired) {
+        const Status result = dynamic_cast<DataPath*>(this)->release(op);
+        retired = result.ok();
+        return result;
+    }
 };
 
 } // namespace tutti

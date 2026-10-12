@@ -164,11 +164,6 @@ def read_log_tail() -> str:
         return ""
 
 
-def _last_int(text: str, pattern: str, cast=int):
-    hits = re.findall(pattern, text)
-    return cast(hits[-1]) if hits else None
-
-
 def read_storage_stats(text: str) -> dict:
     """从日志尾部抓 Tutti 侧的 per-rank 落盘计数。
 
@@ -177,7 +172,6 @@ def read_storage_stats(text: str) -> dict:
     index 落盘是否持续生效、以及是否与内存增长同步。
     """
     stats: dict[str, float] = {}
-    written = _last_int(text, r"DIRECT_CHECKPOINT_WRITTEN", str)
     stats["ckpt_total"] = (
         float(len(re.findall(r"DIRECT_CHECKPOINT_WRITTEN", text)))
     )
@@ -192,12 +186,6 @@ def read_storage_stats(text: str) -> dict:
 
 def read_health(text: str) -> dict:
     """读日志尾部最后一条 [tutti] health。"""
-    line = None
-    for candidate in text.splitlines():
-        if "[tutti] health" in candidate:
-            line = candidate
-    if line is None:
-        return {}
     line = None
     for candidate in text.splitlines():
         if "[tutti] health" in candidate:
@@ -272,11 +260,6 @@ def main() -> int:
         tail = read_log_tail()
         record.update({f"t_{k}": v for k, v in read_health(tail).items()})
         record.update(read_storage_stats(tail))
-        ckpt_elapsed = re.findall(
-            r"DIRECT_CHECKPOINT_WRITTEN elapsed=([0-9.]+)s", tail
-        )
-        if ckpt_elapsed:
-            record["ckpt_last_elapsed_s"] = float(ckpt_elapsed[-1])
         with open(OUT, "a") as handle:
             handle.write(json.dumps(record) + "\n")
         summary = {

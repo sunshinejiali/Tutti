@@ -170,7 +170,7 @@ stream semantics.
 ## 4. Deployment topology
 
 - **Daemon**: one `tutti_daemon` per host owns the controllers; the canonical
-  deployment template is `config/local_nvme_config.yaml` (gRPC defaults to
+  deployment template is `config/device_manager/nvme_daemon.yaml` (gRPC defaults to
   127.0.0.1:50051).
 - **Devices**: daemon-published block and view paths are authoritative;
   striped targets span multiple backing mounts when configured.

@@ -1858,20 +1858,7 @@ SubmitOutcome StripedDataPath::submit_impl_(const DataPathRequest* requests,
     op.prp_cache_refs = std::move(prp_cache_refs);
 
     if (ce != cudaSuccess) {
-        // Same conservative fallback as LocalNvmeDataPath: sync the stream.
-        cudaError_t sync_err = cudaStreamSynchronize(ctx.stream);
-        if (sync_err != cudaSuccess) cudaGetLastError();
-        op.state = (sync_err == cudaSuccess) ? IoState::COMPLETED : IoState::FAILED;
-        op.status = (sync_err == cudaSuccess)
-            ? Status::Ok()
-            : Status(StatusCode::DEVICE_ERROR, "stream sync failed after event record failure");
-        if (sync_err == cudaSuccess) {
-            aggregate_completion_status_(op);
-        } else {
-            op.bytes_transferred = 0;
-            set_completion_failure(op.completion_detail,
-                                   IoFailureKind::CUDA_QUERY_ERROR, 0);
-        }
+        handle_submit_event_failure_(op);
     } else {
         op.state = IoState::IN_FLIGHT;
         op.status = Status::Ok();
@@ -1890,6 +1877,21 @@ SubmitOutcome StripedDataPath::submit_impl_(const DataPathRequest* requests,
     }
     outcome.op = detail::SpiIdentityMint::mint<detail::DataPathOpTag>(op_token, 1);
     return outcome;
+}
+
+void StripedDataPath::handle_submit_event_failure_(OpEntry& op) {
+    const cudaError_t sync_err = cudaStreamSynchronize(static_cast<cudaStream_t>(op.stream));
+    if (sync_err != cudaSuccess) cudaGetLastError();
+    op.state = (sync_err == cudaSuccess) ? IoState::COMPLETED : IoState::FAILED;
+    op.status = (sync_err == cudaSuccess)
+        ? Status::Ok()
+        : Status(StatusCode::DEVICE_ERROR, "stream sync failed after event record failure");
+    if (sync_err == cudaSuccess) {
+        aggregate_completion_status_(op);
+    } else {
+        op.bytes_transferred = 0;
+        set_completion_failure(op.completion_detail, IoFailureKind::CUDA_QUERY_ERROR, 0);
+    }
 }
 
 int StripedDataPath::launch_io_kernel_(const StripedDeviceSubmitEntry* d_entries,

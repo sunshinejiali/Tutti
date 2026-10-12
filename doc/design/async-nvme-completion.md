@@ -1,6 +1,12 @@
 # GPU 直连 NVMe 的异步完成：提交与回收分离
 
-> **状态**：已实现（2026-10-09，实验开关 `TUTTI_ASYNC_COMPLETION=1`，默认关闭），实测见 §11。
+> **状态**：正常路径已实现（2026-10-09，实验开关 `TUTTI_ASYNC_COMPLETION=1`，默认关闭），实测见 §11。
+>
+> **2026-10-10 生命周期修正**：异步超时不再提前结束 kernel/批次；保持在飞
+> 状态直到实际完成和全部等待流退休。关闭超时保留资源且可重试，Runtime 保留全部
+> 子操作的内存/目标引用。新增 GPU 显存合成 CQ、迟到完成、多流等待和软件释放失败
+> 测试，见 §12。默认仍关闭；修正后的真实 NVMe/LLM 回归尚未重跑。
+> 同步 DataPath 原有 timeout 路径不在本轮改动范围。
 >
 > 本文讨论把 GPU 发起的 NVMe IO 从"IO kernel 提交后原地等自己的完成"改成"提交
 > kernel 写完命令就退出，由回收者统一处理完成队列"。重点回答两个问题：
@@ -210,7 +216,7 @@ wait_batches(要等的批次列表 [{slot, batch_id}, ...], all_queues[], 轮询
     loop:
         第 k 号线程负责 all_queues[k], all_queues[k + 32], ...：各调一次 drain_completions
         if 列表里每个批次都满足 finished_batch_id[slot] == batch_id: return   // 正常完成
-        if 超过轮询上限: 给未完成的批次置 timed_out[slot] = 1; return
+        if 超过 deadline 且尚未报告: 给未完成批次置 timed_out[slot] = 1，继续回收等待
         nanosleep（退避）
 ```
 
@@ -288,11 +294,17 @@ Python handle（整数 id）
 
 ## 6. 超时与故障
 
-- 等待 kernel 超过轮询上限：置 `timed_out[slot] = 1` 后退出，主机把该批次报为超时（与现
-  在 status = 2 同一对外语义）。
-- **超时批次的槽位隔离**：不回到 free list，`pending_entries[slot]` 不清零。迟到的完成记
-  录照常被回收者处理（写 status、还 cid、推进 head），计数归零后主机再释放槽位。这同时修掉 §2.2 第 2
-  条的队列卡死：迟到的 CQE 不再挡住 head。
+- 等待 kernel 超过 deadline：置 `timed_out[slot] = 1`，但继续回收直到实际完成。
+  不能提前退出让消费流读未落地的数据。主机 `wait()` 有独立观察超时，可返回 TIMEOUT；
+  观察超时不取消设备命令。
+- **超时批次资源保留**：状态保持 IN_FLIGHT，不释放 op、arena、PRP、内存注册或目标租约。
+  迟到 CQE 正常回收；`finished_batch_id` 匹配且所有已登记等待流的退休事件完成后，
+  才发布 FAILED/TIMEOUT 并释放资源。异步路径不再走提前回收槽位的 `release_with_timeout_leak`。
+- `shutdown(timeout_ns)` 超时保留资源，拒绝新提交，可再调用以完成 drain。析构不能返回并
+  自动销毁还在使用的成员资源，因此可能等待；设备永久挂死必须先由运维安全恢复，不能
+  用 free 或第二次信号冒充 NVMe Abort。
+- Runtime 即使一个子操作失败，也等所有其它子操作安全退休；query/progress 错误不能
+  证明 DMA 取消。已经完成但释放失败时保留结果和引用，允许重试。
 - 命令永远不完成（设备挂死）：cid 和槽位一直被占，与现在一样需要队列重置；本设计不处理
   NVMe Abort / 控制器复位。
 - 主机兜底回收：如果某个批次没有任何设备侧等待者（例如 abort 路径、只在主机上
@@ -309,8 +321,8 @@ Python handle（整数 id）
 - `submit()` 不变（SPI 不变），返回的 op 在异步模式下多记 `batch_id` 和 `finished_event`。
 - `enqueue_wait(op, stream)`：在 `stream` 上插 `cudaStreamWaitEvent(op.submitted_event)` +
   `wait_batches`，并在其后记 `op.finished_event`。可一次传多个批次。
-- `progress` 的异步版本：有 `finished_event` 时查它；没有时读 `finished_batch_id` 的主机可见镜像
-  （或 D2H），必要时触发 §6 的兜底回收。完成后的 status D2H 汇总与现在相同。
+- `progress` 的异步版本：检查 `finished_batch_id` 的主机可见镜像与所有等待流的退休事件；
+  两者同时完成才终态，必要时触发 §6 的兜底回收。完成后的 status D2H 汇总与同步相同。
 
 **Runtime / pybind（新增）**
 
@@ -339,7 +351,7 @@ Python handle（整数 id）
 | `cid_owner`、`pending_entries` / `finished_batch_id` / `timed_out`、`all_queues` 的分配与生命周期 | 新文件 `csrc/data_paths/striped_local_nvme/async_completion.{h,cpp}` |
 | 异步模式的 DataPath | 见下 |
 | `Runtime::enqueue_wait`、pybind 导出、`store.enqueue_wait` | 新增函数 |
-| 硬件契约测试 | 新目录 `tests/async_completion_contract/` |
+| 硬件契约测试 | 新目录 `tests/data_paths/async_completion/` |
 
 **必须触碰的接入点（都是新增分支，默认关闭）**：preset / 配置里一个新开关
 `completion: async`（默认 `sync`），以及 worker 两处按开关选择等待方式。
@@ -407,7 +419,7 @@ LocalNvmeDataPath（单盘）暂不做：生产路径是 StripedDataPath，验�
 | 开关 `completion: async`（配置项） | 环境变量 `TUTTI_ASYNC_COMPLETION=1`，YAML 工厂与 preset 两条构建路径都读它；Python 侧读同一个变量 |
 | `complete_on` / `enqueue_wait` 接口 | `tutti::AsyncCompletion::enqueue_wait`（新 SPI 头 `spi/async_completion.h`，DataPath 可选实现）→ `StorageRuntime::enqueue_wait` → pybind `runtime.enqueue_wait(handles, stream)` → `store.enqueue_compute_wait(completions)` |
 | 新文件 `async_submit_kernel.cu` | `async_submit_kernel_impl.cuh`，由 `fused_submit_kernel.cu` 末尾 include：原头文件在头里定义 kernel，第二个翻译单元会在设备链接时重复定义 |
-| 主机看 `finished_event` | 主机读 `finished_batch_id` 的映射内存镜像（system scope 写），不依赖等待 kernel 的 event |
+| 主机看 `finished_event` | 主机先读 `finished_batch_id` 镜像，再检查每个已登记等待流的退休事件；二者同时满足才终态 |
 | §6 主机兜底回收 | 已实现：提交完成 100 ms 后仍无人排等待的批次，在 DataPath 内部流上补一个等待 kernel（每进程只打印一次日志）。只在主机侧等待的调用方（预热读、契约测试）走这条 |
 
 对现有代码的改动（方案 A）：`StripedDataPath` 两处 `private` → `protected`；新增 virtual
@@ -427,7 +439,7 @@ Python 接入点：`worker.wait_for_layer_load`（异步模式下计算流等本
 | `tutti_raid0_local_nvme_contract_test`（异步模式，走主机兜底回收） | 18/18 |
 | Python 455、非硬件 ctest 31、chrdev 身份 31/31、RAID0 18/18（同步模式，确认默认路径不变） | 全过 |
 | 离线 e2e 输出 token | 同步 / 异步完全一致 |
-| **未测**：等待超时后的槽位隔离与迟到完成记录的回收（§6） | 需要注入超时的测试 |
+| 当时未测：超时与迟到完成退休 | 2026-10-10 已补 GPU-only 合成故障测试，见 §12；真实 SSD 故障注入仍未做 |
 
 ### 11.3 性能
 
@@ -494,3 +506,47 @@ sqlite `tmp-export/{sync,async}-256k.sqlite`）：B 的 prefill 步（13304 toke
 何时到达，8 个 rank 各不相同；TP 每层两次 all-reduce 都要等最慢的那个，于是每个 rank 的
 随机变慢被放大成全员等待。异步模式消除了这一随机项，B 的三轮波动也从 ±190 ms 收窄到
 ±3 ms。
+
+## 12. 生命周期修正与故障验证（2026-10-10）
+
+本节是当前代码的安全契约；§11 的性能数字来自此前版本，不代表本次修正已重新做真实性能验收。
+
+### 完成与资源退休分开确认
+
+1. 超过 deadline 只置 `timed_out`；等待 kernel 继续回收，不让消费流在 IO 未完成时前进。
+2. `finished_batch_id` 匹配表示命令已完成；还须检查所有已登记等待流的 CUDA event 已退休。
+3. 两个条件同时满足后才发布终态。超时批次最终为 FAILED/TIMEOUT，之后可正常归还 arena。
+4. 在此之前 op、PRP、arena、内存注册与目标租约均保持引用；`release`/close/unregister 不能
+   以观察错误代替硬件取消。异步路径不调用提前复用槽位的 timeout-leak 释放。
+5. 每批 H2D 的源状态放在稳定的主机容器中，不再引用函数返回后的栈。
+
+### 关闭与错误重试
+
+- `shutdown` 先禁止新增提交，给在飞批次排回收等待；主机期限到达返回 TIMEOUT，保留完整
+  资源，下次可继续 drain。时间预算是轮询的合作式限制，不能中断一个已经开始的 CUDA API。
+- 所有批次真正完成且所有等待 event 已退休后，才释放队列、arena 和 completion tables。
+- Runtime 等全部异步子操作结束，不因一个失败或 query/progress 错误提早归还引用。
+- 子操作 terminal snapshot 保留到释放成功；`release_retired(op, retired)` 区分实际释放
+  与后续 guard 恢复错误，已发生的 release 不重放。
+- submit event 记录失败时，stream 同步只证明命令已提交；不能证明 SSD IO 完成。独立跟踪
+  submit 退休状态。等待 event 记录失败时保留等待引用，允许原流补录退休 event。
+- `wait/query` 在放锁驱动进度后重新验证原 handle，避免另一个线程复用槽位后返回新批结果。
+- 析构不能靠 return 阻止成员析构；异步 owning Runtime/DataPath 必须保留对象直到安全排空。
+  因而永久挂死的设备可能导致析构等待。无 NVMe Abort/reset 确认时，不以强行 free 代替恢复。
+
+### 本轮测试
+
+- Python index 3 个反例：同批驻留 key 不能被驱逐、容量不足无副作用、批外 pin 保持保护。
+- Runtime 软件 fake：query/progress 错误、失败子操作旁仍有在飞子操作、释放前失败、实际释放
+  后 restore 失败、Runtime 槽位复用清理错误、已受理 op 的状态数组异常。
+- `tutti_async_completion_contract_test`（`hardware;gpu_only` 标签，不打开 NVMe）：
+  - 显存合成 CQ 验证 `(queue, cid)` 到两个批次的映射、完成乱序、phase 回卷与 CID/SQ 回收；
+  - gated producer 制造迟到完成，超时后状态与 arena 不可释放；
+  - 第一条等待结束但第二条流仍被 gate 阻塞，批次继续在飞；
+  - shutdown 超时后仍保留表/arena，并拒绝新请求；解除 gate 后可重试关闭；
+  - 模拟缺失 submit/等待事件并检查安全退休；一次等待 20 个批次跨 16 项分组；零进度预算不推进。
+- 483 个 Python 测试、31 个非硬件 C++ 用例通过；GPU-only 契约单独通过。
+- compute-sanitizer memcheck 尝试超过 90 秒，只有启动 banner，没有结果；**不能记为通过**。
+
+未做：本轮修正后的真实 NVMe/LLM/性能回归、真实驱动错误/永久设备故障与 reset 认证。
+默认仍使用同步完成模式，不改变部署中的 daemon 或既有盘数据。

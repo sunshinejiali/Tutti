@@ -34,11 +34,8 @@
  *     heartbeat_interval_sec: 10
  *     timeout_sec: 30
  *
- * The parser accepts one completely legacy-only schema during the transition:
- * gpus[].id/mount_path and nvmes[].mount_path/allowed_gpus are normalized at
- * the parser boundary. Canonical and legacy fields cannot be mixed. Legacy
- * deprecation messages are returned through ConfigDiagnostics so tests and
- * embedders do not depend on stderr.
+ * Only the explicit-identity schema is accepted; positional device identity
+ * and gpus/mount_path/allowed_gpus fields are not supported.
  *
  * The kernel-reported user QID range supplies controller capacity. queue_pool
  * is only the per-client admission policy; ServiceState keeps the runtime
@@ -136,15 +133,8 @@ struct ServiceConfig {
     UnmountRetryConfig           unmount_retry;
 };
 
-struct ConfigDiagnostics {
-    // Injectable warnings, primarily for legacy-schema deprecation assertions.
-    std::vector<std::string> warnings;
-};
-
 std::optional<ServiceConfig> parse_config_file(
-    const std::string& path,
-    std::string* error = nullptr,
-    ConfigDiagnostics* diagnostics = nullptr);
+    const std::string& path, std::string* error = nullptr);
 
 // Cross-reference validator for IDs, paths, PCI BDFs, ACLs, policy, and lease
 // cadence.  It does not probe hardware; bring-up validates device facts later.

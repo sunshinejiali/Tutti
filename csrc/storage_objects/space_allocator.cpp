@@ -56,7 +56,7 @@ void SpaceAllocator::set_ready_limit(std::uint64_t limit) {
 // Prefers recycled slots over never-used ones so the working set stays compact:
 // that keeps the materialised prefix small, which matters because
 // materialisation is the expensive part.
-std::uint64_t SpaceAllocator::next_free_locked() {
+std::uint64_t SpaceAllocator::take_free_slot_locked() {
     if (!free_list_.empty()) {
         const std::uint64_t slot = free_list_.front();
         free_list_.pop_front();
@@ -73,7 +73,7 @@ SlotReservation SpaceAllocator::reserve(std::uint64_t count) {
     out.generations.reserve(static_cast<std::size_t>(count));
 
     for (std::uint64_t i = 0; i < count; ++i) {
-        const std::uint64_t slot = next_free_locked();
+        const std::uint64_t slot = take_free_slot_locked();
         if (slot >= total_slots_) {
             // Out of space. Report the remainder and stop: exhaustion is an
             // ordinary outcome, so there is nothing to wait for or raise.

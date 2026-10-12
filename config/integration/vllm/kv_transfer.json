@@ -1,0 +1,22 @@
+{
+  "kv_connector": "TuttiConnectorV1",
+  "kv_connector_module_path": "tutti.integration.vllm.connector",
+  "kv_role": "kv_both",
+  "kv_load_failure_policy": "fail",
+  "kv_connector_extra_config": {
+    "chunk_tokens": 512,
+    "store": {
+      "type": "tutti_nvme",
+      "options": {
+        "root": "/mnt/your-kv/tutti-kv-{LOCAL_RANK}",
+        "capacity": "64 GiB",
+        "preset": {
+          "type": "striped",
+          "daemon_config": ["config/local/tutti_daemon_kv.yaml"],
+          "gpu_id": "{LOCAL_RANK}",
+          "device_groups": [[0, 1]]
+        }
+      }
+    }
+  }
+}

@@ -28,3 +28,5 @@ add_test(NAME tutti_config_spec_headers_test
     COMMAND tutti_config_spec_headers_test)
 set_tests_properties(tutti_config_spec_headers_test PROPERTIES
     LABELS "host;config;spec;headers")
+
+set_property(TEST tutti_config_spec_test tutti_config_spec_debug_test tutti_config_spec_headers_test APPEND PROPERTY LABELS module_config)

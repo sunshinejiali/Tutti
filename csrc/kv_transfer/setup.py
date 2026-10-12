@@ -4,10 +4,8 @@ import os
 from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
-# Target arch: default to the local GPU (H20 -> sm_90); override via
-# TORCH_CUDA_ARCH_LIST (torch's cpp_extension honours it, e.g. "9.0").
-if "TORCH_CUDA_ARCH_LIST" not in os.environ:
-    os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0"
+# torch selects the architectures of visible GPUs by default. For builds
+# without a GPU, set TORCH_CUDA_ARCH_LIST explicitly for the deployment target.
 
 
 def read_version():

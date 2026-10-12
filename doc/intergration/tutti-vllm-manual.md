@@ -1,226 +1,174 @@
 # Tutti × vLLM 操作手册
 
-> 本机（TENCENT64）专用。权威架构：`doc/vllm-connector/Target_arch.md`；
-> 设计复盘：`doc/intergration/tutti-vllm-integration.md`；编排：`ai-orch/`。
+这是可复制的部署与验收流程，不是维护者机器的历史日志。先完成
+[`快速开始`](../getting-started.md) 的构建、三个 Python 包、宿主安全配置及硬件验证。
+Connector 的入口是 `tutti.integration.vllm.connector.TuttiConnectorV1`；不再使用
+旧的 `adapter.connector`、`integration/vllm-connector` 或 `/data2` 路径。
 
-## 0. 命名与位置（统一，勿混用）
+## 1. 明确运行环境
 
-| 名称 | 路径 | 状态（2026-08-20） |
-|---|---|---|
-| Python 环境 | `/data/home/ryeqiu/tutti-env` | **就绪**（uv 建的 venv，python 3.11.16；torch 2.13.0+cu130、numpy、pytest 已装） |
-| C/C++ 编译器 | `/data/home/ryeqiu/tutti-compilers` | **就绪**（conda 独立环境，gcc/g++ 12.4.0；vllm 要求 ≥11.3） |
-| rust | `/data/home/ryeqiu/.rustup` + `.cargo` | **就绪**（stable 1.97.1，`rustup default stable` 已设） |
-| 环境入口 | `/data/home/ryeqiu/env-tutti.sh` | 就绪（source 即用，见 §7） |
-| tutti 源码 | `/data/home/ryeqiu/Tutti` | 主仓库 |
-| tutti_runtime（pybind） | `Tutti/csrc/python` | **就绪**（T-101；自带 setup.py，不由根 pyproject 打包） |
-| KV transfer（CUDA 扩展） | `Tutti/csrc/kv_transfer` | 就绪（自带 setup.py） |
-| connector 适配层 | `Tutti/tutti/integration/vllm/` | 就绪（vLLM 专属；新增框架在 `tutti/integration/` 下平级扩展） |
-| KV 引擎层 | `Tutti/tutti/engine/` | 就绪（框架无关：core/completion/transfer/staging/metadata） |
-| 索引 / 存储层 | `Tutti/tutti/index/`、`Tutti/tutti/storage/` | 就绪（框架无关） |
-| vLLM 压测脚本 | `Tutti/scripts/vllm/` | 就绪（profile/smoke/convert + `run/` 机器本地配置） |
-| vLLM fork | `/data/home/ryeqiu/Tutti/third_pkgs/vllm` | **就绪**（0.1.dev20081+gb0e9cff5e，editable 已装） |
-| vendored CUDA | `/data/home/ryeqiu/Tutti/third_pkgs/nvidia/cuda-toolkit` | 就绪（CUDA 13.3） |
-| 模型 | `/data2/qwen`（Qwen2.5-14B、qwen2-5-7B）、`/data2/deepseek-ai`（DeepSeek-V3.1/V4-Flash）、`/data2/tencent`（Hy3、Hy3-FP8） | 冒烟候选：**qwen2-5-7B** |
-| trace 负载 | `/data2/traces`（1.1G） | R3 bench 用 |
-| 测试日志 | `/data/home/ryeqiu/log/`（vllm_build.log、pip_cuda.log） | |
-| pip/tmp 缓存 | `/data/home/ryeqiu/pip-cache`、`/data/home/ryeqiu/tmp` | 磁盘纪律（系统盘曾满） |
-
-## 1. 环境要求（已核实）
-
-- 8×GPU（驱动 580.105.08）；8×NVMe（**NUMA1 四盘已 bring-up**，
-  NUMA0 四盘待补，见 §3）
-- 系统 python3.6 + gcc8.5：**不用**，一切进 tutti-env/tutti-compilers
-- 磁盘纪律：TMPDIR/PIP_CACHE/RUSTUP/CARGO 一律指向 `/data/home/ryeqiu/`
-
-## 2. 构建 Tutti C++（一次）
-
-按 [`../getting-started.md`](../getting-started.md) 完成唯一默认硬件构建：
+在仓库根、同一 Python 环境中设置：
 
 ```bash
-cd /data/home/ryeqiu/Tutti
-cmake --preset default
-cmake --build --preset default --parallel 8
+export TUTTI_PYTHON="$(command -v python)"
+export MODEL=/path/to/model
+export TUTTI_PROFILE_ROOT=/path/on/nvme/tutti-profile
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+export TP_SIZE=4
+export DAEMON_CONFIG="$PWD/config/local/tutti_daemon_kv.yaml"
+export DEVICE_GROUPS="0,1,2,3"
+export KV_MOUNT=/mnt/your-kv
 ```
 
-## 3. snvme 内核模块 + tutti_daemon bring-up
+以上值是示例，必须匹配已经启动的daemon。`tutti_daemon_kv.yaml`表示部署者自行创建并
+审核的配置，不是仓库预装文件；先按快速开始创建它。`MODEL`也可以是Hugging Face ID。
+默认权重加载为 vLLM 的 `auto`，**KV offload 不依赖 Phoenix**。
 
-严格三步（详见 `doc/tutti_daemon.md`）：
-
-```bash
-# 1) 内核模块（snvme.ko）：按 doc/getting-started.md 编译，并按站点流程签名/加载。
-# 2) tutti_daemon（controller bring-up + mount）：
-sudo env TUTTI_VERBOSE=1 nohup \
-  /data/home/ryeqiu/Tutti/build/bin/tutti_daemon \
-  --config config/local/tutti_daemon_kv0.yaml \
-  > /data/home/ryeqiu/log/tutti_daemon.log 2>&1 &
-# 3) 验证：
-ls /dev/snvme* /dev/ssnvme*   # 设备节点出现
-ls /mnt/nvme*/                # daemon 挂载点非空
-# 真机测试 preset：config/local/preset_gpu0.json
-#   TUTTI_NVME_PRESET=.../preset_gpu0.json \
-#     python -m pytest tests/contract/test_local_store.py -k real -v
-```
-
-> 机器重启后需重跑（内核模块不持久）。
-
-## 4. Python 环境 tutti-env（已完成，T-110）
-
-实际构建方式（uv venv，非 conda）：
-
-```bash
-# 基座：uv 管理的 cpython-3.11
-# /data/home/ryeqiu/uv-python/cpython-3.11-linux-x86_64-gnu/
-# tutti-env 是其 venv；torch 2.13.0+cu130（cu130 wheel）已装
-
-source /data/home/ryeqiu/tutti-env/bin/activate
-python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
-```
-
-## 5. 编译器环境 tutti-compilers（已完成）
-
-vllm 要求 GCC≥11.3（PyTorch C++20 headers），系统 gcc8.5 不可用：
-
-```bash
-# 已用系统 conda 装独立编译器环境（不污染 tutti-env）：
-# conda create -y -p /data/home/ryeqiu/tutti-compilers -c conda-forge \
-#     gcc_linux-64=12 gxx_linux-64=12
-
-/data/home/ryeqiu/tutti-compilers/bin/x86_64-conda-linux-gnu-gcc --version
-# 12.4.0
-```
-
-## 6. 编译 vLLM（进行中，T-110）
-
-```bash
-source /data/home/ryeqiu/tutti-env/bin/activate
-export CUDA_HOME=/data/home/ryeqiu/Tutti/third_pkgs/nvidia/cuda-toolkit
-export PATH=$CUDA_HOME/bin:/data/home/ryeqiu/.cargo/bin:$PATH
-export CC=/data/home/ryeqiu/tutti-compilers/bin/x86_64-conda-linux-gnu-gcc
-export CXX=/data/home/ryeqiu/tutti-compilers/bin/x86_64-conda-linux-gnu-g++
-export CUDAHOSTCXX=$CXX   # 必须！nvcc host 编译器，CC/CXX 不会传给 nvcc（见 §10）
-export TMPDIR=/data/home/ryeqiu/tmp
-export RUSTUP_HOME=/data/home/ryeqiu/.rustup CARGO_HOME=/data/home/ryeqiu/.cargo
-cd /data/home/ryeqiu/Tutti/third_pkgs/vllm
-
-pip install packaging setuptools-rust setuptools-scm
-pip install -r requirements/common.txt -r requirements/cuda.txt   # 已完成
-
-# 后台编译（断连不影响）：
-nohup bash -c 'MAX_JOBS=48 pip install -e . --no-build-isolation' \
-  > /data/home/ryeqiu/log/vllm_build.log 2>&1 &
-tail -f /data/home/ryeqiu/log/vllm_build.log
-
-# 验证（编译完成后）：
-python -c "import vllm; print(vllm.__version__, vllm.__file__)"
-# __file__ 必须指向 third_pkgs/vllm（editable 生效）
-cd third_pkgs/vllm && git status --porcelain | grep "^ M" | head   # 必须无输出
-```
-
-**踩过的坑**（已解决）：① CUDA_HOME 未设置 → 报错
-`AssertionError: CUDA_HOME is not set`；② GCC 8.5 →
-`GCC >= 11.3 is required`；③ PEP517 元数据阶段挂起（pip -q 无输出假象，
-改用 tee 实时日志）；④ 未设 `CUDAHOSTCXX` → nvcc 用系统 gcc 8.5 当 host，
-`-std=c++20` 被静默忽略，CCCL 报 `CUB requires at least C++17`（详见 §10）。
-
-## 7. 每次使用
-
-```bash
-source /data/home/ryeqiu/env-tutti.sh
-```
-
-`env-tutti.sh` 内容（已写好）：
-
-```bash
-source /data/home/ryeqiu/tutti-env/bin/activate
-export TMPDIR=/data/home/ryeqiu/tmp PIP_CACHE_DIR=/data/home/ryeqiu/pip-cache
-export CUDA_HOME=/data/home/ryeqiu/Tutti/third_pkgs/nvidia/cuda-toolkit
-export PATH=$CUDA_HOME/bin:/data/home/ryeqiu/.cargo/bin:$PATH
-export CC=/data/home/ryeqiu/tutti-compilers/bin/x86_64-conda-linux-gnu-gcc
-export CXX=/data/home/ryeqiu/tutti-compilers/bin/x86_64-conda-linux-gnu-g++
-export CUDAHOSTCXX=$CXX   # nvcc host 编译器（缺它 → CUB requires at least C++17）
-export RUSTUP_HOME=/data/home/ryeqiu/.rustup CARGO_HOME=/data/home/ryeqiu/.cargo
-export VLLM_SOURCE=/data/home/ryeqiu/Tutti/third_pkgs/vllm
-```
-
-## 8. vLLM 端到端测试（R2 起生效）
-
-### 冒烟（T-202 产出 `start_tutti_vllm.sh`）
-
-```bash
-bash <scripts>/start_tutti_vllm.sh --detach     # qwen2-5-7B 起步
-curl http://localhost:8000/v1/completions -H "Content-Type: application/json" \
-  -d '{"model":"qwen2-5-7B","prompt":"Hello","max_tokens":16}'
-```
-
-配置核心（外部 connector，零 vLLM 侵入，D-005）：
-
-```python
-kv_transfer_config = {
-    "kv_connector": "TuttiConnectorV1",
-    "kv_connector_module_path": "adapter.connector",
-    "kv_role": "kv_both",
-    "extra_config": {"capacity_bytes": ...,   # 必需；硬件无关
-                     "blocks_per_chunk": 0}}  # 0=自动（segment≥256KiB 对齐）
-```
-
-验收口径：同一 prompt 两遍，第二遍日志出现外部命中，输出 token 一致。
-
-### 在环 bench（T-203）
-
-LocalStoreBackend 真实建池（GB 级）→ GPU-direct 写 pattern → 读回校验 →
-上报 GB/s（分级对照：单盘 ~7 / NUMA 4 盘 ~28 / 全机峰值 50+GB/s）。
-
-### trace 负载（R3，`run_tutti_bench.sh`）
-
-`/data2/traces` 持续发压（populate/interleave/stream），结果
-`/data/home/ryeqiu/log/tutti_bench_*/`（TTFT p50/p90/p99 JSON）。
-
-## 9. 更新后重建
-
-| 更新了什么 | 操作 |
+| 参数 | 含义 |
 |---|---|
-| tutti C++ | `cmake --build --preset default --parallel 8` → 重装 tutti_runtime（pip install -e 幂等） |
-| connector 适配层 | 无需重编，直接重启 vllm |
-| engine/kernels | 重装对应包（pip install -e） |
-| vllm C++/rust | 重跑 §6（增量，rust 缓存有效） |
-| 内核模块/daemon | 重启机器后重跑 §3 |
+| `DAEMON_CONFIG` | 当前运行的 daemon YAML；多个文件以逗号分隔，合并成客户端盘清单 |
+| `DEVICE_GROUPS` | 每组以逗号分隔 `device_id`，组间分号；不是 `/dev/nvmeN` 编号 |
+| `TP_SIZE` | vLLM TP rank 数；须能被盘组数量整除 |
+| `KV_MOUNT` | 各 rank checkpoint/索引根所在挂载点；段文件位于所分配设备的 mount 下 |
+| `TUTTI_PROFILE_ROOT` | 日志、JIT cache、临时文件、profiler 报告的 NVMe 目录 |
+| `TUTTI_PYTHON` | 已安装 torch、vLLM、两个原生扩展的解释器 |
 
-## 10. 常见问题
+两个 NUMA 盘组的例子：`TP_SIZE=8 DEVICE_GROUPS="0,1,2,3;4,5,6,7"`，rank 0–3
+使用第一组，rank 4–7 使用第二组。每组 rank 都访问该组设备。PCI ACL 必须允许这些访问，
+不能仅凭“GPU i 对 NVMe i”推断其它成员盘的 P2P 可达性。
 
-**Q: `No space left on device`（系统盘）**
-确认 TMPDIR/PIP_CACHE_DIR/RUSTUP_HOME/CARGO_HOME 全部指向 /data
-（env-tutti.sh 已封装）；`df -h /data`。
+## 2. 配置模型几何与容量
 
-**Q: vllm 编译报 `CUDA_HOME is not set`**
-`export CUDA_HOME=/data/home/ryeqiu/Tutti/third_pkgs/nvidia/cuda-toolkit`。
+原生Runtime YAML与Python preset的区别、参数默认/单位/优先级和性能选择，见
+[配置与性能指南](../configuration-and-performance.md)。最小connector JSON示例位于
+`config/integration/vllm/kv_transfer.json`；必须修改其中的本机路径、设备ID与每rank容量。
+逐项注释见 [Python用户参数说明](../../config/integration/vllm/README.md)。直接JSON可写
+`"capacity": "64 GiB"`，并省略`max_chunks_per_wave`、`io_stream`和`num_queues`；
+在线wrapper使用`TOTAL_CAPACITY="128 GiB"`指定服务总payload预算，先除TP再传每rank。
+离线wrapper使用`CAPACITY`或`--capacity`指定每rank预算，不按模型名字猜测槽数。
 
-**Q: vllm 编译报 `GCC >= 11.3 is required (found 8.5.0)`**
-用 tutti-compilers 的 gcc-12：`export CC/CXX`（env-tutti.sh 已含）。
+运行入口仍名为 `serve-8gpu-striped.sh` / `bench-8gpu-striped.sh`，名称是历史名称；
+`TP_SIZE`、GPU 列表和盘组可覆盖，并不强制 8 卡。它们的预置几何来自 Hy3-FP8 验证环境，
+不是所有模型的安全默认。
 
-**Q: vllm 编译报 `CUB/Thrust/libcu++ requires at least C++17`（大量 .cu 齐挂）**
-根因：`CC/CXX` 只管 CMake 的 C++ 侧，**不会传给 nvcc**。未设
-`CUDAHOSTCXX` 时 nvcc 落回 PATH 的系统 gcc 8.5 当 host 编译器，
-`-std=c++20` 被静默忽略（日志中有一行
-`nvcc warning : The -std=c++20 flag is not supported with the configured
-host compiler. Flag will be ignored.`），等效按 C++14 编译；而 CUDA 13.0
-自带的 CCCL 3.0 要求 ≥C++17，于是所有含 CUB/Thrust 头（torch stable 头
-会拉入 thrust/complex.h）的 .cu 全部 `#error`。
-修复：`export CUDAHOSTCXX=/data/home/ryeqiu/tutti-compilers/bin/x86_64-conda-linux-gnu-g++`
-（env-tutti.sh 已含）后重跑 §6。验证：构建日志的 nvcc 命令行应含
-`-ccbin .../x86_64-conda-linux-gnu-g++`。
+- `BLOCK_SIZE` 必须被所选 vLLM attention backend 支持，且 `CHUNK_TOKENS` 是其整数倍。
+- `KV_CACHE_DTYPE=fp8` 必须有可用且正确的 KV scales；未经验证的模型先使用 `auto`。
+- `MAX_MODEL_LEN` 不超过模型和显存允许的上限；prompt 加生成 token 也不能超限。
+- `TOOL_CALL_PARSER` 必须符合模型工具格式；不把 Hermes 当作所有模型的兼容承诺。
+- 当前仅支持单一、定宽 KV cache group，多组/hybrid 布局会拒绝启动。
+- `TOTAL_CAPACITY` 是带单位的服务总payload预算，除以TP后传每rank；不是每盘上限。
+  首个段文件组仍需要足够空间，不能将预建开销误认为完全按需零成本。
 
-**Q: pip 装依赖长时间无输出（似卡死）**
-`-q` + `tail` 会吞掉下载进度；改用 `tee` 实时日志（如 pip_cuda.log）。
+段文件实际位于 `<mount>/r<rank>/segments/`。**不同 `POOL_TAG` 只隔离索引，不隔离这些
+段文件**；不得在同一挂载点/rank 上并发运行多个实例，也不得并发 benchmark 与线上服务。
+模型/TP/几何改变时应使用独立的数据部署或先停止并有计划地清理旧 KV。
 
-**Q: `ls /dev/snvme*` 为空 / 拓扑显示 N/A**
-daemon 未 bring-up 或内核模块未加载：重跑 §3 三步；NUMA0 先用 NUMA1。
+## 3. 离线 A→B 复用测试
 
-**Q: `import tutti_runtime` 失败**
-TUTTI_BUILD_DIR 未指对，或 tutti C++ 未构建：先 §2 再 §5。
+先停占用同一组 GPU / KV 段文件的服务，从较小上下文开始：
 
-**Q: vllm 装成了 pip wheel 而非源码**
-`vllm.__file__` 必须含 third_pkgs/vllm，否则 uninstall 后重跑 §6。
+```bash
+bash scripts/vllm/run/bench-8gpu-striped.sh \
+  --capacity "64 GiB" --tokens 10000 --reuse-pct 90 --rounds 3 --pool-tag reuse-check
+```
 
-**Q: 子 session 的 worktree 里跑测试**
-全部用 `/data/home/ryeqiu/tutti-env/bin/python`（3.11，含 pytest）；
-T-116/T-117 零 vllm 依赖可直接跑，T-113 起等 T-110 编译完成后。
+这个 wrapper 的离线几何固定为 `block-size=64`，KV dtype 使用 vLLM 默认；不要把它与在线
+脚本的 FP8/block=512 数字直接混在一起比较。需要调整离线几何时调用 driver 的 `--help`。
+
+- A 计算并写入，B 复用 A 的一部分前缀。
+- Tutti 跑法在 A/B 间只清本地 HBM prefix cache，保留外部缓存。否则 B 可能只从 HBM 命中。
+- 不同轮次改变首 token，保持 shape 一致且避免轮间重复命中。
+- 检查外部命中及 `DIRECT_READ_PLAN_READY`、失败记录和生成 token，再比较 `steady_mean`。
+  首轮包含 JIT、注册等一次性成本；HTTP 200 或“速度快”本身不能证明 KV 直读成功。
+
+同日 HBM 对照：
+
+```bash
+bash scripts/vllm/run/bench-8gpu-striped.sh \
+  --baseline --tokens 10000 --reuse-pct 90 --rounds 3
+```
+
+这是 HBM prefix-cache 参考，不是 B 全量重算参考。不要同时运行两组测试。
+
+## 4. 在线服务：先预览、再启动
+
+例子使用兼容性较保守的 KV dtype 与 context 长度，须依据目标模型调整 block/parser：
+
+```bash
+export PORT=8000
+export SERVED_NAME=tutti
+export KV_CACHE_DTYPE=auto
+export BLOCK_SIZE=64
+export CHUNK_TOKENS=512
+export MAX_MODEL_LEN=32768
+export MAX_PROMPT_TOKENS=32768
+export TOTAL_CAPACITY="128 GiB"
+export POOL_TAG=online-v020
+bash scripts/vllm/run/serve-8gpu-striped.sh --dry-run
+```
+
+预览会校验 daemon 清单、盘组 ID 和 TP，打印真实 connector JSON 及执行命令，不加载模型。
+确认后以前台方式启动，方便记录并管理进程：
+
+```bash
+bash scripts/vllm/run/serve-8gpu-striped.sh
+```
+
+需要后台启动时，将输出明确放到 NVMe，记录 API 进程 PID，并在停机时给该进程一次
+SIGTERM、等待全部 worker 退出；不要用宽泛 `pkill` 杀其它用户任务。此脚本不自动加载
+驱动、重建 RAID、格式化、清 KV 或释放控制器。
+
+### 验收 API 与流式输出
+
+在另一个终端：
+
+```bash
+curl --fail http://localhost:8000/health
+curl --fail http://localhost:8000/v1/models
+curl --fail -N http://localhost:8000/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"tutti","prompt":"Explain what a KV cache is.","max_tokens":32,"temperature":0,"stream":true}'
+curl --fail http://localhost:8000/metrics
+```
+
+成功标准：health=200、model 列表含服务名、流里有 token 并以 `[DONE]` 结束。
+同 prompt 再次调用可能命中 HBM；证明 NVMe 复用仍以第 3 节的离线隔离测试为准。
+长 trace 使用 `scripts/vllm/vllm_online_longrun.py --help` 选择数据集和并发，并单独保存客户端
+TTFT、错误码及运行参数；系统日志不一定能解释分词/排队/客户端延迟的全部开销。
+
+### 停止和恢复 Linux 驱动
+
+顺序是停止 API/worker → 确认无 IO 客户端 → 停 daemon/退回阵列。不要先解绑定 SSD。
+已登记的阵列通过 `tutti-env.sh daemon stop <name>` 交回 Linux；`protected` 级别还需要
+`--confirm <name>`，这不是绕过使用者检查的强制选项。不要对 daemon 连发两次 SIGTERM，
+也不要用 lazy unmount 当作安全回退。
+
+## 5. nsys 与实验异步完成
+
+```bash
+bash scripts/vllm/run/bench-8gpu-striped.sh \
+  --nsys --tokens 10000 --reuse-pct 90 --rounds 3 --pool-tag nsys-check
+```
+
+日志与 `.nsys-rep` 位于 `$TUTTI_PROFILE_ROOT/logs` / `reports`。CUDA/NVTX 必须覆盖
+真正的请求；按 launch correlation 和进程归属比较同一步，不能只按 CPU 时间窗截取 GPU
+kernel。单次 kernel 求和不是墙钟，也不能仅凭 kernel 名认定读写方向。
+
+`TUTTI_ASYNC_COMPLETION=1` 是可选实验模式：提交与 CQ 回收分离；默认关闭。不改
+vLLM/FlashInfer。正常路径及 64K/256K 性能结果见
+[`异步完成设计`](../design/async-nvme-completion.md)，但超时/迟到完成/资源隔离门禁尚未
+完整验收，不作为 v0.2.0 的默认安全路径。
+
+## 6. 排障入口
+
+| 症状 | 先查 |
+|---|---|
+| import 失败 | 当前 Python ABI、三个包、`build/` 库与 RUNPATH；`tutti-env.sh status` |
+| 服务启动拒绝 group/layout | 模型真实 KV cache spec；不可伪造层宽或禁用 guard |
+| B 无外部读 | HBM reset、A 提交成功、namespace、盘池恢复、读计划记录 |
+| `EAGAIN` 创建队列 | 每盘 ranks × 每 rank queues 与 daemon 实际可用配额 |
+| 慢首轮/启动 | JIT、权重加载、预建和注册；区分首轮与稳态 |
+| IO 失败/设备身份错配 | 立即停止测试，核对 PCI/namespace/字符设备，不能换编号“试一下” |
+| ENOSPC/根盘写入 | `findmnt`、KV mount、每 rank 容量与预建空间；不自动删业务文件 |
+
+详细判别方法随 [`runtime skill`](../../Skills/tutti-runtime/SKILL.md) 的 references 提供。

@@ -102,7 +102,7 @@ Code: `tutti/data_paths/local_nvme/metadata/handle_workspace_cache.h`,
   handle independently usable for IO.
 
 Code: `tutti/include/tutti/storage_runtime.h` (`open_batch`),
-`tests/batch_open_perf/batch_open_perf.cpp`,
+`tests/data_paths/perf/batch_open/batch_open_perf.cpp`,
 `tutti/data_paths/local_nvme/metadata/metadata_arena.cpp`
 
 ## 5. Multi-device placement

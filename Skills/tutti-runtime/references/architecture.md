@@ -34,7 +34,7 @@ tutti/integration/vllm/connector.py  (dual-role shell, same class)
 - `tutti/index/chunk_index.py` — pure logic, no IO. Chunk key derivation and the
   resident / pinned / pending state machine. Instantiated on **both** sides.
 - `tutti/engine/` — framework-agnostic orchestration: `core.py` (plans),
-  `completion.py` (handles), `transfer.py` (direct vs staged), `staging.py`,
+  `completion.py` (handles), `transfer.py` (direct transfer),
   `metadata.py` (scheduler-side index).
 - `tutti/storage/` — `base.py` defines the `KVStore` SPI; `tutti_nvme/` is the
   native backend (`store.py`, `object_layout.py` over the C++ object store,
@@ -64,7 +64,9 @@ tutti/integration/vllm/connector.py  (dual-role shell, same class)
 2. `wait_for_layer_load(N)` — wait on the CUDA event fenced after layer N's
    reads. This is a **device-side** dependency (`stream.wait_event`), so compute
    overlaps IO. If the feeder has not registered layer N yet, the caller blocks
-   until it does — being behind is a normal state, not an error.
+   until it does — being behind is a normal state, not an error. Experimental
+   async mode instead enqueues a completion-draining wait for this layer's
+   handles; a submit fence alone does not mean those reads have finished.
 3. `save_kv_layer` / `wait_for_save` — write the layers selected in the prepared
    batch (only `plan.new_keys`, i.e. keys not already resident on this rank).
 4. `build_connector_worker_meta` — hand the accumulated increments to vLLM's
@@ -91,19 +93,20 @@ Consequences worth internalising:
 There is exactly one on-disk layout. A chunk occupies one **slot**; slot numbers
 rotate over the rank's mounts (`device = slot % N`), and each device packs
 `segment_file_slots` (default 2048) of its slots into one segment file
-`<mount>/r<rank>/segments/<id>.seg`. A slot is a contiguous region: a 32 KiB
-prefix holding the object header, then every layer's segment. One chunk's IO
-therefore never spans disks; a long prompt spreads over all disks because its
-consecutive chunks rotate.
+`<mount>/r<rank>/segments/<id>.seg`. A slot has a 128 KiB prefix containing
+its object header, followed by each layer's segment. Independent mounts rotate
+whole chunk slots; an md RAID0 backing mount may map one file's extents across
+its member namespaces. The resolver supplies the array layout to the DataPath.
 
-- The 32 KiB prefix is not cosmetic: it makes every payload start 16 KiB-aligned.
-  With a 4 KiB prefix the same reads ran ~20% slower (the SSD's internal
-  parallelism follows the LBA pattern; see `doc/design/kv-storage-layout-and-io-submission.md`).
+- Prefix alignment is part of the IO layout, not just metadata overhead. The
+  default is 128 KiB; it can avoid crossing an aligned 128 KiB RAID stripe for
+  suitably sized layer segments. See `doc/design/kv-storage-layout-and-io-submission.md`.
 - The geometry (slots per file, prefix) is part of the namespace fingerprint:
   changing it means a new pool, and opening old media fails closed.
 - Segment files live under the mounts, not under `kv_root`; `kv_root` holds the
-  checkpoint and residency bitmaps. A new `kv_root` gives a fresh index and the
-  existing segment files are adopted (their old contents are unreachable).
+  checkpoint and residency bitmaps. A new `kv_root` gives a fresh index but
+  still shares the same mount/rank payload files. It is not physical isolation:
+  concurrent instances can overwrite each other's slots.
 
 ## Precreation: File Groups, Never on the Write Path
 

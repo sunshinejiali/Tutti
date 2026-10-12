@@ -3,7 +3,7 @@
 > **状态：历史低层协议参考，不是当前部署入口。**手动构建请使用
 > [`doc/getting-started.md`](../../../../doc/getting-started.md)，生产 daemon 配置与启动请使用
 > [`doc/tutti_daemon.md`](../../../../doc/tutti_daemon.md) 和
-> `config/local_nvme_config.yaml`。下文保留旧 `nvmeservice_daemon` / `Connect` 协议的
+> `config/device_manager/nvme_daemon.yaml`。下文保留旧 `nvmeservice_daemon` / `Connect` 协议的
 > 设计与诊断背景，不应复制其旧 `sys_config.yaml`、preset 或输出路径命令。
 >
 > Session broker for SNVMe (post L1 Commit 4b).
@@ -90,7 +90,7 @@ For a current deployment:
 1. Compile with [`doc/getting-started.md`](../../../../doc/getting-started.md);
    the resulting output directory is `build/`.
 2. Follow [`doc/tutti_daemon.md`](../../../../doc/tutti_daemon.md) to create
-   canonical YAML from `config/local_nvme_config.yaml`, load a signed module,
+   canonical YAML from `config/device_manager/nvme_daemon.yaml`, load a signed module,
    and start `build/bin/tutti_daemon`.
 3. Use `build/bin/nvmeservice_client --list-only` to inspect daemon-published
    resources and view paths.
@@ -101,47 +101,12 @@ not run their `nvmeservice_daemon`, `sys_config.yaml`, legacy ACL, or fixed
 
 ---
 
-## Legacy YAML schema
+## Configuration
 
-> 当前唯一 canonical schema 是 `config/local_nvme_config.yaml`；字段使用
-> `accelerators[].accel_id`、`view_root`、`nvmes[].device_id`、
-> `backing_mount_path` 和 `allowed_accel_ids`。不要根据以下历史 schema 新建部署配置。
-
-```yaml
-grpc:
-  endpoint: "127.0.0.1:50051"            # required
-
-gpus:
-  - { id: 0, mount_path: "/mnt/gpu0" }   # at least one entry
-
-nvmes:
-  - pci_addr: "0000:08:00.0"             # required
-    mount_path: "/mnt/nvme0"             # required, unique across all nvmes[]
-    namespace_id: 1                      # default 1
-    kernel_ioq_cap: 32                   # NVM_SET_KERNEL_IOQ_CAP hint, optional
-    allowed_gpus: [0]                    # optional ACL; empty/missing = all gpus[].id
-
-queue_pool:
-  default_per_client: 4                  # ConnectRequest.num_queues == 0 -> use this
-  max_per_client: 32                     # daemon clamp; kernel also enforces 32/group
-
-lease:
-  heartbeat_interval_sec: 10
-  timeout_sec: 30
-```
-
-Validator rules (`config.cpp::validate_config`):
-
-1. `gpus[].id` unique, `gpus[].mount_path` non-empty.
-2. `nvmes[].pci_addr` / `mount_path` non-empty; `mount_path`s unique.
-3. Every entry in `nvmes[].allowed_gpus` must reference an existing
-   `gpus[].id`.
-4. `queue_pool.max_per_client >= default_per_client`.
-5. `lease.timeout_sec > heartbeat_interval_sec`.
-
-Anything outside that list (`total_queues`, `queue_depth`,
-`queue_groups[].count`, the entire `queue_setup` block) is **ignored** —
-those were the previous design's knobs and have no daemon-side meaning.
+Only the explicit-identity schema in `config/device_manager/nvme_daemon.yaml`
+is accepted. Create a reviewed `config/local/tutti_daemon_<name>.yaml` and pass
+it with `--config`; see the deployment manual. Positional GPU/device IDs and
+legacy `gpus`, `mount_path`, `allowed_gpus` fields are not supported.
 
 ---
 

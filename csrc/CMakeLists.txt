@@ -375,7 +375,7 @@ if(BUILD_TESTING)
         "${CMAKE_CURRENT_BINARY_DIR}/tests_config"
     )
     add_subdirectory(
-        "${TUTTI_REPOSITORY_ROOT}/tests/tutti_runtime"
+        "${TUTTI_REPOSITORY_ROOT}/tests/storage_runtime/assembly"
         "${CMAKE_CURRENT_BINARY_DIR}/tests_tutti_runtime"
     )
 
@@ -391,27 +391,27 @@ if(BUILD_TESTING)
 
     # Contract test (runs in all profiles: CUDA and HOST)
     add_subdirectory(
-        "${TUTTI_REPOSITORY_ROOT}/tests/cuda_like"
+        "${TUTTI_REPOSITORY_ROOT}/tests/api/cuda_like"
         "${CMAKE_CURRENT_BINARY_DIR}/tests_cuda_like"
     )
     message(STATUS "Tutti: added tests/cuda_like (contract test)")
 
     add_subdirectory(
-        "${TUTTI_REPOSITORY_ROOT}/tests/accelerator_device_guard"
+        "${TUTTI_REPOSITORY_ROOT}/tests/api/accelerator_device_guard"
         "${CMAKE_CURRENT_BINARY_DIR}/tests_accelerator_device_guard"
     )
     message(STATUS "Tutti: added accelerator device guard contract test")
 
     # Public API usage test (runs in all profiles: CUDA and HOST)
     add_subdirectory(
-        "${TUTTI_REPOSITORY_ROOT}/tests/public_api"
+        "${TUTTI_REPOSITORY_ROOT}/tests/api/public_api"
         "${CMAKE_CURRENT_BINARY_DIR}/tests_public_api"
     )
     message(STATUS "Tutti: added tests/public_api (public API usage test)")
 
     # SPI usage-requirements consumer test (runs in all profiles: CUDA and HOST)
     add_subdirectory(
-        "${TUTTI_REPOSITORY_ROOT}/tests/spi_consumer"
+        "${TUTTI_REPOSITORY_ROOT}/tests/api/spi_consumer"
         "${CMAKE_CURRENT_BINARY_DIR}/tests_spi_consumer"
     )
     message(STATUS "Tutti: added tests/spi_consumer (SPI usage-requirements test)")
@@ -420,72 +420,72 @@ if(BUILD_TESTING)
     # runnable under the HOST profile. Their fake components prove Runtime
     # routing does not require CUDA, libnvm, or a local-NVMe deployment.
     add_subdirectory(
-        "${TUTTI_REPOSITORY_ROOT}/tests/data_path_contract"
+        "${TUTTI_REPOSITORY_ROOT}/tests/data_paths/contract"
         "${CMAKE_CURRENT_BINARY_DIR}/tests_data_path_contract"
     )
     add_subdirectory(
-        "${TUTTI_REPOSITORY_ROOT}/tests/storage_runtime_contract"
+        "${TUTTI_REPOSITORY_ROOT}/tests/storage_runtime/contract"
         "${CMAKE_CURRENT_BINARY_DIR}/tests_storage_runtime_contract"
     )
     # Storage-object-layer SPI: on-media layout constants plus the semantic
     # invariants callers depend on (partial reserve acceptance, under-report-
     # only cross-rank residency, fail-closed open).
     add_subdirectory(
-        "${TUTTI_REPOSITORY_ROOT}/tests/storage_object_store_contract"
+        "${TUTTI_REPOSITORY_ROOT}/tests/storage_objects/store_contract"
         "${CMAKE_CURRENT_BINARY_DIR}/tests_storage_object_store_contract"
     )
     # On-media digests. Frozen format: CRC-32C pinned to the standard vectors,
     # object_identity pinned to captured literals.
     add_subdirectory(
-        "${TUTTI_REPOSITORY_ROOT}/tests/object_digest_contract"
+        "${TUTTI_REPOSITORY_ROOT}/tests/storage_objects/digest"
         "${CMAKE_CURRENT_BINARY_DIR}/tests_object_digest_contract"
     )
     # Storage object layer implementation: header codec, checkpoint containers,
     # residency bitmap, space allocator. Adversarial -- corrupts headers, tears
     # checkpoint writes, desynchronises bitmaps, recycles space under records.
     add_subdirectory(
-        "${TUTTI_REPOSITORY_ROOT}/tests/storage_objects_contract"
+        "${TUTTI_REPOSITORY_ROOT}/tests/storage_objects/contract"
         "${CMAKE_CURRENT_BINARY_DIR}/tests_storage_objects_contract"
     )
     # Placement policies and physical media layer. Verifies materialisation
     # allocates real blocks (FIEMAP cannot map holes) and that O_DIRECT
     # alignment is enforced rather than worked around.
     add_subdirectory(
-        "${TUTTI_REPOSITORY_ROOT}/tests/storage_objects_media_contract"
+        "${TUTTI_REPOSITORY_ROOT}/tests/storage_objects/media"
         "${CMAKE_CURRENT_BINARY_DIR}/tests_storage_objects_media_contract"
     )
     # Whole layer as one object: reserve -> commit -> restart -> recover, plus
     # crash-before-commit and torn-header scenarios.
     add_subdirectory(
-        "${TUTTI_REPOSITORY_ROOT}/tests/storage_object_store_e2e"
+        "${TUTTI_REPOSITORY_ROOT}/tests/storage_objects/e2e"
         "${CMAKE_CURRENT_BINARY_DIR}/tests_storage_object_store_e2e"
     )
     add_subdirectory(
-        "${TUTTI_REPOSITORY_ROOT}/tests/storage_object_store_segment_files"
+        "${TUTTI_REPOSITORY_ROOT}/tests/storage_objects/segment_files"
         "${CMAKE_CURRENT_BINARY_DIR}/tests_storage_object_store_segment_files"
     )
-    message(STATUS "Tutti: added tests/data_path_contract and tests/storage_runtime_contract")
+    message(STATUS "Tutti: added tests/data_path_contract and tests/storage_runtime/contract")
 
     # Additional hardware-free contract tests (status, memory_types,
     # io_types, storage_target_resolver, payload).
     add_subdirectory(
-        "${TUTTI_REPOSITORY_ROOT}/tests/status_contract"
+        "${TUTTI_REPOSITORY_ROOT}/tests/api/status"
         "${CMAKE_CURRENT_BINARY_DIR}/tests_status_contract"
     )
     add_subdirectory(
-        "${TUTTI_REPOSITORY_ROOT}/tests/memory_types_contract"
+        "${TUTTI_REPOSITORY_ROOT}/tests/api/memory_types"
         "${CMAKE_CURRENT_BINARY_DIR}/tests_memory_types_contract"
     )
     add_subdirectory(
-        "${TUTTI_REPOSITORY_ROOT}/tests/io_types_contract"
+        "${TUTTI_REPOSITORY_ROOT}/tests/api/io_types"
         "${CMAKE_CURRENT_BINARY_DIR}/tests_io_types_contract"
     )
     add_subdirectory(
-        "${TUTTI_REPOSITORY_ROOT}/tests/storage_target_resolver_contract"
+        "${TUTTI_REPOSITORY_ROOT}/tests/resolvers/contract"
         "${CMAKE_CURRENT_BINARY_DIR}/tests_storage_target_resolver_contract"
     )
     add_subdirectory(
-        "${TUTTI_REPOSITORY_ROOT}/tests/payload_contract"
+        "${TUTTI_REPOSITORY_ROOT}/tests/payloads/contract"
         "${CMAKE_CURRENT_BINARY_DIR}/tests_payload_contract"
     )
     message(STATUS "Tutti: added hardware-free contract tests (status, memory_types, io_types, storage_target_resolver, payload)")
@@ -493,7 +493,7 @@ if(BUILD_TESTING)
     # UAPI contract test (hardware-free; verifies shared tutti_snvme.h layout,
     # ABI version, capability bits, and static_assert locks).
     add_subdirectory(
-        "${TUTTI_REPOSITORY_ROOT}/tests/uapi_contract"
+        "${TUTTI_REPOSITORY_ROOT}/tests/device_manager/uapi"
         "${CMAKE_CURRENT_BINARY_DIR}/tests_uapi_contract"
     )
     message(STATUS "Tutti: added tests/uapi_contract (hardware-free UAPI contract test)")
@@ -503,7 +503,7 @@ if(BUILD_TESTING)
     # private headers (libnvm, nvmeservice, snvme kernel, CUDA kernel) are
     # NOT reachable from the public include path.
     add_subdirectory(
-        "${TUTTI_REPOSITORY_ROOT}/tests/header_hygiene"
+        "${TUTTI_REPOSITORY_ROOT}/tests/api/header_hygiene"
         "${CMAKE_CURRENT_BINARY_DIR}/tests_header_hygiene"
     )
     message(STATUS "Tutti: added tests/header_hygiene (Phase 3 header-hygiene consumer test)")
@@ -511,23 +511,23 @@ if(BUILD_TESTING)
     # MockDataPath kit contract test (hardware-free; proves the kit itself
     # satisfies the DataPath SPI as a reference implementation).
     add_subdirectory(
-        "${TUTTI_REPOSITORY_ROOT}/tests/mock_data_path_kit_contract"
+        "${TUTTI_REPOSITORY_ROOT}/tests/data_paths/mock"
         "${CMAKE_CURRENT_BINARY_DIR}/tests_mock_data_path_kit_contract"
     )
     message(STATUS "Tutti: added tests/mock_data_path_kit_contract (MockDataPath kit self-contract test)")
 
     add_subdirectory(
-        "${TUTTI_REPOSITORY_ROOT}/tests/resource"
+        "${TUTTI_REPOSITORY_ROOT}/tests/resource/contract"
         "${CMAKE_CURRENT_BINARY_DIR}/tests_resource"
     )
     message(STATUS "Tutti: added tests/resource (hardware-free Resource contract)")
 
     add_subdirectory(
-        "${TUTTI_REPOSITORY_ROOT}/tests/resolvers"
+        "${TUTTI_REPOSITORY_ROOT}/tests/resolvers/factory"
         "${CMAKE_CURRENT_BINARY_DIR}/tests_resolvers"
     )
     add_subdirectory(
-        "${TUTTI_REPOSITORY_ROOT}/tests/datapaths"
+        "${TUTTI_REPOSITORY_ROOT}/tests/data_paths/factory"
         "${CMAKE_CURRENT_BINARY_DIR}/tests_datapaths"
     )
     message(STATUS "Tutti: added resolver and DataPath factory tests")
@@ -536,7 +536,7 @@ if(BUILD_TESTING)
     # Tests config parsing, /proc scanning, mount/unmount lifecycle
     # with tmpfs, and force-exit flag.  No real NVMe devices needed.
     add_subdirectory(
-        "${TUTTI_REPOSITORY_ROOT}/tests/mount_manager_contract"
+        "${TUTTI_REPOSITORY_ROOT}/tests/device_manager/mount_manager"
         "${CMAKE_CURRENT_BINARY_DIR}/tests_mount_manager_contract"
     )
     message(STATUS "Tutti: added tests/mount_manager_contract (host;mount_manager)")
@@ -548,7 +548,7 @@ if(BUILD_TESTING)
         # Links tutti_local_file_resolver (always built, hardware-free header-only).
         # Needs TUTTI_BUILD_HARDWARE_TESTS=ON; labelled "hardware;resolver".
         add_subdirectory(
-            "${TUTTI_REPOSITORY_ROOT}/tests/resolver_contract"
+            "${TUTTI_REPOSITORY_ROOT}/tests/resolvers/local_file"
             "${CMAKE_CURRENT_BINARY_DIR}/tests_resolver_contract"
         )
         message(STATUS "Tutti: added tests/resolver_contract (hardware;resolver)")
@@ -560,7 +560,7 @@ if(BUILD_TESTING)
             # Local-NVMe DataPath test: needs GPU + snvme + libnvm.
             # Labelled "hardware;local_nvme".
             add_subdirectory(
-                "${TUTTI_REPOSITORY_ROOT}/tests/local_nvme_datapath_contract"
+                "${TUTTI_REPOSITORY_ROOT}/tests/data_paths/local_nvme"
                 "${CMAKE_CURRENT_BINARY_DIR}/tests_local_nvme_datapath_contract"
             )
             message(STATUS "Tutti: added tests/local_nvme_datapath_contract (hardware;local_nvme)")
@@ -568,7 +568,7 @@ if(BUILD_TESTING)
             # Public-Runtime → resolver → local-NVMe E2E acceptance gate.
             # Labelled "hardware;local_nvme;runtime_e2e".
             add_subdirectory(
-                "${TUTTI_REPOSITORY_ROOT}/tests/storage_runtime_local_nvme_contract"
+                "${TUTTI_REPOSITORY_ROOT}/tests/storage_runtime/local_nvme"
                 "${CMAKE_CURRENT_BINARY_DIR}/tests_storage_runtime_local_nvme_contract"
             )
             message(STATUS "Tutti: added tests/storage_runtime_local_nvme_contract (hardware;local_nvme;runtime_e2e)")
@@ -576,7 +576,7 @@ if(BUILD_TESTING)
             # StripedDataPath test: needs 2 GPU-attached NVMe devices + libnvm.
             # Labelled "hardware;striped;runtime_e2e".
             add_subdirectory(
-                "${TUTTI_REPOSITORY_ROOT}/tests/striped_local_nvme_contract"
+                "${TUTTI_REPOSITORY_ROOT}/tests/data_paths/multi_nvme"
                 "${CMAKE_CURRENT_BINARY_DIR}/tests_striped_local_nvme_contract"
             )
             message(STATUS "Tutti: added tests/striped_local_nvme_contract (hardware;striped;runtime_e2e)")
@@ -584,20 +584,25 @@ if(BUILD_TESTING)
             # md RAID0 over the NVMe namespaces: GPU member-direct IO checked
             # byte-for-byte against the kernel md/ext4 path.
             add_subdirectory(
-                "${TUTTI_REPOSITORY_ROOT}/tests/raid0_local_nvme_contract"
+                "${TUTTI_REPOSITORY_ROOT}/tests/storage_runtime/raid0"
                 "${CMAKE_CURRENT_BINARY_DIR}/tests_raid0_local_nvme_contract"
             )
 
             # chrdev <-> controller identity through the preset (two daemons).
             add_subdirectory(
-                "${TUTTI_REPOSITORY_ROOT}/tests/snvme_identity_contract"
+                "${TUTTI_REPOSITORY_ROOT}/tests/device_manager/snvme_identity"
                 "${CMAKE_CURRENT_BINARY_DIR}/tests_snvme_identity_contract"
+            )
+
+            add_subdirectory(
+                "${TUTTI_REPOSITORY_ROOT}/tests/data_paths/async_completion"
+                "${CMAKE_CURRENT_BINARY_DIR}/tests_async_completion_contract"
             )
 
             # Round 19 S1: batch open performance microbenchmark.
             # Not a ctest (perf number, not pass/fail); manually invoked.
             add_subdirectory(
-                "${TUTTI_REPOSITORY_ROOT}/tests/batch_open_perf"
+                "${TUTTI_REPOSITORY_ROOT}/tests/data_paths/perf/batch_open"
                 "${CMAKE_CURRENT_BINARY_DIR}/tests_batch_open_perf"
             )
 
@@ -619,7 +624,7 @@ if(BUILD_TESTING)
             # Round 19 S3b: registration throughput microbenchmark.
             # Not a ctest (perf number, not pass/fail); manually invoked.
             add_subdirectory(
-                "${TUTTI_REPOSITORY_ROOT}/tests/register_perf"
+                "${TUTTI_REPOSITORY_ROOT}/tests/data_paths/perf/register"
                 "${CMAKE_CURRENT_BINARY_DIR}/tests_register_perf"
             )
 

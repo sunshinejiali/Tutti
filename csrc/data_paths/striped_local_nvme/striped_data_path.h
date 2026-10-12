@@ -360,6 +360,8 @@ protected:
         std::uint64_t op_generation = 0;
     };
 
+    virtual void handle_submit_event_failure_(OpEntry& op);
+
     const StripedTarget* find_target_(DataPathTarget target) const;
     StripedTarget* find_target_(DataPathTarget target);
     const StripedMemory* find_memory_(DataPathMemory memory) const;

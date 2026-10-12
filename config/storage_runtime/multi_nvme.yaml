@@ -1,0 +1,38 @@
+# Native TuttiRuntimeSpec: two controllers in ONE fused DataPath.
+# The allocation response decides independent mounts versus an md RAID0 mount.
+# Adjust endpoint/device IDs after reviewing config/local/tutti_daemon_<name>.yaml.
+# This file does not configure a Python connector or create/rebuild an array.
+accelerator:
+  profile: CUDA
+runtime:
+  accel_id: 0
+storage:
+  resources:
+    - id: nvme-group
+      type: nvme
+      provider:
+        type: nvme-service
+        endpoint: "127.0.0.1:50051"
+      allocation:
+        selection: striped
+        device_ids: [0, 1]
+        queues_per_controller: 4
+  resolvers:
+    - id: file-resolver
+      type: local-file
+      scheme: file
+      config: {}
+  datapaths:
+    - id: multi-nvme-datapath
+      type: striped-local-nvme
+      config:
+        max_in_flight_operations: 16
+        max_batch_entries: 4096
+        prp_cache_capacity: 4096
+  backends:
+    - id: multi-nvme-storage
+      contract: striped-local-nvme
+      resolver: file-resolver
+      datapath: multi-nvme-datapath
+      resource: nvme-group
+      config: {}

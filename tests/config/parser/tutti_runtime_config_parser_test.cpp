@@ -160,6 +160,16 @@ int main() {
             CHECK(config != nullptr);
         }
     }
+    {
+        for (const char* path : {
+                 "config/storage_runtime/local_nvme.yaml",
+                 "config/storage_runtime/multi_nvme.yaml"}) {
+            auto parsed = tutti::config::parse_tutti_runtime_config(
+                std::string(TUTTI_TEST_REPOSITORY_ROOT) + "/" + path);
+            CHECK(parsed.ok());
+            if (parsed.ok()) CHECK(parsed.value().validate().ok());
+        }
+    }
     std::printf("parser tests: %s\n", failures == 0 ? "PASS" : "FAIL");
     return failures == 0 ? 0 : 1;
 }

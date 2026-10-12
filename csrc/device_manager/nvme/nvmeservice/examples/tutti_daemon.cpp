@@ -2,7 +2,7 @@
  * tutti_daemon.cpp -- Tutti NVMe service daemon entry.
  *
  * The owner half of the SERVICE_CLIENT data plane.  This process is
- * the sole owner of every NVMe controller named in sys_config.yaml:
+ * the sole owner of every NVMe controller named in the explicitly selected daemon YAML:
  * it does the libnvm owner bring-up (chrdev_create + cap + bind + probe),
  * mounts each block device, publishes per-GPU view symlinks, and serves
  * gRPC so that Coordinator
@@ -29,7 +29,7 @@
  *
  * Pairing:
  *   1. Start this daemon on the NVMe-owning host:
- *        sudo ./tutti_daemon --config sys_config.yaml
+ *        sudo ./tutti_daemon --config config/local/tutti_daemon_<name>.yaml
  *   2. Point a SERVICE_CLIENT Coordinator / e2e_smoke at it:
  *        sudo ./e2e_smoke --cuda 0 --service 127.0.0.1:50051 \
  *                         --dev-id 0 --dev-id 1
@@ -85,7 +85,7 @@ static void on_signal(int /*sig*/) {
 
 static void print_usage(const char* prog) {
     std::fprintf(stderr,
-        "Usage: %s --config <sys_config.yaml>\n"
+        "Usage: %s --config <daemon.yaml>\n"
         "\n"
         "Brings up every NVMe named in the config as the owner and runs\n"
         "the tutti NVMe service daemon until SIGINT/SIGTERM.\n"
@@ -115,41 +115,7 @@ int main(int argc, char** argv) {
     }
 
     if (config_path.empty()) {
-        // Lookup order: config/local_nvme_config.yaml (canonical) >
-        // config/sys_config.yaml > ./sys_config.yaml (both legacy names
-        // emit a deprecation warning).
-        std::FILE* f = std::fopen("config/local_nvme_config.yaml", "r");
-        if (f) {
-            std::fclose(f);
-            config_path = "config/local_nvme_config.yaml";
-        } else {
-            f = std::fopen("config/sys_config.yaml", "r");
-            if (f) {
-                std::fclose(f);
-                config_path = "config/sys_config.yaml";
-                std::fprintf(stderr,
-                    "WARNING: config/sys_config.yaml has been renamed to "
-                    "config/local_nvme_config.yaml (deprecated name in use). "
-                    "Rename it or pass --config explicitly.\n");
-            } else {
-                f = std::fopen("sys_config.yaml", "r");
-                if (f) {
-                    std::fclose(f);
-                    config_path = "sys_config.yaml";
-                    std::fprintf(stderr,
-                        "WARNING: starting daemon with sys_config.yaml from "
-                        "the repository root (deprecated).  Move it to "
-                        "config/local_nvme_config.yaml or pass --config "
-                        "explicitly.\n");
-                }
-            }
-        }
-    }
-
-    if (config_path.empty()) {
-        std::fprintf(stderr, "Missing --config (also tried "
-            "config/local_nvme_config.yaml, config/sys_config.yaml and "
-            "./sys_config.yaml)\n");
+        std::fprintf(stderr, "Missing --config: provide a reviewed daemon configuration\n");
         print_usage(argv[0]);
         return 1;
     }

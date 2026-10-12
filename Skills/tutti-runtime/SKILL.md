@@ -1,228 +1,144 @@
 ---
 name: tutti-runtime
-description: Tutti GPU-direct NVMe KV cache offloading runtime. Use this skill when working in the Tutti repository — building it from scratch, bringing up the hardware and host environment (PCIe/IOMMU prerequisites, kernel modules, tutti_daemon, mounts) on a new or unknown machine, running the Python or C++ test suites, running vLLM KV-offload benchmarks, profiling with nsys or the torch profiler, or debugging symptoms such as zero cache hits, read-plan failures, ImportError on libnvm.so, EAGAIN on queue creation, or a first request far slower than steady state. Also use it before any privileged or destructive host action (unloading kernel modules, restarting the daemon, changing device PCI addresses), when navigating the repository layout (csrc/ vs tutti/ vs scripts/), or when adding support for an inference framework other than vLLM.
+description: Deploy, build, test, and operate Tutti GPU-direct NVMe KV cache offloading and its vLLM connector. Use for new-host PCIe/IOMMU and disk identity checks, kernel module/daemon setup, native extensions, offline prefix reuse, online API and streaming acceptance, nsys profiling, and KV offload diagnostics. Also use before changing controllers, mounts, or daemon ownership in the Tutti repository.
 ---
 
 # Tutti Runtime
 
-## Overview
+Tutti uses GPU-initiated NVMe IO to move KV between SSD and GPU memory. The vLLM
+entry is `tutti.integration.vllm.connector.TuttiConnectorV1`; no vLLM or
+FlashInfer source modifications are required.
 
-Tutti offloads LLM KV cache to local NVMe over a GPU-direct path: NVMe queues are
-driven from CUDA kernels and DMA lands straight in GPU memory — no host bounce
-buffer, no `cudaMemcpy` on the data path. It ships a vLLM v1 `KVConnector` so a
-prefill-heavy workload reuses cached prefixes instead of recomputing them.
+## Start here
 
-This skill covers going from a fresh clone to a running benchmark, the invariants
-that must not be broken, and the diagnostic playbook for failures whose symptoms
-are far from their cause.
+Locate the checkout before using any relative path. Read `doc/getting-started.md`
+for the canonical install/build/host/test sequence and
+`doc/intergration/tutti-vllm-manual.md` for offline reuse and online service.
+Read `tests/README.md` to select tests by architecture module and dependency:
+CTest adds `module_<module>` labels; Python tests live under matching modules
+in `tests/python/`. Distinguish GPU-only synthetic tests from real NVMe IO.
+For configuration, read `config/README.md` and
+`doc/configuration-and-performance.md`: daemon, native Runtime YAML and Python
+preset are separate consumers. Prefer automatic model geometry/in-flight
+values; review devices/capacity/queue budget explicitly. Local/multi worker
+and cache defaults differ; do not claim a universal optimum or auto-run sweeps.
+Python users may omit wave/IO stream/queue knobs; the connector provides defaults
+without changing low-level store/preset callers. User capacity uses only
+`capacity: "64 GiB"` (per rank); raw byte/slot option aliases are removed.
+Read `config/integration/vllm/README.md` for plain field explanations; never
+guess device_groups from GPU/disk numbers.
+If only this skill is installed, first obtain the Tutti checkout; the skill
+contains instructions, not the compiled runtime or host configuration.
 
-## One Entry Point for Everything
+Follow this sequence without skipping gates:
 
-`scripts/tutti-env.sh` is the single interface for build, kernel modules, daemon
-and tests. Prefer it over hand-typed commands — it encodes the ordering
-constraints and verifies its own results.
+1. Read `references/hardware.md`; identify the intended GPU/SSD PCI BDFs,
+   serials, namespaces, filesystem, mount users, and P2P/IOMMU constraints.
+   Ask permission before host-level changes. Prefer KV-only data disks.
+2. Select the Python environment and an NVMe scratch directory. Install
+   CUDA-compatible PyTorch/vLLM first; build Tutti and both native extensions
+   against the same environment. Root package installation alone is insufficient.
+3. Write host-specific daemon YAML and validate it. Shipped `config/local/`
+   files describe the maintainer's machine, not this machine. For existing
+   RAID0, configure and rehearse a safe handover before starting a daemon.
+4. Run software tests; then, with explicit permission and reviewed test paths,
+   run hardware byte-exact read/write and controller-identity tests.
+5. Run a small offline A/B workload. Clear HBM prefix cache between A and B;
+   require real external-read evidence, no IO failures, and matching output.
+6. Preview service configuration, start the API, check `/health` and
+   `/v1/models`, and verify SSE tokens with `[DONE]`. Only then run a trace.
 
-```bash
-scripts/tutti-env.sh status        # 只读检查宿主环境；退出码非 0 = 环境不完整
-scripts/tutti-env.sh bootstrap     # 从零：build -> build-ext -> modules -> daemon
-scripts/tutti-env.sh build         # cmake configure + 全部 C++ 目标（含内核模块）
-scripts/tutti-env.sh build-ext     # 两个 Python 扩展
-scripts/tutti-env.sh modules load|unload|rebuild
-scripts/tutti-env.sh daemon start|stop|restart|status [NAME...]
-scripts/tutti-env.sh up|down [NAME...]  # 加载模块+起 daemon（不编译）/ 停 daemon
-scripts/tutti-env.sh test py|cpp|all
-scripts/tutti-env.sh env           # eval 用的 PYTHONPATH 等
-```
+## Safety boundaries
 
-Options: `--dry-run`, `--no-phoenix`, `--clean`, `-j N`.
+Never infer SSD identity from `nvmeN`, `snvmeN`, or `ssnvmeN`: their allocators
+and bring-up order differ. Match PCI/namespace and the kernel-reported identity.
 
-One daemon per disk group: `NAME` selects `config/local/tutti_daemon_<NAME>.yaml`;
-without `NAME`, every daemon config in `config/local/` is managed. A daemon
-whose config has `raid0_arrays` is always started and stopped through
-`scripts/tutti-md.sh`, which hands the array over from the kernel nvme/md
-driver and returns it on any failure or daemon exit — so `stop`/`down` on it
-gives the array back to Linux.
+Do not automatically format disks, erase RAID superblocks, unmount busy data,
+change `/etc/fstab`, bind/unbind controllers, or unload modules. An explicit
+request to deploy does not authorize destroying existing host data.
 
-Protection levels (`LEVEL` in `scripts/tutti-md.sh`; this host: `md0` =
-protected, `kv0` = normal). A protected array holds host data (models,
-datasets, docker): switching its drivers by hand needs `--confirm NAME`, and
-is refused — not waited out — while its mount, block devices or controllers
-are in use. At every level, `down` refuses while a Tutti client (e.g. a vLLM
-worker) still drives the controllers; releasing them under it can hang or
-crash the client and its GPU. Never send the daemon a second SIGTERM: it then
-releases the controllers even under a mounted filesystem.
+Stop API and all IO workers before stopping a daemon or switching drivers.
+Never use a second SIGTERM, SIGKILL, or lazy unmount as proof that controller
+release is safe. A daemon's supervisor cannot guarantee rollback if it too is
+killed, or if clients still hold the devices.
 
-**Always run `status` first when something misbehaves.** It distinguishes missing
-build artifacts, an interpreter/ABI mismatch, unloaded modules, a dead daemon and
-un-mounted devices — most "mysterious" failures are one of these.
+`POOL_TAG` isolates checkpoint/index directories, **not** the shared
+`<mount>/r<rank>/segments` payload files. Never run two instances or a benchmark
+and live service against the same mount/rank workspace. Do not delete segment
+files while any index/service uses them.
 
-### Interpreter selection matters
+Keep scratch, pytest basetemp, JIT caches, logs, and profiler exports on NVMe.
+Preserve the caller's GPU selection, compiler, and Python. Do not overwrite
+live libraries or remove the CMake build tree behind deployed extensions.
 
-Extensions are compiled for one CPython ABI (`_core.cpython-311-*.so`). The
-script picks `PYTHON_BIN` → active virtualenv → `python3`. A distro `python3` is
-often too old (3.6 on some hosts) and yields a confusing `ImportError`; `status`
-reports this explicitly as an ABI mismatch. Pass `PYTHON_BIN=/path/to/python` or
-activate the project venv.
+## Command selection
 
-## From a Fresh Clone
+- `scripts/tutti-env.sh status`: read-only environment diagnosis; a failure may
+  simply mean modules/daemon are intentionally stopped.
+- `build` / `build-ext`: C++ stack / two in-place Python extensions.
+- `test py|cpp|all`: software tests; C++ excludes `hardware` by default.
+- `test cpp --hardware`: explicit hardware IO; review every selected config first.
+- `daemon start|stop|restart|status [NAME...]`: configuration-specific processes.
+  Without NAME, the script considers all local daemon configs. Always name the
+  intended deployment on an unknown/shared machine.
+- `scripts/tutti-md.sh`: supervised RAID handover. Its table currently contains
+  maintainer-specific PCI sets, UUIDs and mounts; new hosts require new entries.
+  `protected` handovers need `--confirm NAME`, and confirmation does not bypass
+  busy-client checks. Do not use `bootstrap` blindly on a fresh machine.
+- `scripts/vllm/run/serve-8gpu-striped.sh --dry-run`: real JSON/command preview,
+  not model execution. The historical name does not force TP8.
+- `scripts/vllm/run/bench-8gpu-striped.sh`: offline reuse / HBM reference / nsys.
 
-Prerequisites: CUDA toolkit + nvcc, a CUDA-capable `torch` in the target
-interpreter, kernel headers for the running kernel, `cmake` ≥ 3.20, and root/sudo
-for module load and daemon start. NVMe devices must be available for Tutti to
-claim, and each must sit under the same PCIe switch as the GPU that uses it.
+Required run inputs: `MODEL`, `TUTTI_PROFILE_ROOT`, selected Python
+(`TUTTI_PYTHON`), `DAEMON_CONFIG`, `DEVICE_GROUPS`, `KV_MOUNT`, and TP. Select
+model-specific block/context/KV dtype/parser instead of trusting Hy3 defaults.
+Serve uses unit-bearing `TOTAL_CAPACITY` (service total); bench requires
+`CAPACITY` or `--capacity` (per rank). The daemon always requires `--config`
+with the reviewed explicit-identity schema, with no old-path fallback.
+Standard weight loading is `auto`; Phoenix is optional and not needed for KV
+IO. See the operation manual for runnable commands and API checks.
 
-```bash
-git clone <repo> && cd Tutti
-PYTHON_BIN=/path/to/python scripts/tutti-env.sh bootstrap
-PYTHON_BIN=/path/to/python scripts/tutti-env.sh test all
-```
+## Supported layouts and experimental features
 
-`bootstrap` refuses to continue on failure and prints the exact next command.
-Ordering is not interchangeable and the script enforces it: kernel modules →
-`tutti_daemon` (creates `/dev/snvme*n1`, performs `auto_mount`, serves gRPC) →
-workload. Mounting before the daemon runs fails because the block devices do not
-exist yet.
+Current connector geometry is a single KV cache group with equal per-layer
+page bytes. Hybrid/multi-group layouts are rejected. A model loading in vLLM
+alone is not evidence of Tutti compatibility. MiniMax/DeepSeek new-version
+adaptation is pending model identification and separate verification.
 
-The script never signs kernel modules. If load fails and `dmesg` shows
-"Required key not available", sign `build/module/*.ko` per your site's procedure
-and retry.
+`TUTTI_ASYNC_COMPLETION=1` selects experimental submit/drain separation for the
+striped DataPath; default is synchronous completion. Lifetime fixes now retain
+resources until DMA and all waiters retire; shutdown timeout is retryable and
+does not cancel IO. GPU-only synthetic CQ/late completion/waiter tests and
+software release-failure tests exist, but the revised code has not rerun real
+NVMe/LLM regression or controller-reset fault injection. Do not describe it as
+fully certified. See `doc/design/async-nvme-completion.md`.
 
-**On a machine that is not already known-good, read
-`references/hardware.md` first.** It covers the PCIe/IOMMU prerequisites, why
-`config/local/tutti_daemon_*.yaml` (one per daemon) are the single source of
-truth for hardware facts, the module↔user-space ABI handshake, and an ordered new-machine checklist.
-A misconfigured host does not run slower — it fails, or destroys data.
+## Code invariants
 
-## Safety — Ask Before Doing
+1. Scheduler modules and package initializers must not import torch, CUDA, or
+   native data-plane extensions. Worker/scheduler increments publish residency.
+2. An IO handle can represent partial acceptance. Inspect `initial_states`,
+   not just handle presence; rejected entries did not execute.
+3. Only confirmed successful IO may publish writes as committed. Wait errors,
+   invalid observations, missing results, and failed states are not success.
+4. Data-file IO uses `O_DIRECT` with aligned buffers, offsets and lengths.
+5. Queue depth and MDTS come from the controller/kernel. Never create a smaller
+   shadow ring or assume another host's queue count.
+6. `<tutti/...>` is the installed public-header namespace, not an arbitrary
+   repository directory prefix. Avoid blanket path replacement.
 
-Tutti's bring-up steps are **host-level and privileged**: they take devices from
-the kernel, affect every process on the machine, and some are irreversible. Do
-not perform these on your own initiative; state the intent and get explicit
-confirmation.
+## Read references on demand
 
-- **Unloading kernel modules** — all `/dev/snvme*` vanish immediately and any
-  running workload dies. Check for other users (`pgrep -a -f 'vllm|tutti'`,
-  `mount | grep snvme`) and unmount first.
-- **Starting/stopping `tutti_daemon`** — shared host state, not per-venv.
-- **Changing `pci_addr`** — a claimed device is written as raw LBAs; the wrong
-  address destroys whatever is on that disk.
-- **Deleting `build/`** — breaks every deployed extension's RUNPATH. Never
-  `rm -rf` with a relative path from the repository root.
-- **`phoenixfs` + RDMA** — structurally mutually exclusive; `rmmod phoenixfs`
-  before any RDMA path, or pass `--no-phoenix`.
+- `references/hardware.md`: identity, prerequisites, safe host transitions.
+- `references/architecture.md`: layers, index authority, segment layout.
+- `references/benchmarking.md`: sizing, isolation and profiling interpretation.
+- `references/diagnostics.md`: discriminating checks for failures.
 
-Read-only investigation (`status`, `lspci`, `dmesg`, `py-spy`, reading logs) needs
-no confirmation — always prefer it first. Full rationale and the rest of the list
-are in `references/hardware.md`.
+Start diagnostics with read-only status/logs. Use GPU timelines to distinguish
+host stalls from device waits, Python/native stacks to identify the cause, and
+nsys launch correlation for cross-stream steps. Save evidence on NVMe. Do not
+attribute an idle gap to the first kernel after it or infer SSD bandwidth from
+summed waiting-kernel times.
 
-## Running a vLLM Benchmark
-
-`scripts/vllm/vllm_profile_offline.py` drives an offline A/B workload: request A
-populates the cache, request B reuses a configurable prefix fraction.
-
-```bash
-eval "$(scripts/tutti-env.sh env)"
-python scripts/vllm/vllm_profile_offline.py \
-    --model /path/to/model --tensor-parallel-size 8 --block-size 64 \
-    --tokens 10000 --reuse-pct 90 --rounds 2 \
-    --device-groups "0,1,2,3" --num-queues 8 \
-    --kv-root '/mnt/nvme0/tutti-kv-{LOCAL_RANK}' \
-    --kv-load-failure-policy fail --direct-transfer-strict
-```
-
-Read `references/benchmarking.md` before multi-GPU or long-context runs: it
-documents the capacity/queue sizing rules that cause hangs when wrong, why an
-aborted run poisons its pool, and how to measure IO/compute overlap. Judge
-performance on the reported **steady** mean, never the first round.
-
-## Invariants — Breaking These Causes Silent Data Loss or Deep Failures
-
-1. **The scheduler process must never import the data plane.** vLLM runs
-   scheduler and workers in separate processes. `tutti.engine.metadata`,
-   `tutti.storage.metadata` and `tutti.index.chunk_index` must stay free of
-   `torch`/`tutti_runtime`/CUDA imports. Every `__init__.py` is deliberately
-   side-effect free — do not add convenience re-exports.
-
-2. **`csrc/include/tutti/...` is a public namespace, not a directory path.** When
-   moving C++ sources, rewrite only prefixes that resolve from the repository
-   root; decide per prefix by whether it exists under `csrc/include/tutti/`.
-   `<tutti/config/...>` additionally resolves through a generated build-tree
-   mirror. Never blanket-replace `tutti/`.
-
-3. **Every data file must be opened `O_DIRECT`.** Buffered IO poisons the page
-   cache, competes with GPU DMA for SSD bandwidth, and lets a buffered read
-   return stale data after a GPU DMA write. Requires 4096-byte alignment of
-   buffer, offset and length. Device nodes are exempt.
-
-4. **`SubmitOutcome.io.has_value() == true` does not mean all requests were
-   accepted.** On partial acceptance the handle tracks only accepted ops;
-   rejected ones appear in `initial_states`. Callers must inspect it or window
-   their submissions, otherwise `wait()` reports success for IO that never ran.
-
-5. **`queue_depth` is owned by the kernel module,** fixed at install time. User
-   space must read `ctrl->q_depth`; a smaller shadow ring desyncs the CQ phase
-   and hangs only after enough completions accumulate.
-
-## Repository Layout
-
-```
-csrc/                 C++/CUDA sources (data paths, device manager, resolvers, daemon)
-  csrc/python/          pybind extension `tutti_runtime` (own setup.py)
-  csrc/kv_transfer/     CUDA extension `tutti-kv-transfer` (own setup.py)
-  csrc/include/tutti/   PUBLIC headers — this prefix is the installed namespace
-tutti/                Python package (the importable one)
-  tutti/{common,index,engine,storage}/   framework-agnostic core
-  tutti/integration/vllm/                vLLM-specific adapter
-tests/                C++ hardware contract tests (ctest)
-tests/python/         Python test suite (pytest)
-scripts/              tutti-env.sh + scripts/vllm/ benchmarks
-config/local/         tutti_daemon_{kv0,md0}.yaml — hardware facts, one per daemon
-Skills/               this skill
-```
-
-`references/architecture.md` covers layer responsibilities, the control flow of
-one request, why the index is memory-authoritative, the segment-file layout and
-its precreation, and lazy registration.
-
-## Diagnostics
-
-`references/diagnostics.md` documents, with the evidence chain for each: zero
-cache hits with no warning; read-plan `has no recorded ready event`; a first
-request far slower than steady state; `ImportError: libnvm.so`; queue creation
-`EAGAIN`; mid-request stalls.
-
-General method, in order: GPU utilisation timeline to decide host-blocked vs
-device-bound → `py-spy dump` for the Python stack → `perf record` for kernel
-hotspots → `eu-stack` for the native call chain. Use `nsys` for kernel/NVTX
-timelines, the torch profiler when Python-level stacks are needed.
-
-Before concluding a test failure is a regression, reproduce it on the previous
-commit (`git worktree add` a detached checkout and build there). A test can encode
-a hardware assumption that was never true on the current machine.
-
-### Recording new experience
-
-This skill is only worth loading if it stays true, so prefer making knowledge
-executable over writing it down. In order of preference:
-
-1. Can it be a check? → add it to `scripts/tutti-env.sh status`.
-2. Can it be an assertion? → add a test.
-3. Can it be a runtime guard? → fail closed, or warn.
-4. Only if none apply → add it here, **with the discriminating command** that
-   tells you whether you are looking at that failure. A conclusion without a way
-   to confirm it is nearly worthless, and actively harmful once stale.
-
-Do not record performance numbers, commit hashes, machine-specific paths, or the
-full story of a bug that the code now prevents. When adding an entry, re-run the
-discriminating commands of the existing ones and delete those that no longer
-apply — this file must not grow monotonically.
-
-## Extending to Another Framework
-
-Add a sibling package under `tutti/integration/<framework>/`. Keep
-`tutti/{common,index,engine,storage}` framework-agnostic: the adapter translates
-framework callbacks into engine calls and must not push framework types downward.
-Register stores through `tutti/storage/registry.py`, which keeps two registration
-faces — concrete classes for the data plane, and lazy `"module:Class"` strings for
-the scheduler side so naming a store never pulls device bindings into the
-scheduler process.
+Keep this skill synchronized with scripts and supported-layout guards. Prefer
+encoding lessons in checks/tests over accumulating machine-specific history.

@@ -33,7 +33,7 @@ target_link_libraries(tutti_memfs_payload INTERFACE
 
 if(BUILD_TESTING)
     add_subdirectory(
-        "${TUTTI_REPOSITORY_ROOT}/tests/memfs_sample_contract"
+        "${TUTTI_REPOSITORY_ROOT}/tests/payloads/memfs"
         "${CMAKE_CURRENT_BINARY_DIR}/tests_memfs_sample_contract"
     )
     message(STATUS "Tutti: added tests/memfs_sample_contract (sample extension)")

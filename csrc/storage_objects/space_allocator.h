@@ -127,7 +127,7 @@ public:
     SpaceAllocatorStats stats() const;
 
 private:
-    std::uint64_t next_free_locked();
+    std::uint64_t take_free_slot_locked();
 
     mutable std::mutex mutex_;
     std::uint64_t total_slots_ = 0;

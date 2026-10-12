@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# Two-request KV-reuse benchmark on 8 GPUs with 2-disk striping, with an
-# optional nsys capture.
+# Two-request KV-reuse benchmark with selectable TP/device groups and optional
+# nsys capture. The historical filename does not require eight GPUs.
 #
 # The workload is a pair of requests per round: request A is cold, request B
 # shares a prefix with A (--reuse-pct). What is being measured is how much of
@@ -24,12 +24,13 @@
 #   --tokens N        prompt length, default 10000
 #   --reuse-pct N     shared prefix percentage, default 80
 #   --rounds N        rounds of (A,B), default 2
+#   --capacity SIZE   per-rank KV payload budget, e.g. "1 TiB"; required for Tutti
 #   --tag NAME        label for output files
 #   --pool-tag NAME   pool root suffix (checkpoint/metadata root). Segment
 #                     files live under <mount>/r<rank>/segments and are shared
 #                     across pool tags; a new tag only gives a fresh index.
 #
-# Everything lands under $TUTTI_PROFILE_ROOT (/mnt/nvme4/tutti-profile).
+# Set MODEL and TUTTI_PROFILE_ROOT (an NVMe scratch directory) before running.
 
 set -euo pipefail
 
@@ -46,27 +47,19 @@ POOL_TAG="${POOL_TAG:-v1}"
 # 盘组部署，与 serve-8gpu-striped.sh 一致（默认：两个 RAID0，各一个 daemon）：
 #   DAEMON_CONFIG  各 daemon 配置，逗号分隔；KV_MOUNT 池根挂载点；
 #   DEVICE_GROUPS  按 rank 分组的 device_id（分号分组）。
-_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-DAEMON_CONFIG="${DAEMON_CONFIG:-$_REPO/config/local/tutti_daemon_kv0.yaml,$_REPO/config/local/tutti_daemon_md0.yaml}"
+DAEMON_CONFIG="${DAEMON_CONFIG:-$REPO_ROOT/config/local/tutti_daemon_kv0.yaml,$REPO_ROOT/config/local/tutti_daemon_md0.yaml}"
 KV_MOUNT="${KV_MOUNT:-/mnt/tutti_md0}"
 DEVICE_GROUPS="${DEVICE_GROUPS:-0,1,2,3;4,5,6,7}"
-MODEL="${MODEL:-/mnt/nvme4/models/Hy3-FP8}"
-TP_SIZE=8
-# 直连准入要求 >= 2 * num_layers（80 层模型 = 160），这是下限。
-#
-# 显存代价（实测三点、完全线性）：arena 槽位 = 2 x 本值，每槽位 576 KiB。
-#   160 -> 320 槽位 -> 180 MiB      （下限，够用）
-#   256 -> 512 槽位 -> 288 MiB
-#   4096 -> 8192 槽位 -> 4608 MiB   （比下限多 4.4 GiB，实测峰值 90405->94833 MiB，
-#                                     占 95.6 GiB 的 96.9%，逼近上限）
-# 该内存与 KV cache 争同一块余量，故取"刚够"而非"越大越安全"。
-MAX_IN_FLIGHT="${MAX_IN_FLIGHT:-}"   # 空 = 用生产侧按 2 x num_layers 的推导值
-# 模型加载格式：默认 phxsafetensors（Phoenix GDS 直读，绕过 page cache）。
-# 前提（缺一即启动失败）：
-#   1. phoenixfs 内核模块已 insmod（手动执行，脚本不代跑）；
-#   2. LD_LIBRARY_PATH 含 libphoenix 的 lib 目录。
-# 想退回普通加载：LOAD_FORMAT=auto bash bench-8gpu-striped.sh ...
-LOAD_FORMAT="${LOAD_FORMAT:-phxsafetensors}"
+MODEL="${MODEL:-}"
+TP_SIZE="${TP_SIZE:-8}"
+NUM_QUEUES="${NUM_QUEUES:-8}"
+[[ "$NUM_QUEUES" =~ ^[1-9][0-9]*$ ]] || { echo "NUM_QUEUES must be a positive integer" >&2; exit 2; }
+# 空值不传：connector按模型和请求加载模式推导in-flight；不是越大越快。
+# arena显存还依赖max_batch_entries，不能复制另一个模型的固定MiB预算。
+MAX_IN_FLIGHT="${MAX_IN_FLIGHT:-}"
+# Standard vLLM loading requires no Phoenix installation. Alternative weight
+# loaders may be selected explicitly via LOAD_FORMAT and PHXLOADER_DIR.
+LOAD_FORMAT="${LOAD_FORMAT:-auto}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -78,13 +71,14 @@ while [[ $# -gt 0 ]]; do
         --tag)         TAG="$2"; shift 2 ;;
         --pool-tag)    POOL_TAG="$2"; shift 2 ;;
         --model)       MODEL="$2"; shift 2 ;;
+        --capacity)    CAPACITY="$2"; shift 2 ;;
         -h|--help)     sed -n '2,31p' "${BASH_SOURCE[0]}"; exit 0 ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
 done
 
-# 8 GPUs, not the 4 the old environment file hardcoded.
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+: "${MODEL:?Set MODEL or pass --model to select the checkpoint}"
+# GPU selection belongs to the caller.
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/profile-env.sh"
 
@@ -94,27 +88,29 @@ DRIVER="$REPO_ROOT/scripts/vllm/vllm_profile_offline.py"
 # phxsafetensors 的 python 侧 (phxloader) 不在 vllm-env 里，是 Phoenix 仓库里
 # 构建出的包（与 serve-8gpu-striped.sh 同一路径）：前置到 PYTHONPATH。
 if [[ "$LOAD_FORMAT" == "phxsafetensors" ]]; then
-    PHXLOADER_DIR="${PHXLOADER_DIR:-/data/home/ryeqiu/phoenix/adapters/vLLM/phxloader}"
+    : "${PHXLOADER_DIR:?Set PHXLOADER_DIR for the optional phxsafetensors loader}"
     [[ -f "$PHXLOADER_DIR/phxloader/__init__.py" ]] || {
         echo "phxloader missing: $PHXLOADER_DIR/phxloader (set PHXLOADER_DIR)" >&2; exit 1;
     }
     export PYTHONPATH="$PHXLOADER_DIR${PYTHONPATH:+:$PYTHONPATH}"
 fi
 
-[[ -x "$PYTHON" ]] || { echo "interpreter missing: $PYTHON" >&2; exit 1; }
-[[ -f "$DRIVER" ]]  || { echo "driver missing: $DRIVER" >&2; exit 1; }
-[[ -d "$MODEL" ]]   || { echo "model missing: $MODEL" >&2; exit 1; }
+command -v "$PYTHON" >/dev/null || { echo "interpreter missing: $PYTHON" >&2; exit 1; }
+[[ -f "$DRIVER" ]] || { echo "driver missing: $DRIVER" >&2; exit 1; }
+if (( ! BASELINE )) && ! mountpoint -q "$KV_MOUNT"; then
+    echo "KV_MOUNT is not mounted: $KV_MOUNT" >&2
+    exit 1
+fi
 
 MODE=$([[ "$BASELINE" == 1 ]] && echo hbm || echo tutti)
 STAMP="$(date +%Y%m%d-%H%M%S)"
-NAME="8gpu-${MODE}-${TOKENS}-reuse${REUSE_PCT}${TAG:+-$TAG}-$STAMP"
+NAME="${TP_SIZE}gpu-${MODE}-${TOKENS}-reuse${REUSE_PCT}${TAG:+-$TAG}-$STAMP"
 LOG="$TUTTI_PROFILE_ROOT/logs/$NAME.log"
 
-# --- capacity sizing -------------------------------------------------------
-# Pool capacity is NOT set here: the driver derives it from tokens and rounds
-# (floor 10000). Capacity is only an upper bound -- segment files are built one
-# file group at a time (first group at open, the rest in the background), and
-# the forward thread never creates files.
+# 每rank显式payload预算，随模型/批量/轮数检查工作集；不猜模型KV字节数。
+if (( ! BASELINE )); then
+    : "${CAPACITY:?Set CAPACITY or pass --capacity, for example 1 TiB per rank}"
+fi
 CHUNKS_PER_REQUEST=$(( (TOKENS + 255) / 256 ))
 
 ARGS=(
@@ -146,31 +142,20 @@ else
     # 读计划 0 次，而 B 的墙钟又很漂亮（因为它确实复用了，只是没经过 NVMe），
     # 于是极易误判为"直连读很快"。
     ARGS+=( --reset-local-prefix-between-requests )
-    # 8 ranks share one rotating group of 4 disks (slot i % 4 round-robin;
-    # placement layer does the per-rank subdirectory).  --device-groups is
-    # mandatory here, not cosmetic: without it the driver takes its
-    # single-device branch and derives device_id={LOCAL_RANK}, so rank 5
-    # asks the daemon for NVMe device 5 on a 4-disk host and every worker
-    # dies with "daemon 配置无 device_id=5 的 NVMe 条目".
-    #
-    # --device-groups is semicolon-between-groups, comma-within-group. A JSON
-    # spelling like '[[0,1],[2,3]]' parses to nonsense and silently falls back
-    # to the same failure.
+    # Groups partition TP ranks evenly. IDs are from daemon YAML, not nvmeN.
+    # Syntax: comma-separated IDs per group, semicolon-separated groups.
     ARGS+=(
-        --device-groups "${DEVICE_GROUPS:-0,1,2,3}"
+        --capacity "$CAPACITY"
+        --device-groups "$DEVICE_GROUPS"
         # {LOCAL_RANK} 是 driver 的占位符（大括号、无 $）。写成 shell 的
         # ${LOCAL_RANK} 会被转义成字面量 "$0"，于是 8 个 rank 全写进同一个名为
         # "...-$0" 的目录——池按 rank 隔离的语义失效，且互相追加同名文件。
         --kv-root "${KV_MOUNT}/tutti-kv-8gpu-${POOL_TAG}-{LOCAL_RANK}"
         --daemon-config "$DAEMON_CONFIG"
-        # Per device. 8 ranks x 8 queues = 64 on a disk whose usable pool is
-        # 119, which fits (the default 32 would need 256 and fail EAGAIN).
-        --num-queues 8
-        # 默认不传 --max-in-flight-operations：生产侧（factory）已按
-        # 2 x num_layers 推导出下限，此处保持默认即是在验证那条路径。
-        # MAX_IN_FLIGHT=N 可显式覆盖，用于实验更大配额。
-        # 不再需要 --direct-transfer-strict：staged 暂存路径已退役，直连准入
-        # 失败一律抛出，strict 成为恒真行为（该 CLI 参数保留但仅声明直连）。
+        # Per rank, per device. Check ranks-per-device times queues against
+        # the actual daemon grants; another host's queue pool is not a limit.
+        --num-queues "$NUM_QUEUES"
+        # MAX_IN_FLIGHT只在显式设置时覆盖模型准入推导。
         --kv-load-failure-policy fail
     )
 fi
@@ -181,11 +166,11 @@ if [[ -n "${MAX_IN_FLIGHT:-}" ]]; then
     echo "[bench] 显式覆盖 max_in_flight_operations=$MAX_IN_FLIGHT"
 fi
 
-# No deletion path on purpose: bulk removal is intercepted by a safe-delete
-# shim. Switching POOL_TAG gives a fresh index without deleting anything.
+# No deletion or media reset here. A fresh POOL_TAG changes only the index;
+# payload segment files remain shared at <mount>/r<rank>/segments.
 
 echo "[bench] mode=$MODE tokens=$TOKENS reuse=${REUSE_PCT}% rounds=$ROUNDS tp=$TP_SIZE"
-[[ "$BASELINE" == 1 ]] || echo "[bench] chunks_per_request=$CHUNKS_PER_REQUEST pool_tag=$POOL_TAG (pool sized by driver)"
+[[ "$BASELINE" == 1 ]] || echo "[bench] chunks_per_request=$CHUNKS_PER_REQUEST pool_tag=$POOL_TAG capacity_per_rank=$CAPACITY"
 echo "[bench] log: $LOG"
 
 cd "$REPO_ROOT"

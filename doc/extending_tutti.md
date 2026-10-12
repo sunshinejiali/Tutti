@@ -13,7 +13,7 @@ no `csrc/include/tutti/**` or Runtime source file was modified.
 | **DataPath** | `csrc/payloads/<name>/<name>_data_path.h` | Implements `tutti::DataPath` SPI (open/close/register/submit/progress/query/release) |
 | **Resolver** | `csrc/resolvers/<name>/resolver.h` | Implements `tutti::StorageTargetResolver` SPI (parses URI, produces `ResolvedTarget`) |
 | **CMakeLists.txt** | `csrc/payloads/<name>/CMakeLists.txt` | INTERFACE library + optional test registration |
-| **Contract test** | `tests/<name>_sample_contract/` | URI parsing, E2E, boundary, lifecycle |
+| **Contract test** | `tests/payloads/<name>/` | URI parsing, E2E, boundary, lifecycle |
 
 ## What you must NOT modify
 
@@ -35,7 +35,7 @@ different disks. One `rt.submit()` is exactly **one** `cudaLaunchKernel`: a
 device table with one `DeviceTargetHandle*` row per opened target lets the
 fused kernel dispatch each entry to its device. Like memfs, it was added with
 **zero core changes** — callers see a plain `TargetHandle` and never reference
-a `Striped*` type; see `tests/striped_local_nvme_contract/` for the fault and
+a `Striped*` type; see `tests/data_paths/multi_nvme/` for the fault and
 partial-commit contract. It shares the `nvme_submit_primitives.cuh` device-side
 primitives with `csrc/data_paths/local_nvme/` rather than reimplementing
 `resolve_lba`/doorbell/CQ-poll logic. See `striped_data_path.h` and
@@ -125,7 +125,7 @@ target_link_libraries(tutti_memfs_payload INTERFACE tutti_spi)
 
 if(BUILD_TESTING)
     add_subdirectory(
-        "${TUTTI_REPOSITORY_ROOT}/tests/memfs_sample_contract"
+        "${TUTTI_REPOSITORY_ROOT}/tests/payloads/memfs"
         "${CMAKE_CURRENT_BINARY_DIR}/tests_memfs_sample_contract")
 endif()
 ```
@@ -151,7 +151,7 @@ build the test binary but silently leave it out of `ctest`.
 
 ### 6. Write contract tests
 
-Create `tests/<name>_sample_contract/` with:
+Create `tests/payloads/<name>/` with:
 - URI parsing (valid + invalid)
 - E2E via `StorageRuntime`: open → register → submit(WRITE) → wait →
   submit(READ) → wait → verify data → release → close → shutdown

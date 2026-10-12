@@ -1,0 +1,50 @@
+# storage_runtime/local_nvme.yaml -- native TuttiRuntimeSpec single-NVMe graph.
+# Not a Python connector config; pass this file explicitly to the native runtime.
+# See config/README.md before changing zero-valued tuning fields.
+#
+# This file describes one logical storage backend. Deployment facts such as
+# PCI BDFs, device paths, BAR sizes, mounts, and actual queue grants belong to
+# the daemon configuration and are returned by nvmeservice at allocation time.
+
+accelerator:
+  profile: CUDA
+
+runtime:
+  accel_id: 0
+
+storage:
+  resources:
+    - id: nvme-local-0
+      type: nvme
+      provider:
+        type: nvme-service
+        endpoint: "127.0.0.1:50051"
+      allocation:
+        selection: explicit
+        device_ids: [0]
+        queues_per_controller: 4
+
+  resolvers:
+    - id: file-resolver-0
+      type: local-file
+      scheme: file
+      config: {}
+
+  datapaths:
+    - id: local-nvme-datapath-0
+      type: local-nvme
+      config:
+        handle_cache_capacity: 0
+        prp_cache_capacity: 0
+        handle_cache_l2_capacity: 0
+        max_in_flight_operations: 0
+        max_batch_entries: 0
+        io_granularity: 0
+
+  backends:
+    - id: model-storage
+      contract: ext4-local-nvme
+      resolver: file-resolver-0
+      datapath: local-nvme-datapath-0
+      resource: nvme-local-0
+      config: {}

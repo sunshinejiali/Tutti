@@ -11,7 +11,7 @@
 #   daemon start|stop|restart|status [NAME...]
 #   up [NAME...]            modules load + daemon start + status（**不编译**）
 #   down [NAME...]          停止 daemon（不卸载模块）
-#   test py|cpp|all         跑测试（内置正确的 PYTHONPATH 与前置检查）
+#   test py|cpp|all         跑测试（默认跳过 C++ 硬件用例；--hardware 显式启用）
 #   env                     打印供 shell eval 的环境变量（PYTHONPATH 等）
 #
 # 多 daemon：每个盘组一个 daemon，NAME 对应 config/local/tutti_daemon_<NAME>.yaml，
@@ -27,10 +27,12 @@
 #
 # 选项
 #   --dry-run       只打印将执行的命令
-#   --no-phoenix    跳过 phoenixfs（RDMA 场景需卸载它）
+#   --with-phoenix  显式启用可选 Phoenix 权重加载环境
+#   --no-phoenix    跳过 phoenixfs（默认；不会卸载已经加载的模块）
 #   -j N            构建并行度（默认 nproc 上限 32）
 #   --clean         仅 build：先删 build/ 再全新 configure
 #   --confirm NAME  允许切换 protected 阵列 NAME 的驱动（可重复）
+#   --hardware      test cpp|all 包含硬件用例（会在配置的数据盘上读写）
 #
 # 环境变量覆盖
 #   TUTTI_ROOT TUTTI_BUILD TUTTI_LOG_DIR PHOENIX_BUILD PYTHON_BIN
@@ -49,7 +51,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly TUTTI_ROOT="${TUTTI_ROOT:-$(cd -- "${SCRIPT_DIR}/.." && pwd)}"
 readonly TUTTI_BUILD="${TUTTI_BUILD:-${TUTTI_ROOT}/build}"
 readonly MD_SCRIPT="${SCRIPT_DIR}/tutti-md.sh"
-readonly PHOENIX_BUILD="${PHOENIX_BUILD:-/data/home/ryeqiu/phoenix/build}"
+readonly PHOENIX_BUILD="${PHOENIX_BUILD:-${TUTTI_ROOT}/../phoenix/build}"
 readonly PHOENIX_KO="${PHOENIX_BUILD}/module/phoenixfs.ko"
 readonly LOG_DIR="${TUTTI_LOG_DIR:-${TUTTI_ROOT}/.local/log}"
 readonly SNVME_CORE_KO="${TUTTI_BUILD}/module/snvme-core.ko"
@@ -80,8 +82,9 @@ discover_python() {
 readonly PYTHON_BIN="$(discover_python)"
 
 DRY_RUN=0
-WANT_PHOENIX=1
+WANT_PHOENIX=0
 DO_CLEAN=0
+HARDWARE_TESTS=0
 JOBS=""
 SUDO_READY=0
 DAEMON_NAMES=()   # 命令行点名的 daemon
@@ -314,7 +317,7 @@ check_all() {
     elif (( WANT_PHOENIX )); then
         _row phoenixfs skip '未加载（仅 Phoenix GDS 路径需要）'
     else
-        _row phoenixfs skip '按 --no-phoenix 跳过'
+        _row phoenixfs skip '可选，默认不加载'
     fi
     # phoenixfs 把整个 GPU BAR remap 出 struct page，使 NVIDIA peer-memory 的
     # dma_map_resource 拒绝该地址 -> RDMA 注册显存 EIO。本地 NVMe 路径不受影响，
@@ -470,7 +473,7 @@ modules_unload() {
 }
 
 ensure_phoenix() {
-    (( WANT_PHOENIX )) || { note '按 --no-phoenix 跳过 phoenixfs。'; return 0; }
+    (( WANT_PHOENIX )) || { note 'Phoenix 是可选项，未请求加载。'; return 0; }
     module_loaded phoenixfs && { note 'phoenixfs 已加载。'; return 0; }
     if [[ ! -f "$PHOENIX_KO" ]]; then
         warn "缺 ${PHOENIX_KO}，跳过（仅影响 Phoenix GDS 路径）。"
@@ -592,20 +595,28 @@ daemon_status() {
 
 cmd_test() {
     local what="${1:-all}" rc=0
+    local -a pytest_args=() ctest_args=(--output-on-failure)
+    if [[ -n "${TMPDIR:-}" ]]; then
+        pytest_args+=(--basetemp="${TMPDIR}/tutti-pytest")
+    fi
+    (( HARDWARE_TESTS )) || ctest_args+=(-LE hardware)
     case "$what" in
         py|all)
             note '跑 Python 测试（tests/python）。'
             ( cd "$TUTTI_ROOT" && run env -u PYTHONPATH PYTHONPATH="$(tutti_pythonpath)" \
-                "$PYTHON_BIN" -m pytest tests/python -q ) || rc=1
+                "$PYTHON_BIN" -m pytest tests/python -q "${pytest_args[@]}" ) || rc=1
             ;;
     esac
     case "$what" in
         cpp|all)
-            note '跑 C++ 测试（ctest）。硬件契约测试需要环境就绪。'
-            if ! check_all --quiet; then
-                warn "环境不完整，硬件契约测试会失败。先跑 $0 status 查看。"
+            note '跑 C++ 测试（ctest）；默认排除 hardware 标签。'
+            if (( HARDWARE_TESTS )); then
+                if ! check_all --quiet; then
+                    warn "环境不完整，不运行硬件测试。先跑 $0 status 查看。"
+                    return 1
+                fi
             fi
-            ( cd "$TUTTI_BUILD" && run ctest --output-on-failure ) || rc=1
+            ( cd "$TUTTI_BUILD" && run ctest "${ctest_args[@]}" ) || rc=1
             ;;
     esac
     case "$what" in
@@ -650,8 +661,10 @@ main() {
                 if [[ -z "$subcmd" ]]; then subcmd="$1"; else arg="$1"; fi ;;
             load|unload|rebuild|start|stop|restart|py|cpp|all) arg="$1" ;;
             --dry-run)    DRY_RUN=1 ;;
+            --with-phoenix) WANT_PHOENIX=1 ;;
             --no-phoenix) WANT_PHOENIX=0 ;;
             --clean)      DO_CLEAN=1 ;;
+            --hardware)   HARDWARE_TESTS=1 ;;
             --confirm)    shift; CONFIRMED+=("${1:?--confirm 需要阵列名}") ;;
             -j)           shift; JOBS="${1:?-j 需要数值}" ;;
             -j*)          JOBS="${1#-j}" ;;
