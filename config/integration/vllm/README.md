@@ -15,8 +15,11 @@
 | `preset.gpu_id` | 当前worker使用的逻辑GPU序号 | `{LOCAL_RANK}`由connector展开，不是PCI地址 |
 | `preset.device_groups` | 将连续TP ranks分配给哪些存储设备组 | 按部署意图指定；ID来自daemon的`device_id`，不是`/dev/nvmeN`后缀 |
 
-`type=striped` 是历史名称：多控制器fused数据面，可以使用独立盘组或已组装的单个md阵列，
-不是让用户配置文件细条带。
+`preset.type`默认`raid0`，本例也明确写`raid0`：选择**已存在的同一md RAID0的完整成员**。
+运行时验证实际md级别、成员集合和offset；不同mount/缺成员/非md会拒绝，不降级到独立盘。
+不会自动创建阵列、格式化或调整条带。单盘用`local`，独立多盘用`nvme-device-group`，
+`nvme-device-group`表示一次IO使用的NVMe控制器集合，不表示RAID类型；共享md挂载点
+仍会核验阵列。旧`multi-nvme`、`striped`名称不再接受，普通用户沿用默认`raid0`即可。
 
 ## 容量单位不再需要手算
 
@@ -62,7 +65,7 @@ TP rank是参与同一模型的worker编号，从0开始。盘组按rank连续�
 |---|---|
 | `[[0, 1]]`，TP4 | rank0–3都使用设备0、1 |
 | `[[0, 1], [2, 3]]`，TP4 | rank0–1使用设备0、1；rank2–3使用设备2、3 |
-| `[[0], [1], [2], [3]]`，TP4 | 每rank只使用对应的一组设备 |
+| `[[0], [1], [2], [3]]`，TP4，`type=nvme-device-group` | 每rank只使用对应的一组设备；不是RAID0配置 |
 
 组数必须整除TP；每组中的全部设备都要允许该组GPU访问，并核实P2P。完整md阵列的成员
 应在同一runtime组内。单盘local preset不需device_groups，显式`device_id`即可。
@@ -82,6 +85,23 @@ daemon每客户端策略认为全服务预算必定够。
 
 更多队列不一定更快，先用默认；确有测量依据时用`preset.num_queues`或wrapper的
 `NUM_QUEUES`覆盖。配置本身不改变内核queue depth，也不会替你切驱动扩队列。
+
+## 缓存容量：不用再填写
+
+`prp_cache_capacity`、`handle_cache_capacity`、`handle_cache_l2_capacity`已从用户配置删除。
+PRP是host pinned地址表，不是GPU里的KV数据缓存。runtime依据控制器真实页大小和有效
+batch/in-flight计算容量，每个runtime的缓存backing总预算最多64MiB，按控制器分摊。
+不足或无法初始化时继续原PRP fallback，不代表整个host内存占用有64MiB硬上限。
+
+RAID0并不使用handle L2；local对象池已长期持有文件票据，不再叠加有限L1/L2缓存。
+盲目按显存、文件大小放大L2不会让仍处于open状态的L1可驱逐。
+`allocator_enabled`空开关也已删除，实际预建仍自动跟随分配前沿并遵守磁盘空间护栏。
+
+层数、KV字节、in-flight和wave已有推导，普通用户不必填batch/in-flight。
+sync模式按上下文、序列数及KV block/page估算batch，小模型不再固定分配16384宽度；
+auto/async可能跨步合并，先保留原有限批宽。两项内部上限仍保留高级覆盖，因为实际fan-out
+还依赖md条带、MDTS及文件extents；不能给出廉价且覆盖任意请求的最大值。
+队列、IO worker数和异步模式也不是显存越大就应越大的参数，不自动跑写盘扫参。
 
 ## 一条规则
 

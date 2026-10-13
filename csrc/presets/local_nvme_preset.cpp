@@ -17,6 +17,7 @@
 
 // Private headers — included here ONLY, never by consumer code.
 #include "csrc/data_paths/local_nvme/local_nvme_data_path.h"
+#include "csrc/data_paths/local_nvme/metadata/cache_sizing.h"
 #include "csrc/data_paths/striped_local_nvme/striped_data_path.h"
 #include "csrc/data_paths/striped_local_nvme/striped_async_data_path.h"
 #include "csrc/resolvers/local_file/resolver.h"
@@ -67,7 +68,10 @@ std::string chrdev_for_bdf(const std::string& pci_bdf) {
 
 } // namespace
 
-RuntimeWithTelemetry make_local_nvme_runtime(const LocalNvmePreset& p) {
+RuntimeWithTelemetry make_local_nvme_runtime(const LocalNvmePreset& input) {
+    auto p = input;
+    if (p.max_batch_entries == 0) p.max_batch_entries = 256;
+    if (p.max_in_flight_operations == 0) p.max_in_flight_operations = 16;
     namespace lnvme = tutti::data_paths::local_nvme;
     using tutti::resolvers::local_file::LocalFileResolver;
     using tutti::resolvers::local_file::BackingDeviceConfig;
@@ -83,8 +87,8 @@ RuntimeWithTelemetry make_local_nvme_runtime(const LocalNvmePreset& p) {
         /*mdts_bytes=*/0,
         p.max_batch_entries,
         /*cq_poll_budget=*/0,
-        p.handle_cache_capacity,
-        p.prp_cache_capacity,
+        /*handle_cache_capacity=*/0,
+        lnvme::kAutoPrpCacheCapacity,
         p.max_in_flight_operations,
         /*max_batch_requests=*/0,
         /*max_request_bytes_override=*/0,
@@ -134,10 +138,63 @@ RuntimeWithTelemetry make_local_nvme_runtime(const LocalNvmePreset& p) {
     return result;
 }
 
-RuntimeWithTelemetry make_striped_nvme_runtime(const StripedNvmePreset& p) {
+RuntimeWithTelemetry make_striped_nvme_runtime(const StripedNvmePreset& input) {
+    auto p = input;
+    if (p.max_batch_entries == 0) p.max_batch_entries = 256;
+    if (p.max_in_flight_operations == 0) p.max_in_flight_operations = 16;
     namespace snvme = tutti::data_paths::striped_local_nvme;
     using tutti::resolvers::local_file::MultiMountLocalFileResolver;
     using tutti::detail::backend_ids::kStripedDataPathKey;
+
+    if (p.require_raid0) {
+        bool one_mount = p.devices.size() >= 2 && !p.devices.front().mount_path.empty();
+        for (const auto& device : p.devices) {
+            one_mount = one_mount && device.mount_path == p.devices.front().mount_path;
+        }
+        if (!one_mount) {
+            RuntimeWithTelemetry result;
+            result.creation_status = Status(StatusCode::INVALID_ARGUMENT,
+                "raid0 requires at least two namespaces on one array mount");
+            return result;
+        }
+    }
+    // All devices behind one mount: that mount is an md RAID0 over them, and
+    // one resolver serves the array (payloads carry the md layout).
+    bool one_mount = p.devices.size() > 1;
+    for (const auto& d : p.devices) {
+        one_mount = one_mount && d.mount_path == p.devices.front().mount_path;
+    }
+    std::unique_ptr<StorageTargetResolver> resolver;
+    if (one_mount) {
+        std::vector<tutti::resolvers::local_file::Raid0MemberNamespace> members;
+        for (const auto& d : p.devices) {
+            members.push_back({d.backing_device, d.pci_bdf, d.namespace_id,
+                               d.block_size});
+        }
+        std::string why;
+        auto raid0 = tutti::resolvers::local_file::make_raid0_resolver(
+            p.devices.front().mount_path, members,
+            std::string(kStripedDataPathKey), &why);
+        if (!raid0) {
+            RuntimeWithTelemetry result;
+            result.creation_status = Status(StatusCode::INVALID_ARGUMENT, why);
+            return result;
+        }
+        resolver = std::move(raid0);
+    } else {
+        // One "file" resolver dispatching by mount: a slot's file path
+        // already names the device it lives on (placement rotated slots
+        // across mounts), so resolution is prefix matching plus the full
+        // single-device pipeline.
+        std::vector<MultiMountLocalFileResolver::MountBinding> bindings;
+        bindings.reserve(p.devices.size());
+        for (const auto& d : p.devices) {
+            bindings.push_back({d.mount_path, d.pci_bdf, d.namespace_id,
+                                d.block_size, d.backing_device,
+                                std::string(kStripedDataPathKey)});
+        }
+        resolver = std::make_unique<MultiMountLocalFileResolver>(std::move(bindings));
+    }
 
     std::vector<snvme::DeviceDescriptor> sdevs;
     for (const auto& d : p.devices) {
@@ -152,52 +209,13 @@ RuntimeWithTelemetry make_striped_nvme_runtime(const StripedNvmePreset& p) {
             std::move(sdevs), (std::uint32_t)p.accel_id,
             /*mdts_override=*/0, /*cq_poll_budget=*/0,
             p.max_batch_entries, p.max_in_flight_operations,
-            p.prp_cache_capacity);
+            tutti::data_paths::local_nvme::kAutoPrpCacheCapacity);
     } else {
         dp = new snvme::StripedDataPath(
             std::move(sdevs), (std::uint32_t)p.accel_id,
             /*mdts_override=*/0, /*cq_poll_budget=*/0,
             p.max_batch_entries, p.max_in_flight_operations,
-            p.prp_cache_capacity);
-    }
-
-    // All devices behind one mount: that mount is an md RAID0 over them, and
-    // one resolver serves the array (payloads carry the md layout).
-    bool one_mount = p.devices.size() > 1;
-    for (const auto& d : p.devices) {
-        one_mount = one_mount && d.mount_path == p.devices.front().mount_path;
-    }
-    StorageTargetResolver* resolver = nullptr;
-    if (one_mount) {
-        std::vector<tutti::resolvers::local_file::Raid0MemberNamespace> members;
-        for (const auto& d : p.devices) {
-            members.push_back({d.backing_device, d.pci_bdf, d.namespace_id,
-                               d.block_size});
-        }
-        std::string why;
-        auto raid0 = tutti::resolvers::local_file::make_raid0_resolver(
-            p.devices.front().mount_path, members,
-            std::string(kStripedDataPathKey), &why);
-        if (!raid0) {
-            delete dp;
-            RuntimeWithTelemetry result;
-            result.creation_status = Status(StatusCode::INVALID_ARGUMENT, why);
-            return result;
-        }
-        resolver = raid0.release();
-    } else {
-        // One "file" resolver dispatching by mount: a slot's file path
-        // already names the device it lives on (placement rotated slots
-        // across mounts), so resolution is prefix matching plus the full
-        // single-device pipeline.
-        std::vector<MultiMountLocalFileResolver::MountBinding> bindings;
-        bindings.reserve(p.devices.size());
-        for (const auto& d : p.devices) {
-            bindings.push_back({d.mount_path, d.pci_bdf, d.namespace_id,
-                                d.block_size, d.backing_device,
-                                std::string(kStripedDataPathKey)});
-        }
-        resolver = new MultiMountLocalFileResolver(std::move(bindings));
+            tutti::data_paths::local_nvme::kAutoPrpCacheCapacity);
     }
 
     // Same reasoning as the single-device factory above: inline construction
@@ -206,10 +224,10 @@ RuntimeWithTelemetry make_striped_nvme_runtime(const StripedNvmePreset& p) {
     // resolver, so only the top level changes here.
     OwnedComponents owned;
     owned.resolvers.push_back(OwnedResolver{
-        "file", std::unique_ptr<StorageTargetResolver>(resolver)});
+        "file", std::move(resolver)});
     owned.data_paths.push_back(OwnedDataPath{
         std::string(kStripedDataPathKey),
-        std::unique_ptr<DataPath>(dp), DataPathConfig{"striped-nvme"}});
+        std::unique_ptr<DataPath>(dp), DataPathConfig{"nvme-device-group"}});
 
     RuntimeConfig runtime_config;
     runtime_config.accel_id = p.accel_id;

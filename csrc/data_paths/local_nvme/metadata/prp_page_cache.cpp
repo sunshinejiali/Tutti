@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
+#include <new>
 
 namespace tutti::data_paths::local_nvme {
 
@@ -22,6 +23,16 @@ bool PrpPageCache::init(const Config& cfg, nvm_ctrl_t* ctrl) {
     if (cfg.capacity == 0) { cfg_ = cfg; return true; }
     if (ctrl == nullptr) return false;
 
+    // Complete fallible bookkeeping before acquiring pinned backing or DMA.
+    try {
+        entries_.resize(cfg.capacity);
+        free_list_.clear();
+        for (std::uint32_t i = 0; i < cfg.capacity; ++i) free_list_.push_back(i);
+    } catch (const std::bad_alloc&) {
+        entries_.clear();
+        free_list_.clear();
+        return false;
+    }
     cfg_ = cfg;
     ctrl_ = ctrl;
 
@@ -77,11 +88,6 @@ bool PrpPageCache::init(const Config& cfg, nvm_ctrl_t* ctrl) {
         return false;
     }
 
-    // Initialize entries + free list.
-    entries_.resize(cfg_.capacity);
-    free_list_.clear();
-    for (std::uint32_t i = 0; i < cfg_.capacity; ++i)
-        free_list_.push_back(i);
     index_.clear();
     lru_.clear();
     lru_pos_.clear();

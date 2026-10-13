@@ -11,6 +11,7 @@
 #include "csrc/data_paths/local_nvme/io/submit_one.cuh"
 #include "csrc/data_paths/local_nvme/io/prp_builder.h"
 #include "csrc/data_paths/local_nvme/metadata/prp_page_cache.h"
+#include "csrc/data_paths/local_nvme/metadata/cache_sizing.h"
 #include "csrc/data_paths/local_nvme/io/nvme_queue_group.h"
 #include "csrc/data_paths/striped_local_nvme/fused_submit_kernel.cuh"
 #include "csrc/payloads/ext4_local_nvme/payload.h"
@@ -27,6 +28,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <new>
 #include <stdexcept>
 #include <thread>
 
@@ -124,7 +126,7 @@ StripedDataPath::StripedDataPath(std::vector<DeviceDescriptor> devices,
                                  ? 16 : max_in_flight_operations),
       prp_cache_capacity_(prp_cache_capacity) {
 
-    caps_.name = "striped-local-nvme";
+    caps_.name = "nvme-device-group";
     caps_.source_api_version = 1;
     caps_.supports_host_execution = false;
     caps_.supports_device_execution = true;
@@ -317,6 +319,9 @@ Status StripedDataPath::initialize_impl_(const DataPathConfig& config,
     if (device_descs_.empty()) {
         return Status(StatusCode::INVALID_ARGUMENT, "no devices configured");
     }
+    if (max_in_flight_operations_ > UINT32_MAX / 2) {
+        return Status(StatusCode::INVALID_ARGUMENT, "in-flight budget exceeds arena slot range");
+    }
 
     if (!config.name.empty()) {
         caps_.name = config.name;
@@ -428,7 +433,7 @@ Status StripedDataPath::initialize_impl_(const DataPathConfig& config,
     // two targets that share the device set share the registration -- see
     // the device_domain_key_ declaration for the measured failure mode.
     {
-        std::string key = "striped-local-nvme";
+        std::string key = "nvme-device-group";
         for (const auto& device : devices_) {
             key += ':';
             key += device.desc.controller_pci_addr;
@@ -513,11 +518,14 @@ Status StripedDataPath::initialize_impl_(const DataPathConfig& config,
     arena_cfg.max_entries_per_slot = max_batch_entries_;
     arena_cfg.page_size = static_cast<std::uint32_t>(page_size);
     arena_cfg.cuda_device = cuda_device_;
-    // Device table supports M targets, ONE device row each (a target is one
-    // file on one device). Capacity must cover the largest legal batch: up to
-    // max_batch_entries distinct targets each contributing one pointer.
+    // A legal RAID0 batch needs target rows plus one identity row per device.
+    const std::uint64_t table_capacity = static_cast<std::uint64_t>(max_batch_entries_) + devices_.size();
+    if (table_capacity > UINT32_MAX) {
+        rollback_devices();
+        return Status(StatusCode::INVALID_ARGUMENT, "device-table capacity exceeds uint32 range");
+    }
     arena_cfg.dev_table_capacity_per_slot =
-        std::max(static_cast<std::uint32_t>(2048), max_batch_entries_);
+        std::max(static_cast<std::uint32_t>(2048), static_cast<std::uint32_t>(table_capacity));
     if (!arena_.init(arena_cfg)) {
         rollback_devices();
         return Status(StatusCode::NOT_READY, "StripedArena init failed");
@@ -533,19 +541,37 @@ Status StripedDataPath::initialize_impl_(const DataPathConfig& config,
         prp_buf_pools_[i]->init(devices_[i].ctrl, page_size);
     }
 
-    // Round 16 S5: initialize per-device PRP cache if enabled.
-    if (prp_cache_capacity_ > 0) {
-        prp_caches_.resize(devices_.size());
-        for (std::size_t i = 0; i < devices_.size(); ++i) {
-            prp_caches_[i] = std::make_unique<tutti::data_paths::local_nvme::PrpPageCache>();
-            tutti::data_paths::local_nvme::PrpPageCache::Config pcfg;
-            pcfg.capacity = prp_cache_capacity_;
-            pcfg.page_size = static_cast<std::uint32_t>(page_size);
-            pcfg.cuda_device = cuda_device_;
-            if (!prp_caches_[i]->init(pcfg, devices_[i].ctrl)) {
-                return Status(StatusCode::NOT_READY, "PrpPageCache init failed");
+    const bool auto_cache = prp_cache_capacity_ == local_nvme::kAutoPrpCacheCapacity;
+    const auto cache_capacity = auto_cache
+        ? local_nvme::auto_prp_cache_capacity(max_batch_entries_, max_in_flight_operations_, page_size, devices_.size())
+        : prp_cache_capacity_;
+    if (cache_capacity > 0) {
+        try {
+            prp_caches_.resize(devices_.size());
+            for (std::size_t i = 0; i < devices_.size(); ++i) {
+                prp_caches_[i] = std::make_unique<tutti::data_paths::local_nvme::PrpPageCache>();
+                tutti::data_paths::local_nvme::PrpPageCache::Config pcfg;
+                pcfg.capacity = cache_capacity;
+                pcfg.page_size = static_cast<std::uint32_t>(page_size);
+                pcfg.cuda_device = cuda_device_;
+                if (!prp_caches_[i]->init(pcfg, devices_[i].ctrl)) {
+                    if (!auto_cache) {
+                        return Status(StatusCode::NOT_READY, "PrpPageCache init failed");
+                    }
+                    prp_caches_.clear();
+                    break;
+                }
+            }
+        } catch (const std::bad_alloc&) {
+            prp_caches_.clear();
+            if (!auto_cache) {
+                return Status(StatusCode::RESOURCE_EXHAUSTED, "PrpPageCache allocation failed");
             }
         }
+    }
+    if (auto_cache) {
+        std::fprintf(stderr, "[tutti] PRP_CACHE_AUTO pages_per_controller=%u controllers=%zu page_bytes=%llu\n",
+                     prp_caches_.empty() ? 0 : cache_capacity, devices_.size(), static_cast<unsigned long long>(page_size));
     }
 
     // Optional kernel-side IO timing instrumentation. Allocated once; the

@@ -10,16 +10,16 @@ int main() {
     spec.runtime.accel_id = 0;
     NvmeResourceConfig resource;
     resource.provider = {"nvme-service", "endpoint"};
-    resource.allocation.selection = NvmeSelection::Striped;
+    resource.allocation.selection = NvmeSelection::Multi;
     resource.allocation.nvme_device_ids = {0, 1};
     resource.allocation.queues_per_controller = 4;
     spec.storage.resources.push_back({"nvme", "nvme", resource});
     spec.storage.resolvers.push_back(
         {"resolver", "local-file", "file", LocalFileResolverConfig{}});
     spec.storage.datapaths.push_back(
-        {"datapath", "striped-local-nvme", StripedLocalNvmeDataPathConfig{}});
+        {"datapath", "nvme-device-group", StripedLocalNvmeDataPathConfig{}});
     spec.storage.backends.push_back(
-        {"backend", "striped-local-nvme", "resolver", "datapath", "nvme",
+        {"backend", "nvme-device-group", "resolver", "datapath", "nvme",
          StripedLocalNvmeBackendConfig{}});
 
     auto debug = spec.to_debug_string();
@@ -31,22 +31,19 @@ int main() {
         "storage.resources[0].type = \"nvme\"\n"
         "storage.resources[0].provider.type = \"nvme-service\"\n"
         "storage.resources[0].provider.endpoint = \"endpoint\"\n"
-        "storage.resources[0].allocation.selection = \"striped\"\n"
+        "storage.resources[0].allocation.selection = \"device-group\"\n"
         "storage.resources[0].allocation.device_ids = [0, 1]\n"
         "storage.resources[0].allocation.queues_per_controller = 4\n"
         "storage.resolvers[0].id = \"resolver\"\n"
         "storage.resolvers[0].type = \"local-file\"\n"
         "storage.resolvers[0].scheme = \"file\"\n"
+        "storage.resolvers[0].config.topology = \"auto\"\n"
         "storage.datapaths[0].id = \"datapath\"\n"
-        "storage.datapaths[0].type = \"striped-local-nvme\"\n"
-        "storage.datapaths[0].config.handle_cache_capacity = 0\n"
-        "storage.datapaths[0].config.prp_cache_capacity = 0\n"
-        "storage.datapaths[0].config.handle_cache_l2_capacity = 0\n"
-        "storage.datapaths[0].config.max_in_flight_operations = 0\n"
-        "storage.datapaths[0].config.max_batch_entries = 0\n"
-        "storage.datapaths[0].config.io_granularity = 0\n"
+        "storage.datapaths[0].type = \"nvme-device-group\"\n"
+        "storage.datapaths[0].config.max_in_flight_operations = 16\n"
+        "storage.datapaths[0].config.max_batch_entries = 256\n"
         "storage.backends[0].id = \"backend\"\n"
-        "storage.backends[0].contract = \"striped-local-nvme\"\n"
+        "storage.backends[0].contract = \"nvme-device-group\"\n"
         "storage.backends[0].resolver = \"resolver\"\n"
         "storage.backends[0].datapath = \"datapath\"\n"
         "storage.backends[0].resource = \"nvme\"\n";

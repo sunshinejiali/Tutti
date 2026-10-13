@@ -10,18 +10,18 @@ Status validate_striped_local_nvme_backend(const ResourceSpec& resource,
         std::get_if<StripedLocalNvmeBackendConfig>(&backend.config);
     if (backend_config == nullptr) {
         return invalid_spec(path +
-                            ".config does not match contract striped-local-nvme");
+                            ".config does not match contract nvme-device-group");
     }
     const auto* config = std::get_if<NvmeResourceConfig>(&resource.config);
     if (config == nullptr) {
         return invalid_spec(path + ".resource does not reference nvme config");
     }
     const std::size_t cardinality = config->allocation.nvme_device_ids.size();
-    if (config->allocation.selection != NvmeSelection::Striped ||
+    if (config->allocation.selection != NvmeSelection::Multi ||
         cardinality < contract.minimum_cardinality ||
         cardinality > contract.maximum_cardinality) {
         return invalid_spec(path +
-                            " resource cardinality does not match striped-local-nvme");
+                            " resource cardinality does not match nvme-device-group");
     }
     return Status::Ok();
 }

@@ -91,7 +91,7 @@ tutti::config::BackendSpec relation(std::string contract,
     result.resource = std::move(resource);
     if (result.contract == "ext4-local-nvme") {
         result.config = tutti::config::Ext4LocalNvmeBackendConfig{};
-    } else if (result.contract == "striped-local-nvme") {
+    } else if (result.contract == "nvme-device-group") {
         result.config = tutti::config::StripedLocalNvmeBackendConfig{};
     } else {
         result.config = tutti::config::MemfsBackendConfig{};
@@ -140,7 +140,7 @@ void test_multi_mount_creation() {
     tutti::config::ResolverSpec spec{
         "resolver0", "local-file", "file",
         tutti::config::LocalFileResolverConfig{}};
-    auto backend = relation("striped-local-nvme", "resolver0",
+    auto backend = relation("nvme-device-group", "resolver0",
                             "configured-striped-dp", "nvme0");
 
     auto created = tutti::resolvers::create_resolver(
@@ -160,12 +160,28 @@ void test_multi_mount_creation() {
     (void)created;
 }
 
+void test_raid0_does_not_fall_back() {
+    for (std::size_t count : {1u, 2u}) {
+        ViewResource resource("nvme0", "nvme", nvme_view(count));
+        tutti::config::ResolverSpec spec{"resolver0", "local-file", "file",
+                                        tutti::config::LocalFileResolverConfig{true}};
+        auto backend = relation("nvme-device-group", "resolver0", "configured-multi-dp", "nvme0");
+        auto created = tutti::resolvers::create_resolver(
+            spec, {resource, backend, "configured-multi-dp"});
+        CHECK(!created.ok(), "raid0 must reject one member or independent mounts");
+        if (!created.ok()) {
+            CHECK(created.status().message().find("raid0") != std::string::npos,
+                  "raid0 topology refusal should be explicit");
+        }
+    }
+}
+
 void test_single_slice_rejects_multi_contract() {
     ViewResource resource("nvme0", "nvme", nvme_view(1));
     tutti::config::ResolverSpec spec{
         "resolver0", "local-file", "file",
         tutti::config::LocalFileResolverConfig{}};
-    auto backend = relation("striped-local-nvme", "resolver0",
+    auto backend = relation("nvme-device-group", "resolver0",
                             "configured-striped-dp", "nvme0");
 
     auto created = tutti::resolvers::create_resolver(
@@ -230,6 +246,7 @@ int main() {
     test_local_file_creation();
     test_multi_mount_creation();
     test_single_slice_rejects_multi_contract();
+    test_raid0_does_not_fall_back();
     test_memfs_creation_and_instance_key();
     test_wrong_view_rejected();
     if (failures == 0) {

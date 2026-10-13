@@ -32,6 +32,7 @@ from .runtime_factory import (
     build_runtime,
     build_runtime_from_env,
     normalize_preset,
+    prepare_preset,
     preset_mounts,
 )
 
@@ -1243,7 +1244,6 @@ class TuttiKVStore:
                  mounts=None,
                  segment_file_slots: int = DEFAULT_SEGMENT_FILE_SLOTS,
                  segment_header_bytes: int = DEFAULT_SEGMENT_HEADER_BYTES,
-                 allocator_enabled: bool = True,
                  rank_id: int = 0, tp_size: int = 1,
                  defer_writes_after_reads: bool | None = None):
         """preset 为 dict 时优先于 TUTTI_NVME_PRESET 环境变量构造 runtime。
@@ -1279,12 +1279,7 @@ class TuttiKVStore:
         self._segment_bytes = segment_bytes
         self._runtime = runtime
         self._own_runtime = runtime is None
-        self._preset = _normalize_preset(preset) if preset is not None else None
-        if self._preset is not None and "daemon_config" in self._preset:
-            # mounts 来自 devices[].mount_path，构造 layout 前先按 daemon 配置
-            # 推导一次；_build_runtime 的推导幂等，重复调用不改变结果。
-            import yaml
-            self._preset = derive_device_fields(self._preset, yaml)
+        self._preset = prepare_preset(preset, mounts=mounts) if preset is not None else None
         self._key_namespace: bytes | None = None
         if mounts is None:
             mounts = _preset_mounts(self._preset) or [str(self._root)]
@@ -1296,7 +1291,6 @@ class TuttiKVStore:
             mounts=[str(mount) for mount in mounts],
             capacity_chunks=self._num_chunks,
             rank_id=rank_id,
-            background_reclaim=bool(allocator_enabled),
             segment_file_slots=int(segment_file_slots),
             segment_header_bytes=int(segment_header_bytes),
         )

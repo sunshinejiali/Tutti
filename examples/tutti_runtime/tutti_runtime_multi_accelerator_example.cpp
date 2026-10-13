@@ -165,7 +165,7 @@ bool validate_config_pair(Options& options) {
             nvme->allocation.selection == tutti::config::NvmeSelection::Explicit &&
             nvme->allocation.nvme_device_ids.size() == 1;
         const bool striped =
-            nvme->allocation.selection == tutti::config::NvmeSelection::Striped &&
+            nvme->allocation.selection == tutti::config::NvmeSelection::Multi &&
             nvme->allocation.nvme_device_ids.size() >= 2;
         if (!explicit_local && !striped) {
             std::fprintf(stderr,
@@ -199,7 +199,7 @@ bool validate_config_pair(Options& options) {
             if (backend == nullptr) {
                 std::fprintf(stderr,
                              "Striped config %zu must use a "
-                             "striped-local-nvme backend\n",
+                             "nvme-device-group backend\n",
                              index);
                 return false;
             }

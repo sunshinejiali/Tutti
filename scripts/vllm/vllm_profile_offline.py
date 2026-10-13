@@ -401,7 +401,7 @@ def main() -> int:
             if not groups or any(not group for group in groups):
                 parser.error("--device-groups 解析为空，示例：'0,1;2,3'")
             store_options["preset"].update({
-                "type": "striped",
+                "type": "raid0",
                 "device_groups": groups,
                 "num_queues": args.num_queues,
             })

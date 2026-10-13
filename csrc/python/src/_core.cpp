@@ -773,8 +773,7 @@ tutti::presets::LocalNvmePreset parse_local_preset(const py::dict& d) {
     check_unknown_keys(
         d,
         {"device", "gpu_id", "num_queues", "max_batch_entries",
-         "max_in_flight_operations",
-         "handle_cache_capacity", "prp_cache_capacity"},
+         "max_in_flight_operations"},
         "local nvme preset");
     tutti::presets::LocalNvmePreset p;  // C++ 默认：预算字段的单一来源
     p.device = parse_device(get_dict_field(d, "device"));
@@ -782,8 +781,8 @@ tutti::presets::LocalNvmePreset parse_local_preset(const py::dict& d) {
     opt_int_field(d, "num_queues", p.num_queues);
     opt_int_field(d, "max_batch_entries", p.max_batch_entries);
     opt_int_field(d, "max_in_flight_operations", p.max_in_flight_operations);
-    opt_int_field(d, "handle_cache_capacity", p.handle_cache_capacity);
-    opt_int_field(d, "prp_cache_capacity", p.prp_cache_capacity);
+    if (p.max_batch_entries == 0) p.max_batch_entries = 256;
+    if (p.max_in_flight_operations == 0) p.max_in_flight_operations = 16;
     return p;
 }
 
@@ -791,8 +790,7 @@ tutti::presets::StripedNvmePreset parse_striped_preset(const py::dict& d) {
     check_unknown_keys(
         d,
         {"devices", "gpu_id", "num_queues",
-         "max_batch_entries", "max_in_flight_operations",
-         "prp_cache_capacity"},
+         "max_batch_entries", "max_in_flight_operations"},
         "striped nvme preset");
     if (!d.contains("devices")) {
         value_error("missing preset key: 'devices'");
@@ -814,7 +812,8 @@ tutti::presets::StripedNvmePreset parse_striped_preset(const py::dict& d) {
     opt_int_field(d, "num_queues", p.num_queues);
     opt_int_field(d, "max_batch_entries", p.max_batch_entries);
     opt_int_field(d, "max_in_flight_operations", p.max_in_flight_operations);
-    opt_int_field(d, "prp_cache_capacity", p.prp_cache_capacity);
+    if (p.max_batch_entries == 0) p.max_batch_entries = 256;
+    if (p.max_in_flight_operations == 0) p.max_in_flight_operations = 16;
     return p;
 }
 
@@ -834,16 +833,25 @@ PyRuntime make_local_nvme_runtime(const py::dict& preset) {
                      p.accel_id, /*max_concurrent_streams=*/3);
 }
 
-PyRuntime make_striped_nvme_runtime(const py::dict& preset) {
+PyRuntime assemble_nvme_device_group_runtime(const py::dict& preset, bool require_raid0) {
     tutti::presets::StripedNvmePreset p = parse_striped_preset(preset);
+    p.require_raid0 = require_raid0;
     auto assembled = tutti::presets::make_striped_nvme_runtime(p);
     if (!assembled.runtime) {
-        throw_status("make_striped_nvme_runtime failed",
+        throw_status(require_raid0 ? "make_raid0_nvme_runtime failed" : "make_nvme_device_group_runtime failed",
                      assembled.creation_status);
     }
     return PyRuntime(std::move(assembled.runtime), /*stub=*/false,
                      p.max_batch_entries, p.max_in_flight_operations,
                      p.accel_id, /*max_concurrent_streams=*/3);
+}
+
+PyRuntime make_nvme_device_group_runtime(const py::dict& preset) {
+    return assemble_nvme_device_group_runtime(preset, false);
+}
+
+PyRuntime make_raid0_nvme_runtime(const py::dict& preset) {
+    return assemble_nvme_device_group_runtime(preset, true);
 }
 
 PyRuntime make_stub_runtime(std::int32_t accel_id) {
@@ -964,7 +972,7 @@ tutti::StoreConfig store_config_from_py(const py::dict& config) {
         out.devices.push_back(store_device_from_py(item));
     }
     if (config.contains("background_reclaim")) {
-        out.background_reclaim = py::cast<bool>(config["background_reclaim"]);
+        value_error("background_reclaim is not a supported object-store option");
     }
     if (config.contains("rank_id")) {
         out.rank_id = py::cast<std::uint32_t>(config["rank_id"]);
@@ -1299,7 +1307,7 @@ PYBIND11_MODULE(_core, m) {
 
     m.def("make_local_nvme_runtime", &make_local_nvme_runtime,
           py::arg("preset"));
-    m.def("make_striped_nvme_runtime", &make_striped_nvme_runtime,
-          py::arg("preset"));
+    m.def("make_nvme_device_group_runtime", &make_nvme_device_group_runtime, py::arg("preset"));
+    m.def("make_raid0_nvme_runtime", &make_raid0_nvme_runtime, py::arg("preset"));
     m.def("make_stub_runtime", &make_stub_runtime, py::arg("accel_id") = -1);
 }

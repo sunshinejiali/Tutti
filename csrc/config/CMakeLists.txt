@@ -5,8 +5,6 @@ set(_tutti_config_public_headers
     spec/resource/nvme_spec.h
     spec/resource/memory_spec.h
     spec/resolver/resolver_spec.h
-    spec/resolver/local_file_spec.h
-    spec/resolver/memfs_spec.h
     spec/datapath/datapath_spec.h
     spec/datapath/nvme_datapath_spec.h
     spec/datapath/local_nvme_spec.h

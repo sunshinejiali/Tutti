@@ -2,7 +2,9 @@
 
 #include <cstdio>
 #include <fstream>
+#include <iterator>
 #include <string>
+#include <utility>
 #include <unistd.h>
 
 namespace {
@@ -50,7 +52,7 @@ std::string local_yaml(const std::string& backend_config = "{}") {
         "  datapaths:\n"
         "    - id: datapath-0\n"
         "      type: local-nvme\n"
-        "      config: {handle_cache_capacity: 7, prp_cache_capacity: 8, handle_cache_l2_capacity: 9, max_in_flight_operations: 10, max_batch_entries: 11, io_granularity: 12}\n"
+        "      config: {max_in_flight_operations: 10, max_batch_entries: 11}\n"
         "  backends:\n"
         "    - id: backend-0\n"
         "      contract: ext4-local-nvme\n"
@@ -83,12 +85,8 @@ int main() {
                     &spec.storage.datapaths.front().config);
             CHECK(datapath != nullptr);
             if (datapath != nullptr) {
-                CHECK(datapath->handle_cache_capacity == 7);
-                CHECK(datapath->prp_cache_capacity == 8);
-                CHECK(datapath->handle_cache_l2_capacity == 9);
                 CHECK(datapath->max_in_flight_operations == 10);
                 CHECK(datapath->max_batch_entries == 11);
-                CHECK(datapath->io_granularity == 12);
             }
         }
     }
@@ -115,10 +113,10 @@ int main() {
             "runtime: {accel_id: 0}\n"
             "storage:\n"
             "  resources:\n"
-            "    - {id: nvme, type: nvme, provider: {type: nvme-service, endpoint: e}, allocation: {selection: striped, device_ids: [0, 1], queues_per_controller: 2}}\n"
+            "    - {id: nvme, type: nvme, provider: {type: nvme-service, endpoint: e}, allocation: {selection: device-group, device_ids: [0, 1], queues_per_controller: 2}}\n"
             "  resolvers: [{id: r, type: local-file, scheme: file}]\n"
-            "  datapaths: [{id: d, type: striped-local-nvme}]\n"
-            "  backends: [{id: b, contract: striped-local-nvme, resolver: r, datapath: d, resource: nvme, config: {stripe_unit: 65536}}]\n";
+            "  datapaths: [{id: d, type: nvme-device-group}]\n"
+            "  backends: [{id: b, contract: nvme-device-group, resolver: r, datapath: d, resource: nvme, config: {stripe_unit: 65536}}]\n";
         TempConfig file(striped_bad_type);
         auto parsed = tutti::config::parse_tutti_runtime_config(file.path());
         CHECK(!parsed.ok());
@@ -144,10 +142,10 @@ int main() {
             "runtime: {accel_id: 0}\n"
             "storage:\n"
             "  resources:\n"
-            "    - {id: nvme, type: nvme, provider: {type: nvme-service, endpoint: e}, allocation: {selection: striped, device_ids: [0, 1], queues_per_controller: 2}}\n"
+            "    - {id: nvme, type: nvme, provider: {type: nvme-service, endpoint: e}, allocation: {selection: device-group, device_ids: [0, 1], queues_per_controller: 2}}\n"
             "  resolvers: [{id: r, type: local-file, scheme: file}]\n"
-            "  datapaths: [{id: d, type: striped-local-nvme}]\n"
-            "  backends: [{id: b, contract: striped-local-nvme, resolver: r, datapath: d, resource: nvme}]\n";
+            "  datapaths: [{id: d, type: nvme-device-group}]\n"
+            "  backends: [{id: b, contract: nvme-device-group, resolver: r, datapath: d, resource: nvme}]\n";
         TempConfig file(striped);
         auto parsed = tutti::config::parse_tutti_runtime_config(file.path());
         CHECK(parsed.ok());
@@ -161,13 +159,54 @@ int main() {
         }
     }
     {
+        for (const char* key : {"prp_cache_capacity", "handle_cache_capacity", "handle_cache_l2_capacity", "io_granularity"}) {
+            auto yaml = local_yaml();
+            const auto position = yaml.find("max_in_flight_operations: 10");
+            yaml.insert(position, std::string(key) + ": 32, ");
+            TempConfig file(yaml);
+            auto parsed = tutti::config::parse_tutti_runtime_config(file.path());
+            CHECK(!parsed.ok());
+            CHECK(parsed.status().message().find(key) != std::string::npos);
+        }
+    }
+    {
+        const auto source = std::string(TUTTI_TEST_REPOSITORY_ROOT) + "/config/storage_runtime/nvme_device_group.yaml";
+        std::ifstream input(source);
+        const std::string current((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+        for (const auto& replacement : {
+                 std::pair<std::string, std::string>{"selection: device-group", "selection: multi"},
+                 {"type: nvme-device-group", "type: multi-nvme"}}) {
+            auto yaml = current;
+            const auto position = yaml.find(replacement.first);
+            CHECK(position != std::string::npos);
+            if (position == std::string::npos) continue;
+            yaml.replace(position, replacement.first.size(), replacement.second);
+            TempConfig file(yaml);
+            CHECK(!tutti::config::parse_tutti_runtime_config(file.path()).ok());
+        }
+    }
+    {
         for (const char* path : {
                  "config/storage_runtime/local_nvme.yaml",
-                 "config/storage_runtime/multi_nvme.yaml"}) {
+                 "config/storage_runtime/nvme_device_group.yaml",
+                 "config/storage_runtime/raid0.yaml"}) {
             auto parsed = tutti::config::parse_tutti_runtime_config(
                 std::string(TUTTI_TEST_REPOSITORY_ROOT) + "/" + path);
             CHECK(parsed.ok());
-            if (parsed.ok()) CHECK(parsed.value().validate().ok());
+            if (parsed.ok()) {
+                CHECK(parsed.value().validate().ok());
+                const auto& resolver = std::get<tutti::config::LocalFileResolverConfig>(
+                    parsed.value().storage.resolvers.front().config);
+                CHECK(resolver.require_raid0 == (std::string(path) == "config/storage_runtime/raid0.yaml"));
+                const auto& datapath = parsed.value().storage.datapaths.front();
+                const auto& budget = datapath.type == "local-nvme"
+                    ? static_cast<const tutti::config::NvmeDataPathTuning&>(
+                        std::get<tutti::config::LocalNvmeDataPathConfig>(datapath.config))
+                    : static_cast<const tutti::config::NvmeDataPathTuning&>(
+                        std::get<tutti::config::StripedLocalNvmeDataPathConfig>(datapath.config));
+                CHECK(budget.max_in_flight_operations == 16);
+                CHECK(budget.max_batch_entries == 256);
+            }
         }
     }
     std::printf("parser tests: %s\n", failures == 0 ? "PASS" : "FAIL");

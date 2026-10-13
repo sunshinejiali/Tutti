@@ -8,6 +8,7 @@
 #include "csrc/data_paths/local_nvme/io/device_target.h"
 #include "csrc/data_paths/local_nvme/io/submit_one.cuh"
 #include "csrc/data_paths/local_nvme/io/prp_builder.h"
+#include "csrc/data_paths/local_nvme/metadata/cache_sizing.h"
 
 #include <tutti/cuda_like.h>
 #include <tutti/accelerator_device_guard.h>
@@ -431,6 +432,9 @@ Status LocalNvmeDataPath::initialize_impl_(const DataPathConfig& config,
         return Status(StatusCode::BUSY, "already initialized");
     }
 
+    if (max_in_flight_operations_ > UINT32_MAX / 2) {
+        return Status(StatusCode::INVALID_ARGUMENT, "in-flight budget exceeds arena slot range");
+    }
     if (!config.name.empty()) {
         caps_.name = config.name;
     }
@@ -601,17 +605,27 @@ Status LocalNvmeDataPath::initialize_impl_(const DataPathConfig& config,
                 }
             }
 
-            if (prp_cache_capacity_ > 0) {
+            const bool auto_cache = prp_cache_capacity_ == kAutoPrpCacheCapacity;
+            const auto cache_capacity = auto_cache
+                ? auto_prp_cache_capacity(max_batch_entries_, max_in_flight_operations_, ctrl_->page_size, 1)
+                : prp_cache_capacity_;
+            if (cache_capacity > 0) {
                 PrpPageCache::Config pcfg;
-                pcfg.capacity = prp_cache_capacity_;
+                pcfg.capacity = cache_capacity;
                 pcfg.page_size = static_cast<std::uint32_t>(ctrl_->page_size);
                 pcfg.cuda_device = cuda_device_;
                 if (!prp_cache_.init(pcfg, ctrl_)) {
-                    nvm_ctrl_free_client(ctrl_);
-                    ctrl_ = nullptr;
-                    return Status(StatusCode::NOT_READY,
-                                  "PrpPageCache init failed");
+                    if (!auto_cache) {
+                        nvm_ctrl_free_client(ctrl_);
+                        ctrl_ = nullptr;
+                        return Status(StatusCode::NOT_READY,
+                                      "PrpPageCache init failed");
+                    }
                 }
+            }
+            if (auto_cache) {
+                std::fprintf(stderr, "[tutti] PRP_CACHE_AUTO pages_per_controller=%u controllers=1 page_bytes=%llu\n",
+                             prp_cache_.enabled() ? prp_cache_.capacity() : 0, static_cast<unsigned long long>(ctrl_->page_size));
             }
         }
     }
@@ -1433,7 +1447,7 @@ SubmitOutcome LocalNvmeDataPath::submit_impl_(
         pr.lengths.clear();
     }
     std::vector<PendingReq>& pending = pending_scratch;
-    std::uint32_t total_entries = 0;
+    std::uint64_t total_entries = 0;
     std::uint32_t total_list_ios = 0;
     bool has_rejection = false;
     StatusCode first_rejected_code = StatusCode::OK;
@@ -1499,6 +1513,10 @@ SubmitOutcome LocalNvmeDataPath::submit_impl_(
         const bool use_prebuilt = mreg->prebuilt.valid;
 
         while (remaining > 0) {
+            if (total_entries >= max_batch_entries_) {
+                reject_all(StatusCode::RESOURCE_EXHAUSTED, "too many sub-IOs (entries)");
+                return false;
+            }
             std::uint64_t sub_io = std::min(remaining, effective_mdts);
 
             // Check extent boundary.
@@ -1612,6 +1630,7 @@ SubmitOutcome LocalNvmeDataPath::submit_impl_(
 
     for (std::size_t i = 0; i < count; ++i) {
         if (!process_request(i)) {
+            if (!outcome.status.ok()) return outcome;
             has_rejection = true;
             const auto& st = outcome.initial_states[i].status;
             if (first_rejected_code == StatusCode::OK) {

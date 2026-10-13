@@ -567,7 +567,7 @@ class WorkerImpl:
         # 异步加载（scheduler 判定 load_async 的请求）：
         #   _async_queue    已 pin、等当前计划结束后合并发起的加载
         #   _async_active   在途计划（每 rank 至多一个：配额按 3 个整层计划
-        #                   预留，见 factory._apply_direct_admission_floor）
+        #                   预留，见 geometry.resolve_io_budget）
         #   _async_finished 已结束、待 get_finished 回报的请求
         #   _async_error_blocks 失败请求的块，与同步读的错误块分开存放——
         #                   同步路径会整体重建 _load_error_blocks

@@ -7,7 +7,7 @@ Status validate_striped_local_nvme_datapath(const DataPathSpec& spec,
         std::get_if<StripedLocalNvmeDataPathConfig>(&spec.config);
     if (config == nullptr) {
         return invalid_spec(
-            path + ".config does not match type striped-local-nvme");
+            path + ".config does not match type nvme-device-group");
     }
     return Status::Ok();
 }

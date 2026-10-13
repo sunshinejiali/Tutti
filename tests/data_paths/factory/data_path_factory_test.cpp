@@ -1,4 +1,5 @@
 #include "csrc/data_paths/data_path_factory.h"
+#include "csrc/data_paths/local_nvme/metadata/cache_sizing.h"
 
 #include <cstdio>
 #include <memory>
@@ -89,7 +90,7 @@ tutti::config::BackendSpec relation(std::string contract,
     result.resource = std::move(resource);
     if (result.contract == "ext4-local-nvme") {
         result.config = tutti::config::Ext4LocalNvmeBackendConfig{};
-    } else if (result.contract == "striped-local-nvme") {
+    } else if (result.contract == "nvme-device-group") {
         result.config = tutti::config::StripedLocalNvmeBackendConfig{};
     } else {
         result.config = tutti::config::MemfsBackendConfig{};
@@ -144,9 +145,6 @@ void test_local_nvme_creation_boundary() {
     tutti::config::LocalNvmeDataPathConfig config;
     config.max_batch_entries = 64;
     config.max_in_flight_operations = 4;
-    config.handle_cache_capacity = 8;
-    config.prp_cache_capacity = 16;
-    config.handle_cache_l2_capacity = 32;
     tutti::config::DataPathSpec spec{
         "configured-local-dp", "local-nvme", config};
     auto backend = relation("ext4-local-nvme", "configured-local-dp", "nvme0");
@@ -173,11 +171,9 @@ void test_striped_nvme_creation_boundary() {
     tutti::config::StripedLocalNvmeDataPathConfig config;
     config.max_batch_entries = 64;
     config.max_in_flight_operations = 4;
-    config.handle_cache_capacity = 8;
-    config.prp_cache_capacity = 16;
     tutti::config::DataPathSpec spec{
-        "configured-striped-dp", "striped-local-nvme", config};
-    auto backend = relation("striped-local-nvme",
+        "configured-striped-dp", "nvme-device-group", config};
+    auto backend = relation("nvme-device-group",
                             "configured-striped-dp", "nvme0");
 
     auto created = tutti::data_paths::create_data_path(
@@ -186,11 +182,11 @@ void test_striped_nvme_creation_boundary() {
     CHECK(created.ok(), "striped factory should construct at creation boundary");
     CHECK(created.ok() &&
               created.value().instance->capabilities().name ==
-                  "striped-local-nvme",
+                  "nvme-device-group",
           "striped factory should construct StripedDataPath");
     CHECK(created.ok() &&
               created.value().initialize_config.name ==
-                  "striped-local-nvme",
+                  "nvme-device-group",
           "striped factory should return initialize config");
 #else
     CHECK(!created.ok() &&
@@ -218,6 +214,14 @@ void test_relation_mismatch_rejected() {
 } // namespace
 
 int main() {
+    using tutti::data_paths::local_nvme::auto_prp_cache_capacity;
+    CHECK(auto_prp_cache_capacity(64, 4, 4096, 1) == 512, "small cache follows arena demand");
+    CHECK(auto_prp_cache_capacity(16384, 160, 4096, 4) == 4096, "four controllers share 64 MiB");
+    CHECK(auto_prp_cache_capacity(16384, 160, 8192, 4) == 2048, "use actual controller page size");
+    CHECK(auto_prp_cache_capacity(UINT32_MAX, UINT32_MAX, 4096, 1) == 16384, "large demand cannot overflow");
+    CHECK(auto_prp_cache_capacity(64, 4, 0, 1) == 0, "unknown page size cannot allocate");
+    CHECK(auto_prp_cache_capacity(64, 4, 4096, 0) == 0, "no controller means no cache");
+    CHECK(auto_prp_cache_capacity(64, 4, 4096, UINT64_MAX) == 0, "budget below one page disables cache");
     test_memfs_creation();
     test_local_nvme_creation_boundary();
     test_striped_nvme_creation_boundary();

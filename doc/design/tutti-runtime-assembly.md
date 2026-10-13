@@ -143,10 +143,10 @@ Parser 不判断以下语义：
 | Resolver | `type: local-file` | `LocalFileResolverConfig` |
 | Resolver | `type: memfs` | `MemfsResolverConfig` |
 | DataPath | `type: local-nvme` | `LocalNvmeDataPathConfig` |
-| DataPath | `type: striped-local-nvme` | `StripedLocalNvmeDataPathConfig` |
+| DataPath | `type: nvme-device-group` | `StripedLocalNvmeDataPathConfig` |
 | DataPath | `type: memfs` | `MemfsDataPathConfig` |
 | Backend relation | `contract: ext4-local-nvme` | `Ext4LocalNvmeBackendConfig` |
-| Backend relation | `contract: striped-local-nvme` | `StripedLocalNvmeBackendConfig` |
+| Backend relation | `contract: nvme-device-group` | `StripedLocalNvmeBackendConfig` |
 | Backend relation | `contract: memfs` | `MemfsBackendConfig` |
 
 这种分发让 YAML 解析逻辑与 spec 类型一一对应。新增组件类型时，应同时增加其 spec
@@ -202,7 +202,7 @@ Spec 是普通 C++ value object。调用方可以绕过 YAML 直接构造，因�
 `provider.endpoint`、`queues_per_controller`、memory `capacity_bytes` 等字段没有可用的业务
 默认值；parser 将其设为 required，spec validator 也会拒绝空值或零值。
 
-`striped-local-nvme` backend 不接受任何 config 键（`stripe_unit` 已随条带化一起删除，
+`nvme-device-group` backend 不接受任何 config 键（`stripe_unit` 已随条带化一起删除，
 写了会被 parser 拒绝）。
 
 ### 5.3 `validate()` 的职责
@@ -229,10 +229,10 @@ Spec 是普通 C++ value object。调用方可以绕过 YAML 直接构造，因�
 | Contract | Resource | Resolver | Scheme | DataPath | Resource cardinality |
 | --- | --- | --- | --- | --- | --- |
 | `ext4-local-nvme` | `nvme` | `local-file` | `file` | `local-nvme` | 1 |
-| `striped-local-nvme` | `nvme` | `local-file` | `file` | `striped-local-nvme` | 至少 2 |
+| `nvme-device-group` | `nvme` | `local-file` | `file` | `nvme-device-group` | 至少 2 |
 | `memfs` | `memory` | `memfs` | `memfs` | `memfs` | 1 |
 
-`striped-local-nvme` 与 `ext4-local-nvme` 的区别只在资源数量和 DataPath：多盘时
+`nvme-device-group` 与 `ext4-local-nvme` 的区别只在资源数量和 DataPath：多盘时
 Resolver 仍是 `local-file`，由 factory 按挂载点分派（见 §8.2）。不做条带：一个文件
 只落一块盘，多盘并发来自不同文件落在不同盘上。
 
@@ -328,8 +328,8 @@ StorageRuntime。
 以 `examples/tutti_runtime/tutti_local_nvme.yaml` 为例，静态 NVMe 请求只包含：
 
 - daemon endpoint；
-- selection mode：`allowed`、`explicit` 或 `striped`；
-- explicit/striped 模式下期望的 daemon device ID；
+- selection mode：`allowed`、`explicit` 或 `device-group`；
+- explicit/device-group 模式下期望的 daemon device ID；
 - 每个 controller 请求的 queue 数；
 - `runtime.accel_id`，由顶层 Runtime 配置提供。
 
@@ -422,10 +422,11 @@ local-file 组合要求一个 NVMe slice，构造 Resolver 时消费：
 - `block_path`；
 - `DataPathSpec.id` 形成的 DataPath key。
 
-`striped-local-nvme` 组合要求至少两个 slice。Factory 为每个 slice 生成一个挂载点
-绑定（`backing_mount_path`、`pci_bdf`、`namespace_id`、`logical_block_size`、
-`block_path`、DataPath key），构造 `MultiMountLocalFileResolver`：按 `file://` 路径的
-最长挂载点前缀选中对应盘，再走与单盘相同的 local-file 解析流程。
+`nvme-device-group`组合要求至少两个slice。所有成员共用一个mount时，factory核验真实md
+RAID0并构造阵列resolver；独立mounts则构造`MultiMountLocalFileResolver`按最长前缀
+分派。默认RAID0模板显式配置`topology: raid0`，单成员或不同mount会拒绝，不自动
+降级。各分支消费`backing_mount_path`、PCI、namespace、block size、block_path及
+DataPath key，数据面仍复用多设备提交实现。
 
 Factory 的输出是未被 `StorageRuntime` 拥有的 `unique_ptr`。`TuttiRuntime` 将其注册到
 `resolvers_` registry，并向 `RuntimeComponents` 只提供：
@@ -476,7 +477,7 @@ local-nvme 组合要求一个 slice。构造 DataPath 时，factory 合并：
 - daemon grant：character device path、accel ID、granted queues、namespace、
   logical block size、MDTS、PCI BDF。
 
-striped-local-nvme 组合要求至少两个 slice。Factory 为每个 slice 构造 device descriptor，
+nvme-device-group 组合要求至少两个 slice。Factory 为每个 slice 构造 device descriptor，
 并取所有 slice `max_data_size` 的最小值作为 effective MDTS。
 
 提交 kernel 的 block 大小固定为一个 warp（`kSubmitBlockThreads = 32`），不可配置；

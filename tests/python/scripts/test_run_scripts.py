@@ -24,7 +24,7 @@ def launch_env(tmp_path):
         "TUTTI_PYTHON": sys.executable,
         "TUTTI_PROFILE_ROOT": str(tmp_path / "scratch"),
         "DAEMON_CONFIG": str(config),
-        "DEVICE_GROUPS": "0;1",
+        "DEVICE_GROUPS": "0,1",
         "KV_MOUNT": str(tmp_path / 'kv with "quotes"'),
         "TP_SIZE": "2",
         "CHUNK_TOKENS": "512",
@@ -59,7 +59,8 @@ def test_serve_preview_has_real_connector_config(launch_env):
     assert options["root"] == str(Path(launch_env["KV_MOUNT"]) /
                                    "tutti-kv-online-launch-test-{LOCAL_RANK}")
     assert options["preset"]["daemon_config"] == [launch_env["DAEMON_CONFIG"]]
-    assert options["preset"]["device_groups"] == [[0], [1]]
+    assert options["preset"]["device_groups"] == [[0, 1]]
+    assert options["preset"]["type"] == "raid0"
     assert "--load-format auto" in result.stdout
 
 

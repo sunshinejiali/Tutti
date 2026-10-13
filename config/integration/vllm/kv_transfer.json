@@ -11,7 +11,7 @@
         "root": "/mnt/your-kv/tutti-kv-{LOCAL_RANK}",
         "capacity": "64 GiB",
         "preset": {
-          "type": "striped",
+          "type": "raid0",
           "daemon_config": ["config/local/tutti_daemon_kv.yaml"],
           "gpu_id": "{LOCAL_RANK}",
           "device_groups": [[0, 1]]

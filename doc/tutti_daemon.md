@@ -383,8 +383,9 @@ ls -l /dev/snvm_control
 `block_path`，并在 BDF、设备节点、mount/view 校验失败时将资源保持为不可用。
 
 控制面客户端应先调用 `ListAccelerators` 和 `ListNvmeResources`，再使用
-`AcquireNvmeSlices`。请求支持 allowed、explicit 和按请求顺序的 striped selection；
-一个 striped 请求返回一个 `allocation_id` 和全部 slices。所有 slices 的 queue
+`AcquireNvmeSlices`。配置请求支持allowed、explicit和按顺序申请整个设备组的device-group；
+RPC的STRIPED枚举仍表示一次多成员申请，不决定文件放置或RAID拓扑。一个设备组请求
+返回一个`allocation_id`和全部slices。所有slices的queue
 预算在一个临界区内原子预留，`Release`、旧 `Disconnect`、heartbeat timeout 以及
 PID/starttime reaper 都经过同一回收路径。
 

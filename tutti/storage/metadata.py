@@ -26,8 +26,7 @@ from .registry import (
     create_metadata_store as _create_metadata_store,
     register_metadata_store_type,
 )
-from .tutti_nvme.preset_derive import derive_device_fields
-from .tutti_nvme.runtime_factory import preset_mounts as _preset_mounts
+from .tutti_nvme.runtime_factory import prepare_preset, preset_mounts as _preset_mounts
 from .tutti_nvme.object_layout import (
     DEFAULT_SEGMENT_FILE_SLOTS,
     DEFAULT_SEGMENT_HEADER_BYTES,
@@ -142,16 +141,15 @@ class TuttiMetadataStore:
         # 挂载点集合与数据面必须完全一致（同一套缺省链：mounts → preset
         # devices[].mount_path → root）：对象层的槽位路径由它推导，不一致就会
         # 指向别的文件。
-        mounts = rank_options[0].get("mounts")
-        preset = rank_options[0].get("preset")
-        if mounts is None and isinstance(preset, dict):
-            if "daemon_config" in preset:
-                import yaml
-                preset = derive_device_fields(preset, yaml)
-            mounts = _preset_mounts(preset)
-        self._mounts: list[str] | None = (
-            [str(mount) for mount in mounts] if mounts else None
-        )
+        self._rank_mounts: list[list[str] | None] = []
+        for options in self._rank_options:
+            rank_mounts = options.get("mounts")
+            rank_preset = options.get("preset")
+            if isinstance(rank_preset, dict):
+                rank_preset = prepare_preset(rank_preset, mounts=rank_mounts)
+                if rank_mounts is None:
+                    rank_mounts = _preset_mounts(rank_preset)
+            self._rank_mounts.append([str(mount) for mount in rank_mounts] if rank_mounts else None)
         # 冷启动对账需要层宽（对象几何 = 段数 × 段大小 + 对象头），未声明时
         # scan() 返回空（fail-closed）。worker 侧在 bind 后由引擎注入；调度侧
         # 没有 bind 阶段，必须在构造时给出——否则复用已有池时永远恢复不到任何
@@ -247,7 +245,7 @@ class TuttiMetadataStore:
             options = {
                 "scheme": (
                     SCHEME_STRIPED_NVME_FILE
-                    if self._mounts and len(self._mounts) > 1
+                    if self._rank_mounts[rank] and len(self._rank_mounts[rank]) > 1
                     else SCHEME_LOCAL_NVME_FILE
                 ),
                 "uri": root,
@@ -260,7 +258,6 @@ class TuttiMetadataStore:
                     _fingerprint_bytes(self._key_namespace), slots, header,
                 ),
                 "devices": self._devices_for(rank),
-                "background_reclaim": False,
                 # 段文件按 rank 分目录（<mount>/r<rank>/segments/），必须用与
                 # worker 相同的 rank 才能对上同一批文件。
                 "rank_id": rank,
@@ -274,7 +271,7 @@ class TuttiMetadataStore:
         return stores
 
     def _devices_for(self, rank: int) -> list[dict]:
-        mounts = self._mounts or [self._roots[rank]]
+        mounts = self._rank_mounts[rank] or [self._roots[rank]]
         return [{"mount_path": mount} for mount in mounts]
 
     def _require_open(self) -> None:

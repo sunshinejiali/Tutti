@@ -34,7 +34,7 @@ storage:
         # selection: 申请方式
         #   explicit —— device_ids 逐台作为独立 local 设备使用
         #   striped  —— device_ids 组成一组 striped 条带
-        selection: striped
+        selection: device-group
         # device_ids: daemon YAML（nvmes[].device_id）里的设备号，
         #   不是 /dev 名；顺序即条带顺序，须与 --directory 传入顺序一致
         device_ids: [0, 1, 2, 3]
@@ -55,17 +55,15 @@ storage:
   # datapaths —— IO 数据路径的调优参数
   # -------------------------------------------------------------------------
   datapaths:
-    - id: layerwise-striped-local-nvme-datapath
-      type: striped-local-nvme       # 多盘条带数据路径（单盘用 local-nvme）
+    - id: layerwise-nvme-device-group-datapath
+      type: nvme-device-group       # 多盘条带数据路径（单盘用 local-nvme）
       config:
         # 以下缓存容量单位均为「槽位」（entries），非字节：
         #   1 槽 = 1 个可缓存的条目
-        handle_cache_capacity: 4096  # L1 GPU 常驻句柄缓存，槽位（每槽 1 个
                                      #   打开文件句柄，约 200B 显存/槽）；0=关闭
                                      #   注意：striped 路径当前未接 handle
                                      #   缓存，本项与 handle_cache_l2_capacity
                                      #   暂不生效（预留）
-        prp_cache_capacity: 262144   # PRP 页缓存，槽位（内容寻址）。
                                      #   【host DRAM 池，不占 GPU 显存】
                                      #   cudaHostAlloc + nvm_dma_map_data_host，
                                      #   262144 槽 = 1 GiB/盘 host 内存；
@@ -73,7 +71,6 @@ storage:
                                      #   无 H2D/事件开销。必须覆盖部署工作集
                                      #   的全部 LIST 键（本负载 1024 tensor
                                      #   x 1 键/盘）；0=关闭（走 arena 兜底）
-        handle_cache_l2_capacity: 0  # L2 host-pinned 句柄缓存，槽位；
                                      #   0=自动取 4×L1。（striped 暂未生效，见上）
         # —— 批次的两层结构 ——
         # 一次 submit() = 1 个「操作」(op) = 1 次 fused kernel 发射，批内请求并行下发：
@@ -86,18 +83,17 @@ storage:
         # ≤ 2 批，4 已是双倍余量（arena 槽 = 2×4）。
         max_in_flight_operations: 4  # 并发 submit() 批次数（个批次）
         max_batch_entries: 8192      # 单批 IO 条目数（个条目）
-        io_granularity: 0            # 字节；0=动态 PRP，>0 时按该粒度预建
 
   # -------------------------------------------------------------------------
   # backends —— 组装绑定：resolver + datapath + resource 三者接到一起
-  #   contract: 契约名，striped 固定为 striped-local-nvme（单盘为 ext4-local-nvme）
+  #   contract: 契约名，striped 固定为 nvme-device-group（单盘为 ext4-local-nvme）
   #   2026-09-22：放置模型为"一个 tensor 一个文件、在盘间轮转"，backend
   #   不再有可配置项（条带化已移除，--tensor-kb 即单 IO 粒度）。
   # -------------------------------------------------------------------------
   backends:
     - id: layerwise-striped-storage
-      contract: striped-local-nvme
+      contract: nvme-device-group
       resolver: layerwise-striped-file-resolver
-      datapath: layerwise-striped-local-nvme-datapath
+      datapath: layerwise-nvme-device-group-datapath
       resource: layerwise-striped-nvme
       config: {}

@@ -5,12 +5,15 @@
 namespace tutti::config {
 
 struct NvmeDataPathTuning {
-    std::uint32_t handle_cache_capacity = 0;
-    std::uint32_t prp_cache_capacity = 0;
-    std::uint32_t handle_cache_l2_capacity = 0;
-    std::uint64_t max_in_flight_operations = 0;
-    std::uint64_t max_batch_entries = 0;
-    std::uint64_t io_granularity = 0;
+    // Internal admission/workspace bounds, not GPU utilization targets.
+    // Native callers without workload hints use 16 operations / 256 entries.
+    // Model adapters resolve their own budgets before DataPath initialization.
+    // The arena preallocates 2 * operations slots; every slot holds entries.
+    // Large values multiply HBM usage, so there is no cheap unlimited maximum.
+    // Zero explicitly selects the same finite defaults. Advanced callers may
+    // override for known workloads; oversized batches must be split by callers.
+    std::uint64_t max_in_flight_operations = 16;
+    std::uint64_t max_batch_entries = 256;
 };
 
 } // namespace tutti::config

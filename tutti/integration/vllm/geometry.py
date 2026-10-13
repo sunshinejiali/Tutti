@@ -67,7 +67,9 @@ def apply_wave_default(extra: dict, *, blocks_per_chunk: int = 1) -> dict:
         if isinstance(max_batch, str) and max_batch.strip().isdigit():
             max_batch = int(max_batch)
         if max_batch is None:
-            max_batch = 16384 if preset.get("type") == "striped" else 4096
+            max_batch = 4096 if preset.get("type", "raid0") == "local" else 16384
+        elif isinstance(max_batch, int) and not isinstance(max_batch, bool) and max_batch == 0:
+            max_batch = 256
         if isinstance(max_batch, int) and not isinstance(max_batch, bool) and max_batch > 0:
             wave = min(wave, max_batch // blocks_per_chunk)
             if wave == 0:
@@ -157,7 +159,52 @@ def resolve_geometry(extra: dict, kv_cache_config) -> dict:
             )
         resolved[key] = derived
     resolved["kv_group_layer_names"] = tuple(layer_names)
+    resolved["kv_block_tokens"] = block_size
+    resolved["kv_page_bytes"] = page_sizes[0]
     return apply_wave_default(resolved, blocks_per_chunk=blocks_per_chunk)
+
+
+def resolve_io_budget(options: dict, extra: dict, vllm_config) -> dict:
+    """按已知模型工作量选择有限预算，不保证任意extent fan-out都无需拆批。
+
+    小模型不沿用多盘16384的固定批宽。4KiB粒度用于保守工作量估算，
+    不是覆盖namespace块大小；真实sub-IO宽度仍由native准入约束。
+    显式高级预算保留；不根据瞬时空闲显存放大到最大值。
+    """
+    preset = options.get("preset")
+    if not isinstance(preset, dict):
+        return options
+    preset = dict(preset)
+    layers = int(extra["num_layers"])
+    from tutti.integration.vllm.load_policy import resolve_load_mode
+
+    load_mode = resolve_load_mode(extra)
+    if preset.get("max_in_flight_operations") is None:
+        preset["max_in_flight_operations"] = layers * (2 if load_mode == "sync" else 3)
+    if preset.get("max_batch_entries") is None:
+        block_tokens = extra.get("kv_block_tokens")
+        page_bytes = extra.get("kv_page_bytes")
+        model = getattr(vllm_config, "model_config", None)
+        scheduler = getattr(vllm_config, "scheduler_config", None)
+        context = getattr(model, "max_model_len", None)
+        sequences = getattr(scheduler, "max_num_seqs", None)
+        known = all(isinstance(value, int) and not isinstance(value, bool) and value > 0
+                    for value in (block_tokens, page_bytes, context, sequences))
+        default_entries = 4096 if preset.get("type", "raid0") == "local" else 16384
+        # Async reads can aggregate requests across scheduler steps. Shrinking
+        # their batch by a single-step limit would multiply retained op handles.
+        if known and load_mode == "sync":
+            blocks_per_chunk = extra["chunk_tokens"] // block_tokens
+            wave_blocks = extra["max_chunks_per_wave"] * blocks_per_chunk
+            requests = cdiv(context, block_tokens) * sequences
+            expansion = cdiv(page_bytes, 4096)
+            # Keep one configured wave admissible, but don't grow beyond the
+            # established workload default just because a context is huge.
+            default_entries = max(wave_blocks, min(default_entries, requests * expansion))
+        preset["max_batch_entries"] = default_entries
+    resolved = dict(options)
+    resolved["preset"] = preset
+    return resolved
 
 
 def deployment_rank(vllm_config=None, *, worker: bool = False) -> str:
@@ -211,6 +258,13 @@ def apply_capacity(options: dict, *, segment_bytes: int,
     加入的槽位前缀（默认 128 KiB）、预建文件组取整或文件系统开销，因而
     不是严格的物理总占用上限。服务总预算应由调用者先除以 TP，再传入。
     """
+    if "allocator_enabled" in options:
+        raise ValueError("allocator_enabled 未被消费，已删除")
+    preset = options.get("preset")
+    if isinstance(preset, dict):
+        removed = {"prp_cache_capacity", "handle_cache_capacity", "handle_cache_l2_capacity"}.intersection(preset)
+        if removed:
+            raise ValueError(f"cache容量由runtime管理，不支持preset参数 {sorted(removed)}")
     removed = {"capacity_bytes", "num_chunks"}.intersection(options)
     if removed:
         raise ValueError(f"vLLM store options 不支持 {sorted(removed)}；请设置 capacity，例如 '64 GiB'")

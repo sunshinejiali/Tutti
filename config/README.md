@@ -7,7 +7,8 @@
 |---|---|---|
 | `device_manager/nvme_daemon.yaml` | `tutti_daemon --config` | daemon schema 模板：PCI/namespace/mount/ACL/队列策略/lease |
 | `storage_runtime/local_nvme.yaml` | `TuttiRuntime::create` / C++ example 的 `--config` | 单控制器 Resource→Resolver→DataPath→Backend 图 |
-| `storage_runtime/multi_nvme.yaml` | 同上 | 多控制器图；返回的 mount/md 布局决定独立盘或 RAID0 路由 |
+| `storage_runtime/raid0.yaml` | 同上，推荐默认 | 已存在md RAID0；resolver强制检查实际阵列及完整成员，不允许降级 |
+| `storage_runtime/nvme_device_group.yaml` | 同上，显式可选 | 多个独立挂载点，复用同一多控制器数据面 |
 | `integration/vllm/kv_transfer.json` | `vllm --kv-transfer-config` | 最小 Python connector/preset 示例；逐项说明见 [参数注释](integration/vllm/README.md) |
 | `local/tutti_daemon_<name>.yaml` | daemon、Python 硬件事实推导、宿主脚本 | 已审核的本机设备集合；仓库的 kv0/md0 只描述维护者机器 |
 
@@ -36,9 +37,17 @@ Python与native是两套schema。
 
 ## 当前数据面类型名称
 
-配置目录用`multi_nvme`说明能力；实际多控制器实现由`preset.type=striped`、
-`datapath.type=striped-local-nvme`、`backend.contract=striped-local-nvme`选择。
-这些不是无作用的别名，而是当前实际消费的类型键；不表示细粒度文件切片。
+名称直接区分两件事：**存储拓扑**与**参与IO的设备集合**。
+
+- `raid0`：默认存储拓扑，使用已存在的md RAID0，核验完整成员。
+- `local`：单盘入口。
+- `nvme-device-group`：NVMe设备组入口，常用于独立挂载点；共享md挂载点仍会核验阵列。
+- 原生`selection: device-group`：一次申请整个设备组，不表示文件放置或RAID类型。
+- 原生`datapath.type/contract: nvme-device-group`：设备组IO实现，RAID0和独立盘都复用它。
+- `resolver.config.topology: raid0`：要求该设备组构成真实RAID0，错误时不降级。
+
+旧`multi`、`multi-nvme`和`striped`配置名不再接受。普通Python用户只需默认`raid0`，
+不需要理解设备组数据面的内部装配。
 `gpu_id`选择Python preset绑定GPU，对应C++ `accel_id`。
 
 单盘不需要 `device_groups`：使用 `preset.type=local`、`device_id` 与 `gpu_id`。
@@ -48,10 +57,15 @@ local preset未显式传 `options.mounts` 时payload回退到root下，必须让
 
 ## 默认与本机覆盖
 
-- 模型几何和未显式指定的直连 in-flight 配额由 connector 推导。
+- 模型几何和缺省in-flight由connector推导；sync的batch根据上下文、序列数和KV page缩减。
+  auto/async可能跨步合并，先保留已有有限批宽。普通用户不需要填这两个高级字段。
+- 原生无模型入口使用16操作/256条目，模板只留`config: {}`；它不是无限请求保证。
 - IO worker 池、段文件槽数/前缀等已有默认保持不变；不把本机测量升级为全局最优值。
-- 所有 `0` **不是统一的 auto**：缓存 0 可关闭，底层 batch/in-flight 0 会取内部默认，
-  Python caps 还可能报告原来的 0。初学者不要用 0 绕过准入或复制 native 的 0 到 preset。
+- 缓存容量不再由用户填写：PRP按实际控制器页和在飞预算自动分配；应用factory不启用
+  重复handle L1/L2缓存。旧缓存容量键会被拒绝，详见指南§6。
+- batch/in-flight的0在preset装配前变成有效256/16，caps同步有效值；它不是无限能力。
+- 删除未生效的`allocator_enabled`、`background_reclaim`及YAML `io_granularity`选项；
+  对象层实际后台预建及磁盘护栏保持不变。
 - `load_mode=auto` 是请求级调度选择；`TUTTI_ASYNC_COMPLETION=1` 是实验的设备完成模式，
   不是同一个“async”开关。
 - `NUM_QUEUES` 可覆盖 serve/bench 默认 8；不改变内核 queue depth。

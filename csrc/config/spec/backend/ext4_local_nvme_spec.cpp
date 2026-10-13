@@ -19,7 +19,7 @@ Status validate_ext4_local_nvme_backend(const ResourceSpec& resource,
             ? 1 : config->allocation.nvme_device_ids.size();
     if (cardinality < contract.minimum_cardinality ||
         cardinality > contract.maximum_cardinality ||
-        config->allocation.selection == NvmeSelection::Striped) {
+        config->allocation.selection == NvmeSelection::Multi) {
         return invalid_spec(path +
                             " resource cardinality does not match ext4-local-nvme");
     }

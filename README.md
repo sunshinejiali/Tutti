@@ -106,7 +106,8 @@ Configuration is organized by its consumer; see the
 
 - **`config/device_manager/nvme_daemon.yaml`** is the daemon schema template;
   reviewed host facts live in `config/local/tutti_daemon_<name>.yaml`.
-- **`config/storage_runtime/{local_nvme,multi_nvme}.yaml`** describes the native
+- **`config/storage_runtime/raid0.yaml`** is the recommended native deployment;
+  `local_nvme.yaml` / `nvme_device_group.yaml` are explicit alternatives. These describe the native
   `TuttiRuntimeSpec` resource/resolver/datapath/backend graph. Runtime device
   facts and queue grants come from the daemon allocation response.
 - **`config/integration/vllm/kv_transfer.json`** is the separate Python connector

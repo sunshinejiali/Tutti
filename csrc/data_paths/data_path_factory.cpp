@@ -12,6 +12,7 @@
 #include "csrc/payloads/memfs/memfs_data_path.h"
 #if defined(TUTTI_DATA_PATH_FACTORY_HAS_LOCAL_NVME)
 #include "csrc/data_paths/local_nvme/local_nvme_data_path.h"
+#include "csrc/data_paths/local_nvme/metadata/cache_sizing.h"
 #include "csrc/data_paths/striped_local_nvme/striped_data_path.h"
 #include "csrc/data_paths/striped_local_nvme/striped_async_data_path.h"
 #endif
@@ -148,12 +149,12 @@ Result<CreatedDataPath> create_local_nvme(
         slice.max_data_size,
         max_batch_entries.value(),
         0,
-        config.handle_cache_capacity,
-        config.prp_cache_capacity,
+        /*handle_cache_capacity=*/0,
+        local_nvme::kAutoPrpCacheCapacity,
         config.max_in_flight_operations,
         config.max_batch_entries,
         0,
-        config.handle_cache_l2_capacity,
+        /*handle_cache_l2_capacity=*/0,
         slice.pci_bdf);
     result.initialize_config = DataPathConfig{"local_nvme"};
     return Result<CreatedDataPath>::Success(std::move(result));
@@ -167,7 +168,7 @@ Result<CreatedDataPath> create_striped_local_nvme(
             spec.config) ||
         context.relation.contract != backend_ids::kStripedContract) {
         return failure<CreatedDataPath>(
-            invalid("striped-local-nvme DataPathSpec does not match backend relation"));
+            invalid("nvme-device-group DataPathSpec does not match backend relation"));
     }
     auto base_view = datapath_view(context);
     if (!base_view.ok()) return failure<CreatedDataPath>(base_view.status());
@@ -175,11 +176,11 @@ Result<CreatedDataPath> create_striped_local_nvme(
         base_view.value().get());
     if (view == nullptr) {
         return failure<CreatedDataPath>(
-            invalid("striped-local-nvme DataPath requires NVMe DataPath view"));
+            invalid("nvme-device-group DataPath requires NVMe DataPath view"));
     }
     if (view->slices.size() < 2) {
         return failure<CreatedDataPath>(
-            invalid("striped-local-nvme DataPath requires at least two NVMe slices"));
+            invalid("nvme-device-group DataPath requires at least two NVMe slices"));
     }
 
     const auto& config = tuning(spec);
@@ -221,7 +222,7 @@ Result<CreatedDataPath> create_striped_local_nvme(
             0,
             max_batch_entries.value(),
             max_in_flight.value(),
-            config.prp_cache_capacity);
+            local_nvme::kAutoPrpCacheCapacity);
     } else {
         result.instance = std::make_unique<striped_local_nvme::StripedDataPath>(
             std::move(descriptors),
@@ -230,9 +231,9 @@ Result<CreatedDataPath> create_striped_local_nvme(
             0,
             max_batch_entries.value(),
             max_in_flight.value(),
-            config.prp_cache_capacity);
+            local_nvme::kAutoPrpCacheCapacity);
     }
-    result.initialize_config = DataPathConfig{"striped-local-nvme"};
+    result.initialize_config = DataPathConfig{"nvme-device-group"};
     return Result<CreatedDataPath>::Success(std::move(result));
 }
 #endif

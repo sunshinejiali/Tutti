@@ -46,7 +46,6 @@ def _layout(tmp_path, *, capacity=32, mounts=1):
         SEGMENT,
         mounts=dirs,
         capacity_chunks=capacity,
-        background_reclaim=False,
         namespace=b"test-async-precreate",
         segment_file_slots=SLOTS_PER_FILE,
         segment_header_bytes=32 * 1024,

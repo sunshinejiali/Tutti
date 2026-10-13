@@ -19,7 +19,7 @@ storage:
         type: nvme-service
         endpoint: "127.0.0.1:50051"
       allocation:
-        selection: striped            # 多盘：一组 rotating 设备
+        selection: device-group            # 多盘：一组 rotating 设备
         device_ids: [0, 1, 2, 3]
         queues_per_controller: 32     # 每盘用户队列数（QP）
 
@@ -31,18 +31,14 @@ storage:
 
   datapaths:
     - id: bw-probe-striped-datapath
-      type: striped-local-nvme        # 多盘数据路径
+      type: nvme-device-group        # 多盘数据路径
       config:
-        handle_cache_capacity: 16     # 4 文件句柄，16 槽绰绰有余
-        prp_cache_capacity: 262144     # PRP 页缓存（host DRAM 池），1 GiB
-        handle_cache_l2_capacity: 0
         max_in_flight_operations: 4   # 探针串行 submit+wait
         max_batch_entries: 8192        # depth 扫描最大值
-        io_granularity: 0             # 动态 PRP
 
   backends:
     - id: bw-probe-storage
-      contract: striped-local-nvme    # 多盘契约名
+      contract: nvme-device-group    # 多盘契约名
       resolver: bw-probe-file-resolver
       datapath: bw-probe-striped-datapath
       resource: bw-probe-striped-nvme

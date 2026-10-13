@@ -1,5 +1,5 @@
-# Native TuttiRuntimeSpec: two controllers in ONE fused DataPath.
-# The allocation response decides independent mounts versus an md RAID0 mount.
+# NVMe设备组：一次提交使用整个控制器集合，不代表阵列类型。
+# 独立挂载点由resolver分派；共享md挂载点仍核验阵列。默认用户用raid0.yaml。
 # Adjust endpoint/device IDs after reviewing config/local/tutti_daemon_<name>.yaml.
 # This file does not configure a Python connector or create/rebuild an array.
 accelerator:
@@ -14,7 +14,7 @@ storage:
         type: nvme-service
         endpoint: "127.0.0.1:50051"
       allocation:
-        selection: striped
+        selection: device-group
         device_ids: [0, 1]
         queues_per_controller: 4
   resolvers:
@@ -23,16 +23,13 @@ storage:
       scheme: file
       config: {}
   datapaths:
-    - id: multi-nvme-datapath
-      type: striped-local-nvme
-      config:
-        max_in_flight_operations: 16
-        max_batch_entries: 4096
-        prp_cache_capacity: 4096
+    - id: nvme-device-group-datapath
+      type: nvme-device-group
+      config: {}  # 无模型调用默认16/256；已知大批次可显式覆盖内部预算
   backends:
-    - id: multi-nvme-storage
-      contract: striped-local-nvme
+    - id: nvme-device-group-storage
+      contract: nvme-device-group
       resolver: file-resolver
-      datapath: multi-nvme-datapath
+      datapath: nvme-device-group-datapath
       resource: nvme-group
       config: {}

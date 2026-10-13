@@ -278,4 +278,4 @@ def test_invalid_segment_options(tmp_path):
             TuttiKVStore(tmp_path, 1, SEGMENT, runtime=RotatingFakeRuntime(), **kwargs)
     with pytest.raises(TypeError):
         TuttiKVStore(tmp_path, 1, SEGMENT, runtime=RotatingFakeRuntime(),
-                     layout="striped")
+                     layout="nvme-device-group")

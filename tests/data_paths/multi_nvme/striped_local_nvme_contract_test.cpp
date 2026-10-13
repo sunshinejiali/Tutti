@@ -356,7 +356,7 @@ static bool submit_wait_all(StorageRuntime* rt, const IoRequest* reqs, std::size
 // Environment assembly
 // -------------------------------------------------------------------------
 
-static constexpr const char* kDPKey = "striped-local-nvme";
+static constexpr const char* kDPKey = "nvme-device-group";
 static constexpr std::uint64_t kUnit = 65536;  // 64 KiB (IO granularity)
 
 // Round 16 S3: GPU selection via env TUTTI_TEST_GPU (default 0).
@@ -412,7 +412,7 @@ static std::unique_ptr<StripedEnv> make_env(std::uint32_t num_devices = 2) {
     auto env = std::make_unique<StripedEnv>(num_devices);
     RuntimeComponents comps;
     comps.resolvers.push_back({"file", env->resolver.get()});
-    comps.data_paths.push_back({kDPKey, &env->dp, DataPathConfig{"striped-local-nvme"}});
+    comps.data_paths.push_back({kDPKey, &env->dp, DataPathConfig{"nvme-device-group"}});
     auto created = StorageRuntime::create({}, std::move(comps));
     if (!created.ok()) {
         std::fprintf(stderr, "StorageRuntime::create failed: %s\n",
@@ -2067,7 +2067,7 @@ int main(int argc, char** argv) {
             static_cast<std::uint32_t>(g_gpu_id),
             /*mdts_override=*/0, /*cq_poll_budget=*/2000000,
             /*max_batch_entries=*/4096, /*max_in_flight_operations=*/4);
-        DataPathConfig direct_config{"striped-local-nvme"};
+        DataPathConfig direct_config{"nvme-device-group"};
         ResourceProvider* direct_resources = nullptr;
         const Status direct_init = direct_dp.initialize(
             direct_config, *direct_resources);

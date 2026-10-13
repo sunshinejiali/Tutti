@@ -152,7 +152,7 @@ const char* selection_name(NvmeSelection selection) {
     switch (selection) {
     case NvmeSelection::Allowed: return "allowed";
     case NvmeSelection::Explicit: return "explicit";
-    case NvmeSelection::Striped: return "striped";
+    case NvmeSelection::Multi: return "device-group";
     }
     return "unknown";
 }
@@ -181,15 +181,9 @@ void device_ids_line(std::ostringstream& output, const std::string& path,
 void debug_datapath_tuning(std::ostringstream& output,
                            const std::string& path,
                            const NvmeDataPathTuning& config) {
-    line(output, path + ".handle_cache_capacity",
-         config.handle_cache_capacity);
-    line(output, path + ".prp_cache_capacity", config.prp_cache_capacity);
-    line(output, path + ".handle_cache_l2_capacity",
-         config.handle_cache_l2_capacity);
     line(output, path + ".max_in_flight_operations",
          config.max_in_flight_operations);
     line(output, path + ".max_batch_entries", config.max_batch_entries);
-    line(output, path + ".io_granularity", config.io_granularity);
 }
 
 } // namespace
@@ -318,6 +312,10 @@ Status TuttiRuntimeSpec::validate() const {
                                         " types do not match contract " +
                                         backend.contract);
         }
+        if (const auto* config = std::get_if<LocalFileResolverConfig>(&resolver.config);
+            config && config->require_raid0 && backend.contract != backend_ids::kStripedContract) {
+            return detail::invalid_spec(path + " raid0 topology requires a nvme-device-group backend");
+        }
         if (backend.contract == backend_ids::kExt4Contract) {
             status = detail::validate_ext4_local_nvme_backend(
                 resource, backend, *contract, path);
@@ -421,6 +419,9 @@ Result<std::string> TuttiRuntimeSpec::to_debug_string() const {
         string_line(output, path + ".id", resolver.id);
         string_line(output, path + ".type", resolver.type);
         string_line(output, path + ".scheme", resolver.scheme);
+        if (const auto* config = std::get_if<LocalFileResolverConfig>(&resolver.config)) {
+            string_line(output, path + ".config.topology", config->require_raid0 ? "raid0" : "auto");
+        }
     }
     for (std::size_t index = 0; index < storage.datapaths.size(); ++index) {
         const DataPathSpec& datapath = storage.datapaths[index];

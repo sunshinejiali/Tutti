@@ -97,7 +97,6 @@ class ObjectLayout:
         capacity_chunks: int = 0,
         rank_id: int = 0,
         rank_count: int = 1,
-        background_reclaim: bool = True,
         namespace: bytes | str | None = None,
         segment_file_slots: int = DEFAULT_SEGMENT_FILE_SLOTS,
         segment_header_bytes: int = DEFAULT_SEGMENT_HEADER_BYTES,
@@ -112,7 +111,6 @@ class ObjectLayout:
         self._capacity_chunks = int(capacity_chunks or 0)
         self._rank_id = int(rank_id)
         self._rank_count = int(rank_count)
-        self._background_reclaim = bool(background_reclaim)
         # 后台预建线程的停止信号（None = 未启动），见 start_background_precreate。
         self._precreate_stop: threading.Event | None = None
         self._namespace = (
@@ -196,7 +194,6 @@ class ObjectLayout:
             "segment_header_bytes": self._segment_header_bytes,
             "namespace_fingerprint": fingerprint,
             "devices": devices,
-            "background_reclaim": self._background_reclaim,
             "rank_id": self._rank_id,
             "rank_count": self._rank_count,
         }

@@ -1,0 +1,35 @@
+# Native TuttiRuntimeSpec: default RAID0 deployment over an EXISTING md array.
+# Resolver verifies actual level, exact namespace members and offsets; no formatting.
+# Adjust endpoint/device IDs after reviewing config/local/tutti_daemon_<name>.yaml.
+# This file does not configure a Python connector or create/rebuild an array.
+accelerator:
+  profile: CUDA
+runtime:
+  accel_id: 0
+storage:
+  resources:
+    - id: nvme-group
+      type: nvme
+      provider:
+        type: nvme-service
+        endpoint: "127.0.0.1:50051"
+      allocation:
+        selection: device-group  # 一次申请整个NVMe成员组，不代表RAID类型
+        device_ids: [0, 1]
+        queues_per_controller: 4
+  resolvers:
+    - id: raid0-resolver
+      type: local-file
+      scheme: file
+      config: {topology: raid0}
+  datapaths:
+    - id: nvme-device-group-datapath
+      type: nvme-device-group  # 共享设备组IO实现；阵列约束在resolver.topology
+      config: {}  # 无模型调用默认16/256；模型适配器另行推导提交预算
+  backends:
+    - id: raid0-storage
+      contract: nvme-device-group
+      resolver: raid0-resolver
+      datapath: nvme-device-group-datapath
+      resource: nvme-group
+      config: {}

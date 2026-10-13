@@ -22,7 +22,7 @@ nvmeservice::ClientSelectionMode to_client_selection(
             return nvmeservice::ClientSelectionMode::Allowed;
         case config::NvmeSelection::Explicit:
             return nvmeservice::ClientSelectionMode::Explicit;
-        case config::NvmeSelection::Striped:
+        case config::NvmeSelection::Multi:
             return nvmeservice::ClientSelectionMode::Striped;
     }
     return nvmeservice::ClientSelectionMode::Allowed;

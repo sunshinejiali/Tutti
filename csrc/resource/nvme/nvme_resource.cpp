@@ -157,7 +157,7 @@ Status NvmeResource::validate_allocation_metadata_() const {
                      "AcquireNvmeSlices returned no slices");
     }
 
-    if (allocation_.selection == config::NvmeSelection::Striped) {
+    if (allocation_.selection == config::NvmeSelection::Multi) {
         if (impl_->allocation.slices.size() !=
             allocation_.nvme_device_ids.size()) {
             return error(StatusCode::INVALID_ARGUMENT,

@@ -50,22 +50,20 @@ struct LocalNvmePreset {
     // HostSubmitContext::accel_id 对齐（N2）。
     std::int32_t accel_id = 0;
     std::uint32_t num_queues = 16;
-    // Capacity knobs (0 = use defaults)
+    // Admission budgets (0 resolves to 256 entries / 16 operations).
+    // PRP cache is automatic; long-lived targets do not use a second handle cache.
     std::uint32_t max_batch_entries = 4096;
     std::uint32_t max_in_flight_operations = 4;
-    std::uint32_t handle_cache_capacity = 4096;
-    std::uint32_t prp_cache_capacity = 4096;
 };
 
 // Configuration for multi-device mode: N NVMe devices, ONE fused DataPath.
 //
-// Placement model (2026-09-22): an object is ONE file on ONE device; the
-// slot number rotates over devices (FixedSegmentFilePlacement), and
-// parallelism across the N devices comes from the many chunks of a long
-// prompt arriving together in one submit -- never from splitting a single
-// IO. The DataPath matches each target's file to its device by the
-// payload's controller PCI address.
+// Independent mounts rotate whole object slots across devices. A shared md
+// RAID0 mount is resolved into its member namespaces and physical extents.
+// require_raid0 rejects single-device and independent-mount layouts before
+// creating any device resources; the resolver verifies the actual md array.
 struct StripedNvmePreset {
+    bool require_raid0 = false;
     std::vector<NvmeDeviceConfig> devices;  // typically 4
     std::int32_t accel_id = 0;  // 见 LocalNvmePreset::accel_id
     std::uint32_t num_queues = 32;           // per-device
@@ -80,7 +78,6 @@ struct StripedNvmePreset {
     // 仍超上限的批由上层按上限切成多次 submit（见 store._submit_retry）。
     std::uint32_t max_batch_entries = 16384;
     std::uint32_t max_in_flight_operations = 4;
-    std::uint32_t prp_cache_capacity = 4096;
 };
 
 // Factory: create a single-disk LocalNvmeDataPath runtime.

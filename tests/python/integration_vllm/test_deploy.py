@@ -10,11 +10,82 @@ import pytest
 from tutti.integration.vllm.connector import TuttiConnectorV1
 from tutti.integration.vllm.geometry import (
     apply_capacity, apply_device_groups, deployment_rank, expand_placeholders,
+    resolve_io_budget,
 )
 from tutti.storage.tutti_nvme.store import _normalize_preset
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorRole,
 )
+
+
+def _budget_config(context=4096, sequences=1):
+    return SimpleNamespace(model_config=SimpleNamespace(max_model_len=context),
+                           scheduler_config=SimpleNamespace(max_num_seqs=sequences))
+
+
+def _budget_extra(layers=80, load_mode="sync"):
+    return {"num_layers": layers, "load_mode": load_mode, "chunk_tokens": 512,
+            "max_chunks_per_wave": 512, "kv_block_tokens": 128, "kv_page_bytes": 16384}
+
+
+@pytest.mark.parametrize("layers, mode, expected", [(80, "sync", 160), (80, "auto", 240), (3, "sync", 6)])
+def test_io_budget_matches_layer_lifetime(layers, mode, expected):
+    options = {"preset": {}}
+    got = resolve_io_budget(options, _budget_extra(layers, mode), _budget_config())
+    assert got["preset"]["max_in_flight_operations"] == expected
+    assert options == {"preset": {}}
+
+
+@pytest.mark.parametrize("context, sequences, entries", [(4096, 1, 2048), (131072, 1, 4096),
+                                                         (131072, 4, 16384), (1048576, 256, 16384)])
+def test_batch_budget_follows_workload_with_finite_ceiling(context, sequences, entries):
+    got = resolve_io_budget({"preset": {}}, _budget_extra(), _budget_config(context, sequences))
+    assert got["preset"]["max_batch_entries"] == entries
+
+
+@pytest.mark.parametrize("mode", ["auto", "async"])
+def test_cross_step_async_budget_is_not_shrunk_to_one_step(mode):
+    got = resolve_io_budget({"preset": {}}, _budget_extra(load_mode=mode), _budget_config())
+    assert got["preset"]["max_batch_entries"] == 16384
+    assert got["preset"]["max_in_flight_operations"] == 240
+
+
+@pytest.mark.parametrize("value", [4, 4096, 0])
+def test_io_budget_preserves_explicit_limits(value):
+    options = {"preset": {"max_batch_entries": value, "max_in_flight_operations": value}}
+    assert resolve_io_budget(options, _budget_extra(), _budget_config()) == options
+
+
+def test_io_budget_without_model_uses_bounded_existing_defaults():
+    for preset_type, entries in [("local", 4096), ("raid0", 16384)]:
+        got = resolve_io_budget({"preset": {"type": preset_type}}, _budget_extra(), SimpleNamespace())
+        assert got["preset"]["max_batch_entries"] == entries
+    options = {"capacity": "64 GiB"}
+    assert resolve_io_budget(options, _budget_extra(), _budget_config()) is options
+
+
+@pytest.mark.parametrize("role", ["worker", "scheduler"])
+def test_factories_pass_the_same_model_budget_without_io(monkeypatch, role):
+    import tutti.engine.core as core
+    import tutti.engine.metadata as metadata
+    import tutti.storage.registry as registry
+    import tutti.storage.metadata as stores_metadata
+    from tutti.integration.vllm.factory import worker_engine_for, scheduler_index_for
+
+    captured = {}
+    create = lambda _type, opts: captured.update(opts) or object()
+    monkeypatch.setattr(registry, "create_store", create)
+    monkeypatch.setattr(stores_metadata, "create_metadata_store", create)
+    monkeypatch.setattr(core, "KVEngine", lambda *_: object())
+    monkeypatch.setattr(metadata, "SchedulerMetadataIndex", lambda *_: object())
+    cfg = _budget_config()
+    cfg.parallel_config = SimpleNamespace(rank=0, tensor_parallel_size=1)
+    extra = {**_budget_extra(), "chunk_kv_bytes": 512 * 1280, "store": {
+        "type": "tutti_nvme", "options": {"capacity": "64 GiB", "root": "/unused", "preset": {}}}}
+    (worker_engine_for if role == "worker" else scheduler_index_for)(cfg, extra)
+    assert captured["preset"]["max_batch_entries"] == 2048
+    assert captured["preset"]["max_in_flight_operations"] == 160
+    assert extra["store"]["options"]["preset"] == {}
 
 
 class TestLocalRankPlaceholder:
@@ -205,7 +276,7 @@ class TestLocalRankPlaceholder:
                 "store": {"type": "tutti_nvme", "options": {
                     "root": "/mnt/nvme0/pool-rank{LOCAL_RANK}",
                     "preset": {
-                        "type": "striped",
+                        "type": "nvme-device-group",
                         "device_groups": [[0, 1], [2, 3]],
                         "gpu_id": "{LOCAL_RANK}",
                     },
@@ -239,7 +310,7 @@ def test_worker_connector_applies_only_missing_io_defaults(monkeypatch, io_strea
     from tutti.integration.vllm.factory import worker_engine_for
 
     captured = {}
-    options = {"capacity": "49152 B", "root": "/unused", "preset": {"type": "striped"}}
+    options = {"capacity": "49152 B", "root": "/unused", "preset": {"type": "nvme-device-group"}}
     if io_stream != "missing":
         options["io_stream"] = io_stream
     if queues != "missing":
@@ -290,7 +361,7 @@ def test_human_capacity_is_normalized_before_store_creation(monkeypatch, role):
 
 
 @pytest.mark.parametrize("role", ["worker", "scheduler"])
-@pytest.mark.parametrize("key", ["capacity_bytes", "num_chunks"])
+@pytest.mark.parametrize("key", ["capacity_bytes", "num_chunks", "prp_cache_capacity", "handle_cache_capacity", "handle_cache_l2_capacity"])
 def test_removed_capacity_is_rejected_on_cached_factory(monkeypatch, role, key):
     import tutti.engine.core as core
     import tutti.engine.metadata as metadata
@@ -307,7 +378,8 @@ def test_removed_capacity_is_rejected_on_cached_factory(monkeypatch, role, key):
     monkeypatch.setattr(metadata, "SchedulerMetadataIndex", lambda *_: object())
     factory = worker_engine_for if role == "worker" else scheduler_index_for
     factory(cfg, extra)
-    extra["store"]["options"] = {key: 4}
+    extra["store"]["options"] = ({"capacity": "49152 B", "preset": {key: 4}}
+                                 if "cache" in key else {key: 4})
     with pytest.raises(ValueError, match="不支持"):
         factory(cfg, extra)
 
@@ -349,9 +421,9 @@ class TestTuttiStorePresetParam:
 
         store = TuttiKVStore(
             tmp_path / "pool", num_chunks=4, segment_bytes=4096,
-            preset={"device_id": "1", "gpu_id": "1"},
+            preset={"type": "local", "device_id": "1", "gpu_id": "1"},
         )
-        assert store._preset == {"device_id": 1, "gpu_id": 1}
+        assert store._preset == {"type": "local", "device_id": 1, "gpu_id": 1}
 
     def test_no_preset_stays_none(self, tmp_path):
         from tutti.storage.tutti_nvme.store import TuttiKVStore
@@ -366,7 +438,7 @@ class TestTuttiStorePresetParam:
 
         store = TuttiKVStore(
             tmp_path / "pool", num_chunks=4, segment_bytes=4096,
-            preset={"device_id": "1"},
+            preset={"type": "local", "device_id": "1"},
         )
         monkeypatch.setenv("TUTTI_NVME_PRESET", "/nonexistent/invalid.yaml")
         called = {}
@@ -378,14 +450,55 @@ class TestTuttiStorePresetParam:
         monkeypatch.setattr(store_mod, "_build_runtime", fake_build)
         with pytest.raises(RuntimeError, match="stop-here"):
             store.open()
-        assert called["preset"] == {"device_id": 1}  # 归一化后直达
+        assert called["preset"] == {"type": "local", "device_id": 1}  # 归一化后直达
+
+
+def test_metadata_raid0_mounts_follow_each_rank(tmp_path, monkeypatch):
+    from tutti.storage import metadata as metadata_mod
+    import yaml
+
+    config = tmp_path / "daemon.yaml"
+    config.write_text(yaml.safe_dump({"nvmes": [
+        {"device_id": index, "pci_addr": f"ffff:00:0{index}.0",
+         "backing_mount_path": str(tmp_path / ("array-a" if index < 2 else "array-b"))}
+        for index in range(4)
+    ]}))
+    captured = []
+
+    class View:
+        def __init__(self, options):
+            captured.append(options)
+
+        def open(self):
+            pass
+
+        def recover(self):
+            return set()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(metadata_mod, "ObjectStore", View)
+    ranks = [{"root": str(tmp_path / f"index-{rank}"), "preset": {
+        "type": "raid0", "daemon_config": str(config),
+        "devices": [{"device_id": index} for index in ([0, 1] if rank < 2 else [2, 3])],
+    }} for rank in range(4)]
+    store = metadata_mod.TuttiMetadataStore(ranks[0]["root"], 8, 4096,
+                                            tp_size=4, rank_options=ranks, layer_span=3)
+    store.open()
+    assert [[item["mount_path"] for item in options["devices"]] for options in captured] == [
+        [str(tmp_path / "array-a")], [str(tmp_path / "array-a")],
+        [str(tmp_path / "array-b")], [str(tmp_path / "array-b")],
+    ]
+    assert [options["rank_id"] for options in captured] == list(range(4))
+    store.close()
 
 
 class TestDeviceGroups:
     """device_groups：多卡共用盘组（8 卡 / 每 4 个 rank 一组 2 盘条带）。"""
 
     def test_groups_split_by_rank_span(self):
-        options = {"preset": {"type": "striped",
+        options = {"preset": {"type": "nvme-device-group",
                               "device_groups": [[0, 1], [2, 3]]}}
         for rank in range(4):
             got = apply_device_groups(options, rank=str(rank), tp_size=8)
@@ -429,7 +542,7 @@ class TestCapacityToChunks:
     def _base_options():
         return {
             "preset": {
-                "type": "striped",
+                "type": "nvme-device-group",
                 "gpu_id": "{LOCAL_RANK}",
                 "device_groups": [[0, 1], [2, 3]],
             },

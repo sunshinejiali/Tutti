@@ -176,7 +176,7 @@ print(json.dumps({
             "root": str(Path(mount) / f"tutti-kv-online-{tag}-{{LOCAL_RANK}}"),
             "capacity": f"{capacity} B",
             "preset": {
-                "type": "striped", "daemon_config": paths,
+                "type": "raid0", "daemon_config": paths,
                 "gpu_id": "{LOCAL_RANK}", "device_groups": groups,
                 "num_queues": int(queues),
             },

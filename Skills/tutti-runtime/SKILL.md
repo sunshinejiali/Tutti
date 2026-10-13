@@ -20,13 +20,26 @@ in `tests/python/`. Distinguish GPU-only synthetic tests from real NVMe IO.
 For configuration, read `config/README.md` and
 `doc/configuration-and-performance.md`: daemon, native Runtime YAML and Python
 preset are separate consumers. Prefer automatic model geometry/in-flight
-values; review devices/capacity/queue budget explicitly. Local/multi worker
-and cache defaults differ; do not claim a universal optimum or auto-run sweeps.
+values and sync workload batch sizing. Preserve existing batch budgets for
+cross-step async reads; shrinking those needs a matching completion/backpressure
+design. Native model-free defaults are finite 16 operations / 256 entries;
+review devices/capacity/queue budget explicitly. PRP cache is internally
+budgeted in host pinned memory using controller page size and effective IO
+limits, not GPU free memory. Do not emit cache capacity knobs or unused
+allocator/reclaim/granularity options. Application factories avoid duplicate
+handle L1/L2 caching of long-lived file tickets. Local/multi worker defaults
+still differ; do not claim a universal optimum or auto-run sweeps.
 Python users may omit wave/IO stream/queue knobs; the connector provides defaults
 without changing low-level store/preset callers. User capacity uses only
 `capacity: "64 GiB"` (per rank); raw byte/slot option aliases are removed.
 Read `config/integration/vllm/README.md` for plain field explanations; never
-guess device_groups from GPU/disk numbers.
+guess device_groups from GPU/disk numbers. The default preset is `raid0` over
+an existing md array; native examples use `config/storage_runtime/raid0.yaml`.
+Verify all selected namespaces are exactly one array's members; never create
+or format an array to make a config pass. Use `nvme-device-group` to describe
+the shared IO controller set and `selection: device-group` to allocate that set;
+neither means RAID0. Use `local` for one device. Reject the removed `multi`,
+`multi-nvme` and `striped` configuration names.
 If only this skill is installed, first obtain the Tutti checkout; the skill
 contains instructions, not the compiled runtime or host configuration.
 

@@ -445,7 +445,7 @@ def test_auto_routes_read_and_write_to_distinct_streams(tmp_path, monkeypatch):
     runtime = FakeRuntime(supports_multi_stream=True, bound_accel_id=0)
     store = TuttiKVStore(
         root=tmp_path / "pool", num_chunks=2, segment_bytes=SEG,
-        runtime=runtime, io_stream="auto", preset={"gpu_id": 0},
+        runtime=runtime, io_stream="auto", preset={"type": "local", "gpu_id": 0},
     )
     store.open()
     store.set_layer_span(1)   # 对象几何必须定案（单层 key 各成一个对象）
@@ -516,7 +516,7 @@ def test_auto_falls_back_when_caps_reject_multi_stream(tmp_path, monkeypatch):
     runtime = FakeRuntime(supports_multi_stream=False)
     store = TuttiKVStore(
         root=tmp_path / "pool", num_chunks=2, segment_bytes=SEG,
-        runtime=runtime, io_stream="auto", preset={"gpu_id": 0},
+        runtime=runtime, io_stream="auto", preset={"type": "local", "gpu_id": 0},
     )
     store.open()
     assert store._stream_mode == "shared"
@@ -539,7 +539,7 @@ def test_auto_falls_back_when_multi_stream_caps_are_missing(tmp_path, monkeypatc
     runtime = FakeRuntime()
     store = TuttiKVStore(
         root=tmp_path / "pool", num_chunks=2, segment_bytes=SEG,
-        runtime=runtime, io_stream="auto", preset={"gpu_id": 0},
+        runtime=runtime, io_stream="auto", preset={"type": "local", "gpu_id": 0},
     )
     store.open()
     assert store._stream_mode == "shared"
@@ -554,7 +554,7 @@ def test_auto_rejects_runtime_and_preset_device_mismatch(tmp_path, monkeypatch):
     runtime = FakeRuntime(supports_multi_stream=True, bound_accel_id=1)
     store = TuttiKVStore(
         root=tmp_path / "pool", num_chunks=2, segment_bytes=SEG,
-        runtime=runtime, io_stream="auto", preset={"gpu_id": 0},
+        runtime=runtime, io_stream="auto", preset={"type": "local", "gpu_id": 0},
     )
     with pytest.raises(RuntimeError, match="bound_accel_id.*gpu_id"):
         store.open()
@@ -617,7 +617,7 @@ def test_owned_runtime_shutdown_precedes_stream_release(tmp_path, monkeypatch):
     monkeypatch.setattr(store_module, "_build_runtime", lambda _preset: runtime)
     store = TuttiKVStore(
         root=tmp_path / "pool", num_chunks=2, segment_bytes=SEG,
-        runtime=None, io_stream="auto", preset={"gpu_id": 0},
+        runtime=None, io_stream="auto", preset={"type": "local", "gpu_id": 0},
     )
     runtime.owner = store
     store.open()
@@ -857,7 +857,6 @@ def test_write_leaves_object_files_only(tmp_path):
         runtime=FakeRuntime(),
         rank_id=2,
         tp_size=4,
-        allocator_enabled=False,
         segment_file_slots=SLOTS_PER_FILE,
     )
     store.set_key_namespace(namespace)
@@ -1131,6 +1130,23 @@ def _load_bindings_runtime():
     return pytest.importorskip("tutti_runtime")
 
 
+@pytest.mark.parametrize("key", ["handle_cache_capacity", "handle_cache_l2_capacity", "prp_cache_capacity"])
+@pytest.mark.parametrize("factory", ["make_local_nvme_runtime", "make_raid0_nvme_runtime"])
+def test_cache_capacity_is_not_a_user_preset_option(tmp_path, key, factory):
+    runtime = _load_bindings_runtime()
+    device = {"pci_bdf": "ffff:00:00.0", "mount_path": str(tmp_path)}
+    preset = {"device": device, key: 32} if factory == "make_local_nvme_runtime" else {"devices": [device, device], key: 32}
+    with pytest.raises(Exception) as error:
+        getattr(runtime, factory)(preset)
+    assert "unknown preset key" in str(error.value)
+    assert key in str(error.value)
+
+
+def test_unused_allocator_option_is_rejected(tmp_path):
+    with pytest.raises(TypeError, match="allocator_enabled"):
+        TuttiKVStore(tmp_path, 4, SEG, runtime=FakeRuntime(), allocator_enabled=False)
+
+
 def test_preset_optional_fields_parse(tmp_path):
     """preset 回收：硬件几何/预算字段全部可省略，解析不被 missing key 卡住。
 
@@ -1160,8 +1176,6 @@ def test_preset_optional_fields_parse(tmp_path):
         "num_queues",
         "max_batch_entries",
         "max_in_flight_operations",
-        "handle_cache_capacity",
-        "prp_cache_capacity",
     ],
 )
 def test_preset_rejects_negative_unsigned_fields(tmp_path, key):
@@ -1284,14 +1298,14 @@ def test_derive_device_fields_from_daemon(tmp_path):
     daemon_path = tmp_path / "daemon.yaml"
     daemon_path.write_text(yaml.safe_dump(daemon))
 
-    preset = {"daemon_config": str(daemon_path), "device_id": 1, "gpu_id": 0}
+    preset = {"type": "local", "daemon_config": str(daemon_path), "device_id": 1, "gpu_id": 0}
     derived = _derive_device_fields(preset, yaml)
     device = derived["device"]
     assert device["pci_bdf"] == "0000:4b:00.0"       # daemon 推导
     assert device["mount_path"] == "/mnt/nvme1"      # daemon 推导
     assert device["namespace_id"] == 2               # daemon 推导
     assert device["backing_device"] == "/dev/snvme1n2"
-    assert "type" not in derived                      # 元键不注入 runtime preset
+    assert derived["type"] == "local"               # 保留明确的配置拓扑
 
     override = dict(preset, device={"mount_path": "/custom/mount"})
     device = _derive_device_fields(override, yaml)["device"]
@@ -1306,7 +1320,7 @@ def test_derive_device_fields_unknown_device(tmp_path):
     daemon_path.write_text(yaml.safe_dump({"nvmes": []}))
     with pytest.raises(RuntimeError, match="device_id"):
         _derive_device_fields(
-            {"daemon_config": str(daemon_path), "device_id": 9}, yaml
+            {"type": "local", "daemon_config": str(daemon_path), "device_id": 9}, yaml
         )
 
 
@@ -1321,7 +1335,7 @@ def test_derive_devices_from_several_daemon_configs(tmp_path):
     md0.write_text(yaml.safe_dump({"nvmes": [
         {"device_id": 4, "pci_addr": "ffff:00:04.0", "backing_mount_path": "/md"}]}))
     for daemon_config in ([str(kv0), str(md0)], f"{kv0},{md0}"):
-        preset = {"type": "striped", "daemon_config": daemon_config,
+        preset = {"type": "nvme-device-group", "daemon_config": daemon_config,
                   "devices": [{"device_id": 0}, {"device_id": 4}]}
         devices = _derive_device_fields(preset, yaml)["devices"]
         assert [d["mount_path"] for d in devices] == ["/kv", "/md"]
@@ -1331,7 +1345,7 @@ def test_derive_devices_from_several_daemon_configs(tmp_path):
         {"device_id": 0, "pci_addr": "ffff:00:04.0", "backing_mount_path": "/md"}]}))
     with pytest.raises(RuntimeError, match="device_id=0"):
         _derive_device_fields(
-            {"type": "striped", "daemon_config": [str(kv0), str(md0)],
+            {"type": "nvme-device-group", "daemon_config": [str(kv0), str(md0)],
              "devices": [{"device_id": 0}]}, yaml)
 
 
@@ -1349,7 +1363,7 @@ def test_derive_backing_device_by_pci_address(tmp_path, monkeypatch):
         {"device_id": 4, "pci_addr": "ffff:00:04.0", "backing_mount_path": "/md"},
         {"device_id": 5, "pci_addr": "ffff:00:05.0", "backing_mount_path": "/md"}]}))
     devices = _derive_device_fields(
-        {"type": "striped", "daemon_config": str(daemon),
+        {"type": "nvme-device-group", "daemon_config": str(daemon),
          "devices": [{"device_id": 4}, {"device_id": 5}]}, yaml)["devices"]
     assert devices[0]["backing_device"] == "/dev/snvme0n1"   # sysfs 实际编号
     assert devices[1]["backing_device"] == "/dev/snvme5n1"   # 未接管：旧约定
@@ -1375,7 +1389,7 @@ def test_derive_striped_devices_from_daemon(tmp_path, monkeypatch):
     daemon_path.write_text(yaml.safe_dump(daemon))
 
     preset = {
-        "type": "striped",
+        "type": "nvme-device-group",
         "daemon_config": str(daemon_path),
         "devices": [{"device_id": 0}, {"device_id": 2}],
     }
@@ -1411,7 +1425,7 @@ def test_store_derives_mounts_from_preset(tmp_path):
          "backing_mount_path": str(nvme2), "namespace_id": 1},
     ]}))
     preset = {
-        "type": "striped",
+        "type": "nvme-device-group",
         "daemon_config": str(daemon_path),
         "devices": [{"device_id": 0}, {"device_id": 2}],
     }
@@ -1421,6 +1435,55 @@ def test_store_derives_mounts_from_preset(tmp_path):
     assert store._layout.mounts == (
         str(nvme0.resolve()), str(nvme2.resolve())
     )
+
+
+@pytest.mark.parametrize("preset_type", ["raid0", None])
+def test_raid0_preset_requires_one_mount_and_defaults_to_raid0(preset_type, tmp_path):
+    from tutti.storage.tutti_nvme.runtime_factory import prepare_preset
+
+    preset = {"devices": [{"mount_path": str(tmp_path)}, {"mount_path": str(tmp_path)}]}
+    if preset_type is not None:
+        preset["type"] = preset_type
+    assert prepare_preset(preset)["type"] == "raid0"
+    assert ("type" in preset) == (preset_type is not None)
+
+
+@pytest.mark.parametrize("devices", [
+    [], [{"mount_path": "/one"}],
+    [{"mount_path": "/one"}, {"mount_path": "/two"}],
+    [{"mount_path": "/one"}, {}],
+])
+def test_raid0_preset_rejects_non_array_layout(devices):
+    from tutti.storage.tutti_nvme.runtime_factory import prepare_preset
+
+    with pytest.raises(RuntimeError, match="raid0"):
+        prepare_preset({"type": "raid0", "devices": devices})
+
+
+def test_raid0_rejects_payload_mount_override(tmp_path):
+    from tutti.storage.tutti_nvme.runtime_factory import prepare_preset
+
+    preset = {"type": "raid0", "devices": [{"mount_path": "/array"}] * 2}
+    with pytest.raises(RuntimeError, match="mounts"):
+        prepare_preset(preset, mounts=[str(tmp_path)])
+
+
+@pytest.mark.parametrize("preset_type", ["striped", "stroped", "multi", "multi-nvme"])
+def test_removed_preset_type_is_not_an_alias(preset_type):
+    from tutti.storage.tutti_nvme.runtime_factory import prepare_preset
+
+    with pytest.raises(RuntimeError, match="未知 preset"):
+        prepare_preset({"type": preset_type})
+
+
+def test_raid0_runtime_rejects_non_md_mount(tmp_path):
+    runtime = _load_bindings_runtime()
+    preset = {"devices": [
+        {"pci_bdf": "ffff:00:00.0", "mount_path": str(tmp_path), "backing_device": "/dev/nonexistent-a"},
+        {"pci_bdf": "ffff:00:01.0", "mount_path": str(tmp_path), "backing_device": "/dev/nonexistent-b"},
+    ]}
+    with pytest.raises(Exception, match="md|raid0"):
+        runtime.make_raid0_nvme_runtime(preset)
 
 
 # ---------- layout 单元 ----------

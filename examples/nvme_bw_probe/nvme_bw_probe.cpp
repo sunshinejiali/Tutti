@@ -350,7 +350,7 @@ int main(int argc, char** argv) {
     CUDA_OK(cudaFree(0));
     CUDA_OK(cudaSetDevice(gpu));
     PROBE_OK("runtime up (%s, %zu drive%s, config=%s)",
-             ndev == 1 ? "local-nvme" : "striped-local-nvme", ndev,
+             ndev == 1 ? "local-nvme" : "nvme-device-group", ndev,
              ndev == 1 ? "" : "s", config_path.c_str());
 
     // ---- Backing files ----

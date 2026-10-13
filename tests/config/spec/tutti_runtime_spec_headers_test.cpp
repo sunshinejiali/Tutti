@@ -7,8 +7,6 @@
 #include <tutti/config/spec/datapath/memfs_spec.h>
 #include <tutti/config/spec/datapath/nvme_datapath_spec.h>
 #include <tutti/config/spec/datapath/striped_local_nvme_spec.h>
-#include <tutti/config/spec/resolver/local_file_spec.h>
-#include <tutti/config/spec/resolver/memfs_spec.h>
 #include <tutti/config/spec/resolver/resolver_spec.h>
 #include <tutti/config/spec/resource/memory_spec.h>
 #include <tutti/config/spec/resource/nvme_spec.h>
@@ -20,6 +18,9 @@
 
 static_assert(std::is_default_constructible_v<tutti::config::ResourceSpec>);
 static_assert(std::is_default_constructible_v<tutti::config::ResolverSpec>);
+static_assert(std::is_default_constructible_v<tutti::config::LocalFileResolverConfig>);
+static_assert(std::is_default_constructible_v<tutti::config::MemfsResolverConfig>);
+static_assert(!tutti::config::LocalFileResolverConfig{}.require_raid0);
 static_assert(std::is_default_constructible_v<tutti::config::DataPathSpec>);
 static_assert(std::is_default_constructible_v<tutti::config::BackendSpec>);
 static_assert(std::is_default_constructible_v<tutti::config::TuttiRuntimeSpec>);

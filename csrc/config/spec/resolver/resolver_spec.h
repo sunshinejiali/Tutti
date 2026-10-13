@@ -3,10 +3,13 @@
 #include <string>
 #include <variant>
 
-#include <tutti/config/spec/resolver/local_file_spec.h>
-#include <tutti/config/spec/resolver/memfs_spec.h>
-
 namespace tutti::config {
+
+struct LocalFileResolverConfig {
+    bool require_raid0 = false;
+};
+
+struct MemfsResolverConfig {};
 
 using ResolverConfig = std::variant<LocalFileResolverConfig,
                                     MemfsResolverConfig>;

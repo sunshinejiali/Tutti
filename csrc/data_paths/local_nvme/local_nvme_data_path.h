@@ -127,17 +127,12 @@ public:
     //                     max_batch_entries * effective_mdts, the
     //                     pre-Round-15-S4 formula)
     //
-    // Memory account (Round 15 S4): the MetadataArena pre-allocates
-    //   arena_slots = 2 * max_in_flight_operations
-    //   bytes/slot  = max_batch_entries *
-    //                 (sizeof(DeviceSubmitEntry) [48B]
-    //                  + sizeof(EntryCompletionStatus) [8B]
-    //                  + page_size [PRP-list pool, typ. 4096B])
-    //   total       = arena_slots * bytes/slot
-    // Defaults (16, 256): 32 slots * 256 * 4152B ~= 32.4 MiB.
-    // Example (in-flight=8, batch_entries=4096): 16 slots * 4096 * 4152B
-    //   ~= 259.5 MiB. Callers requesting large batch_entries must budget
-    //   GPU memory accordingly.
+    // MetadataArena preallocates 2 * max_in_flight_operations slots.
+    // GPU bytes/slot scale with max_batch_entries times the submit entry,
+    // completion status and AddressDescriptor sizes, plus one cursor status.
+    // PRP LIST pages are host pinned, NOT an extra GPU page per entry.
+    // Increasing either bound multiplies metadata usage; neither is unlimited.
+    // Requests that fan out beyond max_batch_entries are rejected before launch.
     LocalNvmeDataPath(std::string snvme_dev_path,
                       std::uint32_t cuda_device,
                       std::uint32_t num_user_queues,

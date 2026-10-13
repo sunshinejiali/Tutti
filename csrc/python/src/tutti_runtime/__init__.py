@@ -3,7 +3,7 @@
 Public surface:
     make_stub_runtime(accel_id=-1) -> Runtime
     make_local_nvme_runtime(preset: dict) -> Runtime
-    make_striped_nvme_runtime(preset: dict) -> Runtime
+    make_nvme_device_group_runtime(preset: dict) -> Runtime
     Runtime: caps / open_batch / close_target / close_batch /
              register_memory / submit / release_io /
              wait / wait_result / wait_detail / shutdown / testing_force_complete
@@ -17,7 +17,8 @@ from ._core import (
     WaitResult,
     make_local_nvme_runtime,
     make_stub_runtime,
-    make_striped_nvme_runtime,
+    make_nvme_device_group_runtime,
+    make_raid0_nvme_runtime,
 )
 
 __all__ = [
@@ -26,5 +27,6 @@ __all__ = [
     "WaitResult",
     "make_stub_runtime",
     "make_local_nvme_runtime",
-    "make_striped_nvme_runtime",
+    "make_nvme_device_group_runtime",
+    "make_raid0_nvme_runtime",
 ]

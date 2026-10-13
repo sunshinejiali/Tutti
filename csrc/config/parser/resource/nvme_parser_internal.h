@@ -14,11 +14,11 @@ inline Result<NvmeSelection> parse_nvme_selection(
     if (value == "explicit") {
         return Result<NvmeSelection>::Success(NvmeSelection::Explicit);
     }
-    if (value == "striped") {
-        return Result<NvmeSelection>::Success(NvmeSelection::Striped);
+    if (value == "device-group") {
+        return Result<NvmeSelection>::Success(NvmeSelection::Multi);
     }
     return Result<NvmeSelection>::Failure(parse_error(
-        path + " must be allowed, explicit, or striped"));
+        path + " must be allowed, explicit, or device-group"));
 }
 
 inline Status parse_nvme_device_ids(

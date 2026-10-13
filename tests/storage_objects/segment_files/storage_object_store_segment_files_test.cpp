@@ -70,7 +70,6 @@ StoreConfig config(const std::string& root) {
     device.mount_path = root;
     out.devices.push_back(std::move(device));
     out.namespace_fingerprint = {'s', 'e', 'g', 'm', 'e', 'n', 't'};
-    out.background_reclaim = false;
     return out;
 }
 

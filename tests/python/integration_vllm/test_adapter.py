@@ -287,7 +287,7 @@ class TestGeometryResolution:
     def test_missing_wave_respects_explicit_batch_capacity(self, max_batch):
         extra = {"chunk_tokens": 2 * BLOCK_SIZE, "store": {
             "type": "tutti_nvme", "options": {"preset": {
-                "type": "striped", "max_batch_entries": max_batch,
+                "type": "nvme-device-group", "max_batch_entries": max_batch,
             }},
         }}
         got = resolve_geometry(extra, self._kv_cache_config())
@@ -306,6 +306,12 @@ class TestGeometryResolution:
         }}
         got = resolve_geometry(extra, self._kv_cache_config())
         assert got["max_chunks_per_wave"] == 256
+
+    @pytest.mark.parametrize("value", [0, "0"])
+    def test_zero_batch_uses_effective_native_capacity(self, value):
+        extra = {"chunk_tokens": 2 * BLOCK_SIZE, "store": {"type": "tutti_nvme", "options": {
+            "preset": {"max_batch_entries": value}}}}
+        assert resolve_geometry(extra, self._kv_cache_config())["max_chunks_per_wave"] == 128
 
     def test_no_wave_can_fit_one_chunk_is_rejected(self):
         extra = {"chunk_tokens": 2 * BLOCK_SIZE, "store": {

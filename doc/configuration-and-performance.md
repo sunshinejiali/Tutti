@@ -37,12 +37,13 @@ vLLM 模型 / HBM KVCacheConfig（层数、KV dtype、block 几何）
 | 部署 | 对象放置 | Resolver | 数据面 |
 |---|---|---|---|
 | 单独 NVMe mount | 显式 `options.mounts` 或默认 root 下的段文件；local preset 的 device.mount_path 不自动用于对象放置 | LocalFileResolver | LocalNvmeDataPath，Python `preset.type=local` |
-| 多个独立 NVMe mounts | 整槽位在 mounts 轮转，长 prompt 多个槽位并行 | MultiMountLocalFileResolver 分派 | StripedDataPath，`preset.type=striped` |
-| md RAID0 一个 mount | 一个文件系统内的段文件 | md resolver 按 stripe/member 映射 extent | 同一 StripedDataPath，不新增“raid”提交类 |
+| 多个独立 NVMe mounts | 整槽位在 mounts 轮转，长 prompt 多个槽位并行 | MultiMountLocalFileResolver 分派 | 显式`preset.type=nvme-device-group`，多控制器数据面 |
+| md RAID0 一个 mount（默认） | 一个文件系统内的段文件 | md resolver核对完整namespace成员并映射extent | `preset.type=raid0`，复用多控制器数据面 |
 
-`striped` 是历史 API 名，表示多控制器 fused submit；**不是已删除的 `stripe_unit` 文件切片**。
-md stripe 是阵列超级块的物理事实，不能用 connector 参数覆盖。当前多控制器 preset 对
-全部成员同 mount 的情况选择 md resolver；不把任意共享目录自动视作合法 md。
+用户配置不再用`striped`。Python默认`raid0`：至少两个namespace且必须共用同一个
+真实阵列mount；native resolver核对md级别、完整成员和offset，失败不降级。原生YAML用
+`resolver.config.topology=raid0`强制该约束，数据面仍为`nvme-device-group`。
+md stripe是阵列超级块物理事实，不能用connector参数覆盖，不把共享目录视作合法md。
 同一runtime选择多个md mounts、或md与独立盘混合时，当前不能按mount聚合成员并分别
 创建md resolver。应让不同rank/runtime选择各自独立的完整阵列组，不把多个阵列成员
 全集塞进同一个runtime。
@@ -55,7 +56,8 @@ md stripe 是阵列超级块的物理事实，不能用 connector 参数覆盖�
 
 ### 原生 C++ Runtime YAML
 
-`config/storage_runtime/local_nvme.yaml` 或 `multi_nvme.yaml` → parser →
+推荐`config/storage_runtime/raid0.yaml`，单盘/独立多盘分别用`local_nvme.yaml`、
+`nvme_device_group.yaml` → parser →
 `TuttiRuntimeSpec` → Resource allocation → Resolver/DataPath factory → Runtime。
 `storage.backends[]` 用 ID 连接 resource/resolver/datapath；实际设备路径、MDTS、队列 grant
 来自 daemon 返回的资源。仅改 datapath 参数不会改变挂载/设备 identity。
@@ -114,24 +116,23 @@ Python 读 daemon YAML 推导 `device_id` 的 PCI/mount/namespace，再构造 na
 
 | 参数 | 作用域/单位 | 当前行为 |
 |---|---|---|
-| native `runtime.accel_id` / preset `gpu_id` | 本地逻辑accelerator ordinal | 与可见GPU及绑定pool一致；Python历史键保留 |
+| native `runtime.accel_id` / preset `gpu_id` | 本地逻辑accelerator ordinal | 与可见GPU及绑定pool一致 |
 | native `allocation.device_ids` / preset `device_id`、`devices` | daemon显式ID | 不是 `/dev/nvmeN` 编号；设备事实和chrdev仍验证 |
 | native `queues_per_controller` / preset `num_queues` | 每客户端/rank每设备SQ/CQ队列对 | connector字典preset缺省8，低层直调默认不变；两种schema都不把0当auto；不是queue depth |
-| `max_in_flight_operations` | 每DataPath操作数，不是NVMe命令数 | preset默认4；connector自动推导时覆盖，见§6 |
-| `max_batch_entries` | 每次native提交fan-out后的sub-IO条目数 | local preset4096 / multi preset16384；底层传0取256；MDTS/extent/md边界可能增加条目 |
-| `prp_cache_capacity` | 每控制器PRP-list页数量 | native缺省0关闭；preset默认4096，显式0关闭，不是字节 |
-| `handle_cache_capacity` | target handle缓存项数 | local preset4096；native local 0关闭，当前没有该容量的env覆盖 |
-| `handle_cache_l2_capacity` | host handle记录项数 | native local支持；L1>0而L2=0时L2取4×L1；Python preset没有此键 |
-| `io_granularity` | 注册分片字节 | native schema有此键，但当前factory未把它作为调节传入；不推荐用户调它 |
+| `max_in_flight_operations` | 每DataPath未完成操作上限，不是NVMe命令数 | vLLM缺省按加载模式推导2L/3L；原生无模型默认16；高级覆盖保留 |
+| `max_batch_entries` | 每次native提交展开后的sub-IO上限 | sync按模型上下文、序列数和KV block/page估算并保持有限上限；auto/async不按单步缩减；原生默认256 |
+| PRP缓存 | host pinned地址表，按控制器分池 | runtime自动按实际页大小、控制器数和有效batch/in-flight定容；不再接受容量配置 |
+| handle缓存 | local低层GPU handle及host快照 | 应用factory不启用重复缓存；RAID0本来不使用该L1/L2；不再接受容量配置 |
 | `TUTTI_POOL_WORKERS` | GPU提交worker数 | multi默认256且按条目裁剪；local默认2048不按条目裁剪；同步0用legacy burst，实验async的0仍取256 |
 | `TUTTI_ASYNC_COMPLETION` | 设备完成模式 | 默认关；1只对multi DataPath启用实验submit/wait分离 |
 | Runtime `max_terminal_results` | 保留的完成结果数量 | native Runtime默认64；preset按in-flight自动抬到至少2倍 |
 
-multi native parser共用tuning字段，但factory当前只消费batch/in-flight/PRP预算；不要以为
-写上handle/L2/granularity就自动优化多盘。保持公开schema兼容，本轮不改变其消费逻辑。
+`prp_cache_capacity`、`handle_cache_capacity`、`handle_cache_l2_capacity`已从native YAML和
+Python preset删除；未被执行路径消费的YAML `io_granularity`也已删除。底层显式注册粒度和
+cache契约测试接口保留，它们不是应用配置。
 
-显式0的风险：Python caps现在可报告preset原值，而DataPath把batch/in-flight的0换成256/16；
-**不能把caps的0理解成无限并发或用来绕过准入**。社区preset建议省略自动推导字段或明确正数。
+Python preset的batch/in-flight显式0在装配前转换为有效256/16，caps与terminal结果预算
+使用有效值，不再用0跳过准入。建议省略这些高级字段，让connector计算模型所需下限。
 
 ### 5.3 Connector、KVEngine 和对象层
 
@@ -145,7 +146,6 @@ multi native parser共用tuning字段，但factory当前只消费batch/in-flight
 | `io_stream` | CUDA有序任务流，`auto`或native句柄 | vLLM NVMe worker缺省auto；直接store仍None；不是网络流/线程数；不手拼0默认流 |
 | `segment_file_slots` | 每段文件槽数 | 默认2048；影响预建组成本、共享布局，改动需部署隔离 |
 | `segment_header_bytes` | 每槽前缀字节 | 默认128KiB，≥4096且对齐；属于持久布局，不是免费调优 |
-| `allocator_enabled` | 兼容options字段 | 默认true，仅传background_reclaim；当前native对象层未消费，不控制预建线程；不要用它调吞吐 |
 | `defer_writes_after_reads` | 写流排序bool | options > `TUTTI_DEFER_WRITES_AFTER_READS` > true |
 | `load_mode` | 请求sync/async/auto | `TUTTI_LOAD_MODE` > extra > auto；auto未测得成本时仍sync |
 | `async_load_free_ratio` | (0,1] | 对应env > extra > 0.5；约束后台读持有HBM blocks |
@@ -173,6 +173,50 @@ HBM `NUM_GPU_BLOCKS_OVERRIDE`服务缺省不传，保留vLLM自然池。
 改变block同时保持固定GPU block数会改变HBM容量，不能称作同口径性能实验。
 
 ## 6. 已自动推导的值与不能省略的预算
+
+### 缓存预算，不是按显卡型号猜测
+
+PRP缓存存储NVMe读取的地址表，实际backing在host pinned内存，不占HBM；key由已注册
+内存的起始page和IO页数决定，与文件大小无直接比例关系。设有效batch上限为E、在飞
+上限为I、控制器页大小为P、控制器数为N，每控制器缓存页数为
+`min(2*I*E, floor(64 MiB / N / P))`。该64MiB是每个DataPath的固定保守缓存backing预算，
+不是系统检测出的最优值，不包含CPU索引、fallback池、队列或其它进程；TP总量仍要乘rank数。
+
+缓存耗尽继续走原host PRP fallback。自动缓存初始化失败时退到同一路径，启动日志
+`PRP_CACHE_AUTO`报告实际容量（0表示未启用）；不会降低IO准入或放松pin/释放约束。
+自动策略在shutdown/重新initialize后仍保留，容量重新按控制器事实计算。
+
+handle L2只在local低层使用，它不能解决所有L1项仍被open引用而无法驱逐的问题。
+应用对象池已经长期缓存段文件票据，因此factory不再额外启用有限handle L1/L2，避免
+文件数超过缓存时open失败及重复快照成本。RAID0使用共享成员handle，本来没有这套L2。
+这不是依据文件shape自动选出最优L2，而是移除该路径不必要的缓存层。
+
+`allocator_enabled`及未被native消费的`background_reclaim`传递链也已删除；后台预建
+仍由对象层根据分配前沿、ready余量和磁盘空间护栏驱动，不是这些空开关控制的。
+
+### 模型及资源推导
+
+`max_in_flight_operations`与`max_batch_entries`仍是必要的内部边界，而不是必填项。
+原生`NvmeDataPathTuning`没有模型信息，默认16操作/256条目；模板用`config: {}`。
+vLLM先取得权威KV block token数、每层block字节和层数，再传入实际装配预算。
+
+sync缺省batch预算：令R为`ceil(max_model_len / block_tokens) * max_num_seqs`，
+F为`ceil(kv_page_bytes / 4096)`，W为一波chunk对应block请求数，取
+`max(W, min(local 4096或设备组16384, R*F))`。4KiB仅是工作量估算粒度，不修改
+真实namespace/MDTS。小模型可缩小批宽；缺少权威信息时保留有限的既有preset默认。
+这个估算不是全请求保证：实际extent、md边界及后台合并还会改变submit次数。
+
+auto/async读计划可跨调度步合并，不能用单步`max_num_seqs`缩小batch，否则每层分成
+多个operation会吃完3L配额。因此本轮只对sync做模型批宽缩减；不宣称所有模式均已最小化。
+`TUTTI_IO_BUDGET`启动日志输出最终层数、in-flight及batch预算；显式高级覆盖不被悄悄改写。
+
+arena槽数为2倍in-flight，GPU entry/status/descriptor空间随槽数×batch增长；设备组还
+有target/identity指针表。PRP LIST backing在host pinned内存，不是每entry额外占4KiB HBM。
+因此不存在“很大且不消耗资源”的通用最大值；把workspace改成动态池或改变完成回收
+需要独立的生命周期设计，不在本轮隐式改变。
+
+单盘现在也检查展开后的entry数，超过工作区时在租赁/launch前整体拒绝；输入请求
+数量小不代表MDTS展开后仍小。新硬件反例只编译，本轮未执行真实NVMe。
 
 Python入门参数的直白说明、盘组分配示例和单位规则，见
 [connector参数注释](../config/integration/vllm/README.md)。波次是引擎/staging工作窗口，

@@ -48,10 +48,10 @@ Status validate_nvme_resource(const ResourceSpec& spec,
                                 ".allocation selection=explicit requires exactly one device_id");
         }
         break;
-    case NvmeSelection::Striped:
+    case NvmeSelection::Multi:
         if (count < 2) {
             return invalid_spec(path +
-                                ".allocation selection=striped requires at least two device_ids");
+                                ".allocation selection=device-group requires at least two device_ids");
         }
         break;
     }

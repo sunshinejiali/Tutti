@@ -32,12 +32,8 @@ storage:
     - id: bw-probe-local-nvme-datapath
       type: local-nvme                # 单盘数据路径
       config:
-        handle_cache_capacity: 16     # 单文件单句柄，16 槽绰绰有余
-        prp_cache_capacity: 262144     # PRP 页缓存（host DRAM 池），1 GiB
-        handle_cache_l2_capacity: 0    # 自动取 4×L1
         max_in_flight_operations: 4   # 探针串行 submit+wait，2 已足
         max_batch_entries: 8192        # 单批条目上限（depth 扫描的最大值）
-        io_granularity: 0             # 动态 PRP
 
   backends:
     - id: bw-probe-storage

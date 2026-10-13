@@ -167,10 +167,6 @@ struct StoreConfig {
     // this rank's fixed-size segment files under <mount_path>/r<rank>/segments.
     std::vector<StoreDevice> devices;
 
-    // Background space reclamation. When false, reclamation runs
-    // synchronously on the calling thread (single-threaded tests).
-    bool background_reclaim = true;
-
     // ---- Cross-rank residency bitmap ----
 
     std::uint32_t rank_id = 0;

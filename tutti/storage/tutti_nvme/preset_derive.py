@@ -39,7 +39,7 @@ def derive_device_fields(preset: dict, yaml) -> dict:
                     f"device_id={device_id} 同时出现在多份 daemon 配置中：{daemon_paths}"
                 )
             nvmes[device_id] = entry
-    if preset.get("type") == "striped":
+    if preset.get("type", "raid0") in ("raid0", "nvme-device-group"):
         derived = dict(preset)
         derived["devices"] = [
             _derive_one(dict(device), nvmes)

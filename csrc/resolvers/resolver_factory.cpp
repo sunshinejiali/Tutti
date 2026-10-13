@@ -95,7 +95,7 @@ Result<std::unique_ptr<StorageTargetResolver>> create_local_file(
             invalid("local-file ResolverSpec does not match backend relation"));
     }
     // Which relation this resolver serves decides the slice cardinality:
-    // ext4-local-nvme is exactly one device; striped-local-nvme (the
+    // ext4-local-nvme is exactly one device; nvme-device-group (the
     // multi-device contract, whose files rotate across mounts) is two or
     // more. Everything else is a configuration error.
     const bool single = context.relation.contract == backend_ids::kExt4Contract;
@@ -131,6 +131,12 @@ Result<std::unique_ptr<StorageTargetResolver>> create_local_file(
             invalid("local-file resolver requires at least one NVMe slice"));
     }
 
+    const bool require_raid0 = std::get<config::LocalFileResolverConfig>(spec.config).require_raid0;
+    if (require_raid0 && view->slices.size() < 2) {
+        return failure<std::unique_ptr<StorageTargetResolver>>(
+            invalid("raid0 topology requires at least two NVMe slices"));
+    }
+
     // One device: the original single-mount resolver.
     if (view->slices.size() == 1) {
         if (!single) {
@@ -153,7 +159,7 @@ Result<std::unique_ptr<StorageTargetResolver>> create_local_file(
 
     if (!multi) {
         return failure<std::unique_ptr<StorageTargetResolver>>(
-            invalid("multiple NVMe slices require the striped-local-nvme "
+            invalid("multiple NVMe slices require the nvme-device-group "
                     "contract"));
     }
 
@@ -167,6 +173,10 @@ Result<std::unique_ptr<StorageTargetResolver>> create_local_file(
     }
     if (one_mount) {
         return create_raid0_file(*view, context);
+    }
+    if (require_raid0) {
+        return failure<std::unique_ptr<StorageTargetResolver>>(
+            invalid("raid0 topology requires one shared array mount"));
     }
 
     // Several devices: one "file" resolver dispatching by mount prefix. A

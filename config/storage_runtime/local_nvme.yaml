@@ -1,6 +1,7 @@
 # storage_runtime/local_nvme.yaml -- native TuttiRuntimeSpec single-NVMe graph.
 # Not a Python connector config; pass this file explicitly to the native runtime.
-# See config/README.md before changing zero-valued tuning fields.
+# PRP cache is automatically budgeted; handle caches are not application knobs.
+# See config/README.md before changing admission budgets.
 #
 # This file describes one logical storage backend. Deployment facts such as
 # PCI BDFs, device paths, BAR sizes, mounts, and actual queue grants belong to
@@ -33,13 +34,7 @@ storage:
   datapaths:
     - id: local-nvme-datapath-0
       type: local-nvme
-      config:
-        handle_cache_capacity: 0
-        prp_cache_capacity: 0
-        handle_cache_l2_capacity: 0
-        max_in_flight_operations: 0
-        max_batch_entries: 0
-        io_granularity: 0
+      config: {}  # 无模型调用使用有限默认：16 operations / 256 entries
 
   backends:
     - id: model-storage

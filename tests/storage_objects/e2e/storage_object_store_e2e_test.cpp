@@ -109,7 +109,6 @@ StoreConfig make_config(const std::string& root, std::uint64_t slots) {
     device.mount_path = root;
     cfg.devices.push_back(std::move(device));
     cfg.namespace_fingerprint = {0xDE, 0xAD, 0xBE, 0xEF};
-    cfg.background_reclaim = false;   // drained explicitly, for determinism
     return cfg;
 }
 

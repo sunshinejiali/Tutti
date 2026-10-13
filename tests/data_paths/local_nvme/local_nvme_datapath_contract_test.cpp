@@ -4664,6 +4664,56 @@ int main(int argc, char** argv) {
     }
     next_t56:;
 
+    // Valid input requests may expand beyond the entry workspace at MDTS.
+    {
+        TEST_CASE("fan-out exceeding entry workspace is rejected before launch");
+        LocalNvmeDataPath dp(kSnvmeDevPath, kCudaDevice, kNumQueues,
+                             kNamespaceId, kDeviceBlockSize,
+                             4096, 2, 0, 0, 0, 16, 2, 16384);
+        CHECK(init_dp(dp).ok(), "initialize two-entry workspace");
+        auto file = make_resolved_file("entry_budget.bin", 12288);
+        CHECK(file.target.ok(), "resolve real file for fan-out refusal");
+        if (file.target.ok()) {
+            auto target = dp.open(file.target.value());
+            CHECK(target.ok(), "open fan-out target");
+            void* raw = nullptr;
+            void* buffer = cuda_malloc_aligned_64k(65536, &raw);
+            CHECK(buffer != nullptr, "allocate fan-out memory");
+            if (target.ok() && buffer) {
+                auto memory = dp.register_memory(
+                    DataPathMemoryView{buffer, 65536, static_cast<std::int32_t>(kCudaDevice), DataPathMemoryKind::DEVICE},
+                    primary_registration_domain());
+                CHECK(memory.ok(), "register fan-out memory");
+                if (memory.ok()) {
+                    DataPathRequest request;
+                    request.intent.direction = IoDirection::READ;
+                    request.intent.length = 12288;
+                    request.target = target.value();
+                    request.memory = memory.value();
+                    HostSubmitContext context{ExecutionDomain::DEVICE_EXECUTION,
+                                              static_cast<std::int32_t>(kCudaDevice), ctx_stream()};
+                    const auto result = dp.submit(&request, 1, context);
+                    CHECK(result.status.code() == StatusCode::RESOURCE_EXHAUSTED,
+                          "three MDTS entries exceed two-entry arena");
+                    CHECK(!result.op.has_value(), "overflow refusal returns no operation");
+                    CHECK(result.initial_states.size() == 1 &&
+                          result.initial_states[0].state == IoRequestState::REJECTED,
+                          "fan-out overflow rejects the input request");
+                    if (result.op.has_value()) {
+                        cudaStreamSynchronize(ctx_stream());
+                        dp.progress(ProgressBudget{16, 1000000000});
+                        dp.release(result.op.value());
+                    }
+                    dp.unregister_memory(memory.value());
+                }
+            }
+            if (raw) cudaFree(raw);
+            if (target.ok()) dp.close(target.value());
+            ::unlink(file.path.c_str());
+        }
+        dp.shutdown(0);
+    }
+
     // =====================================================================
     // 57. Per-entry completion status on real SINGLE/DUAL/LIST
     // =====================================================================

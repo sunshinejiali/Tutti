@@ -9,7 +9,7 @@ namespace tutti::config {
 enum class NvmeSelection {
     Allowed,
     Explicit,
-    Striped,
+    Multi,
 };
 
 struct NvmeProviderSpec {

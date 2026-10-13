@@ -39,6 +39,13 @@ int main() {
     CHECK(local_spec().validate().ok());
     {
         auto spec = local_spec();
+        std::get<LocalFileResolverConfig>(spec.storage.resolvers.front().config).require_raid0 = true;
+        const auto status = spec.validate();
+        CHECK(!status.ok());
+        CHECK(status.message().find("raid0") != std::string::npos);
+    }
+    {
+        auto spec = local_spec();
         spec.accelerator.profile = "cuda";
         CHECK(spec.validate().ok());
     }
@@ -85,15 +92,15 @@ int main() {
         auto spec = local_spec();
         auto& resource = std::get<NvmeResourceConfig>(
             spec.storage.resources.front().config);
-        resource.allocation.selection = NvmeSelection::Striped;
+        resource.allocation.selection = NvmeSelection::Multi;
         resource.allocation.nvme_device_ids = {0};
         spec.storage.resolvers.front() =
             {"resolver", "local-file", "file",
              LocalFileResolverConfig{}};
         spec.storage.datapaths.front() =
-            {"datapath", "striped-local-nvme",
+            {"datapath", "nvme-device-group",
              StripedLocalNvmeDataPathConfig{}};
-        spec.storage.backends.front().contract = "striped-local-nvme";
+        spec.storage.backends.front().contract = "nvme-device-group";
         spec.storage.backends.front().config =
             StripedLocalNvmeBackendConfig{};
         const auto status = spec.validate();

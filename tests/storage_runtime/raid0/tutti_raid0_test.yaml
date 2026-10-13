@@ -16,7 +16,7 @@ storage:
         type: nvme-service
         endpoint: "127.0.0.1:50051"
       allocation:
-        selection: striped
+        selection: device-group
         device_ids: [0, 1, 2, 3]
         queues_per_controller: 8
 
@@ -28,18 +28,14 @@ storage:
 
   datapaths:
     - id: raid0-test-datapath
-      type: striped-local-nvme
+      type: nvme-device-group
       config:
-        handle_cache_capacity: 16
-        prp_cache_capacity: 262144
-        handle_cache_l2_capacity: 0
         max_in_flight_operations: 4
         max_batch_entries: 8192
-        io_granularity: 0
 
   backends:
     - id: raid0-test-storage
-      contract: striped-local-nvme
+      contract: nvme-device-group
       resolver: raid0-test-resolver
       datapath: raid0-test-datapath
       resource: raid0-test-nvme
