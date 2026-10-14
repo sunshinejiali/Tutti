@@ -34,6 +34,8 @@ loader 仅在显式选择 `LOAD_FORMAT=phxsafetensors` / `PHXLOADER_DIR` 时使�
 `NUM_QUEUES` 支持serve/bench覆盖，默认8；这是每rank每设备值，不是全服务队列总量。
 服务用`TOTAL_CAPACITY="128 GiB"`指定服务总预算；离线用`CAPACITY="64 GiB"`或
 `--capacity "64 GiB"`指定每rank预算，HBM baseline无需KV容量。
+离线支持`--block-size`/`BLOCK_SIZE`及`--kv-load-mode`/`KV_LOAD_MODE`覆盖。MiniMax M3用
+block128、`LOAD_FORMAT=auto`和eager，权重MXFP8不代表KV FP8；具体支持限制见操作手册。
 模型 block/context/KV dtype/parser 的选择和 SSE 验收在操作手册中。启动前必须先
 `serve-8gpu-striped.sh --dry-run` 检查，脚本不会自动准备驱动或接管 RAID。
 

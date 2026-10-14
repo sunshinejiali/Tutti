@@ -103,6 +103,16 @@ auto/async可能跨步合并，先保留原有限批宽。两项内部上限仍�
 还依赖md条带、MDTS及文件extents；不能给出廉价且覆盖任意请求的最大值。
 队列、IO worker数和异步模式也不是显存越大就应越大的参数，不自动跑写盘扫参。
 
+## MiniMax M3的KV布局
+
+MiniMax-M3-MXFP8在NVIDIA路径有主KV及独立稀疏attention index缓存，均必须offload。
+同一group内page宽不同仍使用固定宽磁盘segment，按每实体真实字节读写；不是把index
+当主KV或跳过它。配置几何由cache spec/tensor分配推导，不能按模型60层手填117实体。
+
+已验证TP8、block128、KV dtype `auto`、eager、16K/80%复用。要求NHD packed页、64KiB
+base对齐；CUDA graph、split K/V、HND与多group未认证且会拒绝。
+运行参数和安全边界见[MiniMax操作说明](../../../doc/intergration/tutti-vllm-manual.md#minimax-m3-mxfp8)。
+
 ## 一条规则
 
 **应用用户选择模型、容量和缓存目录；部署者提供GPU/存储映射；引擎负责IO窗口、流和

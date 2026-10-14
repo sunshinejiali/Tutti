@@ -1,7 +1,8 @@
 # Tutti System Architecture
 
-> **Status**: v0.1.1. This document describes the architecture as
-> implemented and verified in the current codebase.
+> **Status**: historical v0.1.1 core-runtime architecture snapshot.
+> For v0.2.0 deployment and supported KV layouts, see [Getting Started](../getting-started.md)
+> and the [vLLM operation manual](../intergration/tutti-vllm-manual.md).
 
 ## 1. Overview
 

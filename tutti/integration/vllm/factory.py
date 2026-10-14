@@ -47,7 +47,7 @@ def worker_engine_for(vllm_config, extra: dict):
         raw_options = resolve_io_budget(raw_options, extra, vllm_config)
     keys = tuple(sorted(
         (k, extra.get(k))
-        for k in (*_ENGINE_KEYS, *_ENGINE_OPTIONAL_KEYS, "num_layers")
+        for k in (*_ENGINE_KEYS, *_ENGINE_OPTIONAL_KEYS, "num_layers", "kv_layer_page_bytes")
     ))
     entry = _ENGINE_CACHE.get(id(vllm_config))
     if entry is None or entry[0] is not vllm_config:
@@ -85,6 +85,8 @@ def worker_engine_for(vllm_config, extra: dict):
                 f"推导值 {segment_bytes} 不一致"
             )
         options["segment_bytes"] = segment_bytes
+        if "kv_layer_page_bytes" in extra:
+            options["layer_page_bytes"] = extra["kv_layer_page_bytes"]
         if store_spec["type"] == "tutti_nvme" and isinstance(options.get("preset"), dict):
             logging.getLogger(__name__).info(
                 "TUTTI_IO_BUDGET layers=%s in_flight=%s batch_entries=%s",
@@ -100,6 +102,8 @@ def worker_engine_for(vllm_config, extra: dict):
                 config[key] = extra[key]
         if extra.get("num_layers") is not None:
             config["num_layers"] = extra["num_layers"]
+        if "kv_layer_page_bytes" in extra:
+            config["kv_layer_page_bytes"] = extra["kv_layer_page_bytes"]
         # key 命名空间：同 vllm_config 派生恒定，无需入缓存键
         config["key_namespace"] = key_namespace(vllm_config, extra)
         engine = KVEngine(config, store)
@@ -180,6 +184,8 @@ def scheduler_index_for(vllm_config, extra: dict):
         store = create_metadata_store(store_spec["type"], options)
         config = {k: extra[k] for k in _ENGINE_KEYS}
         config["num_layers"] = extra["num_layers"]
+        if "kv_layer_page_bytes" in extra:
+            config["kv_layer_page_bytes"] = extra["kv_layer_page_bytes"]
         config["key_namespace"] = key_namespace(vllm_config, extra)
         index = SchedulerMetadataIndex(config, store)
         entry[1][keys] = index

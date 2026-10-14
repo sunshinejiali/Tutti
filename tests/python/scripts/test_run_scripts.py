@@ -168,6 +168,14 @@ def test_bench_passes_per_rank_capacity_without_loading_model(bench_runner, args
     assert "--without-tutti" not in arguments
 
 
+def test_bench_passes_minimax_block_and_load_mode(bench_runner):
+    result, arguments = bench_runner(["--capacity", "8 GiB", "--block-size", "128",
+                                     "--kv-load-mode", "sync"])
+    assert result.returncode == 0, result.stderr
+    assert arguments[arguments.index("--block-size") + 1] == "128"
+    assert arguments[arguments.index("--kv-load-mode") + 1] == "sync"
+
+
 def test_bench_requires_capacity_for_tutti(bench_runner):
     result, arguments = bench_runner([])
     assert result.returncode != 0

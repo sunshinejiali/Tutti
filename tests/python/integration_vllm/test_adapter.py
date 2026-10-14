@@ -361,7 +361,7 @@ class TestGeometryResolution:
         with pytest.raises(ValueError, match="multi-group"):
             resolve_geometry(extra, config)
 
-    def test_nonuniform_layer_pages_are_rejected(self):
+    def test_nonuniform_layer_pages_use_fixed_width_disk_entities(self):
         names = ["layer.0", "layer.1"]
         spec = SimpleNamespace(
             block_size=BLOCK_SIZE,
@@ -378,8 +378,54 @@ class TestGeometryResolution:
             "chunk_tokens": 2 * BLOCK_SIZE,
             "max_chunks_per_wave": MAX_WAVE,
         }
-        with pytest.raises(ValueError, match="每层 KV page"):
-            resolve_geometry(extra, config)
+        got = resolve_geometry(extra, config)
+        assert got["kv_layer_page_bytes"] == (SEG, 2 * SEG)
+        assert got["chunk_kv_bytes"] == 2 * 2 * 2 * SEG
+
+
+    def test_distinct_cache_spec_types_use_layerwise_even_at_equal_width(self):
+        class MainSpec:
+            page_size_bytes = SEG
+
+        class IndexSpec:
+            page_size_bytes = SEG
+
+        spec = SimpleNamespace(block_size=BLOCK_SIZE, kv_cache_specs={
+            "main": MainSpec(), "index": IndexSpec()})
+        cfg = SimpleNamespace(kv_cache_groups=[SimpleNamespace(layer_names=["main", "index"], kv_cache_spec=spec)])
+        got = resolve_geometry({"chunk_tokens": 2 * BLOCK_SIZE}, cfg)
+        assert got["kv_layer_page_bytes"] == (SEG, SEG)
+
+    def test_scheduler_simplification_preserves_entity_pages_and_namespace(self):
+        from tutti.integration.vllm.geometry import key_namespace
+
+        names = ["main", "index"]
+        main, index = SimpleNamespace(page_size_bytes=2 * SEG), SimpleNamespace(page_size_bytes=SEG)
+        allocations = [SimpleNamespace(size=16 * p, shared_by=[name])
+                       for name, p in zip(names, (2 * SEG, SEG))]
+        worker_cfg = SimpleNamespace(num_blocks=16, kv_cache_tensors=allocations, kv_cache_groups=[
+            SimpleNamespace(layer_names=names, kv_cache_spec=SimpleNamespace(
+                block_size=BLOCK_SIZE, kv_cache_specs={"main": main, "index": index}))])
+        scheduler_cfg = SimpleNamespace(num_blocks=16, kv_cache_tensors=allocations, kv_cache_groups=[
+            SimpleNamespace(layer_names=names, kv_cache_spec=SimpleNamespace(
+                block_size=BLOCK_SIZE, page_size_bytes=2 * SEG))])
+        extra = {"chunk_tokens": 2 * BLOCK_SIZE}
+        worker = resolve_geometry(extra, worker_cfg)
+        scheduler = resolve_geometry(extra, scheduler_cfg)
+        assert worker["kv_layer_page_bytes"] == scheduler["kv_layer_page_bytes"] == (2 * SEG, SEG)
+        assert worker["chunk_kv_bytes"] == scheduler["chunk_kv_bytes"]
+        assert key_namespace(_make_vllm_config(), worker) == key_namespace(_make_vllm_config(), scheduler)
+
+    def test_layerwise_graph_is_rejected_before_store_creation(self):
+        names = ["main", "index"]
+        spec = SimpleNamespace(block_size=BLOCK_SIZE, kv_cache_specs={
+            "main": SimpleNamespace(page_size_bytes=SEG), "index": SimpleNamespace(page_size_bytes=2 * SEG)})
+        kv_cfg = SimpleNamespace(kv_cache_groups=[SimpleNamespace(layer_names=names, kv_cache_spec=spec)])
+        cfg = _make_vllm_config({"chunk_tokens": 2 * BLOCK_SIZE, "num_layers": 2,
+                                 "chunk_kv_bytes": 8 * SEG})
+        cfg.model_config = SimpleNamespace(enforce_eager=False)
+        with pytest.raises(ValueError, match="enforce_eager"):
+            TuttiConnectorV1(cfg, KVConnectorRole.SCHEDULER, kv_cfg)
 
 
 class TestSchedulerSide:

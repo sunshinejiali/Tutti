@@ -813,23 +813,8 @@ class TuttiDirectBackend:
                 self._validate_plan_entry(plan_entry)
                 target = plan_entry.target_ticket
                 for block_ordinal, block_id in enumerate(table):
-                    memory_offset = (
-                        block_id * geometry.block_stride_bytes
-                        + int(layer_idx) * geometry.layer_stride_bytes
-                    )
-                    target_offset = (
-                        plan_entry.target_offset
-                        + int(layer_idx) * geometry.segment_bytes
-                        + block_ordinal * geometry.page_bytes
-                    )
-                    requests.append((
-                        target,
-                        target_offset,
-                        plan.memory_ticket,
-                        memory_offset,
-                        geometry.page_bytes,
-                        direction,
-                    ))
+                    requests.extend(self._page_requests(
+                        int(layer_idx), block_id, block_ordinal, plan_entry, plan))
         submit_started_ns = time.perf_counter_ns()
         stream_direction = (
             "read_async"
@@ -874,6 +859,14 @@ class TuttiDirectBackend:
         completion_holder["completion"] = completion
         store._track_completion(completion, keys)
         return completion
+
+    def _page_requests(self, layer_idx, block_id, block_ordinal, entry, plan):
+        geometry = self.geometry
+        return [(entry.target_ticket,
+                 entry.target_offset + layer_idx * geometry.segment_bytes + block_ordinal * geometry.page_bytes,
+                 plan.memory_ticket,
+                 block_id * geometry.block_stride_bytes + layer_idx * geometry.layer_stride_bytes,
+                 geometry.page_bytes, plan.direction)]
 
     def close(self) -> None:
         if self._closed:
@@ -1245,7 +1238,8 @@ class TuttiKVStore:
                  segment_file_slots: int = DEFAULT_SEGMENT_FILE_SLOTS,
                  segment_header_bytes: int = DEFAULT_SEGMENT_HEADER_BYTES,
                  rank_id: int = 0, tp_size: int = 1,
-                 defer_writes_after_reads: bool | None = None):
+                 defer_writes_after_reads: bool | None = None,
+                 layer_page_bytes=None):
         """preset 为 dict 时优先于 TUTTI_NVME_PRESET 环境变量构造 runtime。
 
         preset 的字符串值恰为纯十进制整数时转为 int（配置占位符替换后
@@ -1277,6 +1271,7 @@ class TuttiKVStore:
         self._tp_size = tp_size
         self._num_chunks = num_chunks
         self._segment_bytes = segment_bytes
+        self._layer_page_bytes = tuple(layer_page_bytes or ())
         self._runtime = runtime
         self._own_runtime = runtime is None
         self._preset = prepare_preset(preset, mounts=mounts) if preset is not None else None
@@ -1718,6 +1713,9 @@ class TuttiKVStore:
         layer, and block-table semantics above Runtime/DataPath.
         """
         self._require_open()
+        if isinstance(kv_caches, dict) and self._layer_page_bytes:
+            from .layerwise_direct import TuttiLayerwiseDirectBackend
+            return TuttiLayerwiseDirectBackend(self)
         return TuttiDirectBackend(self)
 
     def _stream_for(self, direction: str):

@@ -161,6 +161,11 @@ class TuttiConnectorV1(KVConnectorBase_V1):
         """三参与 vLLM 工厂签名对齐；role 决定本实例承载的回调面。"""
         super().__init__(vllm_config, role, kv_cache_config)
         extra = resolve_geometry(extra_config(vllm_config), kv_cache_config)
+        self._vllm_config = vllm_config
+        self._layerwise_kv = "kv_layer_page_bytes" in extra
+        self._cache_hook_handles = ()
+        if self._layerwise_kv and not getattr(vllm_config.model_config, "enforce_eager", False):
+            raise ValueError("独立KV实体目前要求 enforce_eager=True；CUDA graph回调尚未支持")
         dcp = getattr(
             getattr(vllm_config, "parallel_config", None),
             "decode_context_parallel_size",
@@ -271,7 +276,7 @@ class TuttiConnectorV1(KVConnectorBase_V1):
     @property
     def prefer_cross_layer_blocks(self) -> bool:
         """声明偏好单块跨层池（统一层型模型的优化路径原料）。"""
-        return True
+        return not self._layerwise_kv
 
     @classmethod
     def get_required_kvcache_layout(cls, vllm_config) -> str:
@@ -287,7 +292,19 @@ class TuttiConnectorV1(KVConnectorBase_V1):
 
     def register_kv_caches(self, kv_caches: dict) -> None:
         """逐层显存对象登记（转发 worker 实现）。"""
+        if self._layerwise_kv and self._cache_hook_handles:
+            raise RuntimeError("layerwise caches cannot be registered twice")
         self._require_worker().register_kv_caches(kv_caches)
+        if self._layerwise_kv:
+            try:
+                from .minimax import install_cache_callbacks
+                self._cache_hook_handles = install_cache_callbacks(self._vllm_config, self, kv_caches)
+            except Exception:
+                try:
+                    self._require_worker().shutdown()
+                except Exception:
+                    _LOG.exception("Failed to close worker after cache callback installation error")
+                raise
 
     def register_cross_layers_kv_cache(self, kv_cache, attn_backend) -> None:
         """单块跨层显存对象登记（转发 worker 实现）。"""
@@ -334,7 +351,12 @@ class TuttiConnectorV1(KVConnectorBase_V1):
     def shutdown(self) -> None:
         """收尾（worker 转发给实现，scheduler 关闭元数据索引）。"""
         if self._impl is not None:
-            self._impl.shutdown()
+            try:
+                self._impl.shutdown()
+            finally:
+                for handle in self._cache_hook_handles:
+                    handle.remove()
+                self._cache_hook_handles = ()
         elif self._index is not None:
             self._index.close()
 

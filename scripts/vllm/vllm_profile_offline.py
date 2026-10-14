@@ -227,6 +227,8 @@ def main() -> int:
     parser.add_argument("--tokens", type=int, default=65528)
     parser.add_argument("--reuse-pct", type=int, default=80)
     parser.add_argument("--max-tokens", type=int, default=8)
+    parser.add_argument("--kv-load-mode", choices=("sync", "async", "auto"), default="auto",
+                        help="Tutti request loading policy; sync forces external-hit validation")
     parser.add_argument(
         "--rounds",
         type=int,
@@ -424,6 +426,7 @@ def main() -> int:
             },
         }
         connector_extra["direct_transfer"] = True
+        connector_extra["load_mode"] = args.kv_load_mode
         kv_transfer_config = KVTransferConfig(
             kv_connector="TuttiConnectorV1",
             kv_connector_module_path="tutti.integration.vllm.connector",

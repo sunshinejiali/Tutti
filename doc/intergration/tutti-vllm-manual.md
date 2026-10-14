@@ -55,7 +55,8 @@ export KV_MOUNT=/mnt/your-kv
 - `KV_CACHE_DTYPE=fp8` 必须有可用且正确的 KV scales；未经验证的模型先使用 `auto`。
 - `MAX_MODEL_LEN` 不超过模型和显存允许的上限；prompt 加生成 token 也不能超限。
 - `TOOL_CALL_PARSER` 必须符合模型工具格式；不把 Hermes 当作所有模型的兼容承诺。
-- 当前仅支持单一、定宽 KV cache group，多组/hybrid 布局会拒绝启动。
+- 当前支持单KV group。Hy3使用跨层池；MiniMax M3支持同一group内不同page宽的主KV和index缓存，
+  使用独立实体GPU-direct。多group/HMA仍拒绝，不能把MiniMax支持理解成任意hybrid支持。
 - `TOTAL_CAPACITY` 是带单位的服务总payload预算，除以TP后传每rank；不是每盘上限。
   首个段文件组仍需要足够空间，不能将预建开销误认为完全按需零成本。
 
@@ -72,8 +73,8 @@ bash scripts/vllm/run/bench-8gpu-striped.sh \
   --capacity "64 GiB" --tokens 10000 --reuse-pct 90 --rounds 3 --pool-tag reuse-check
 ```
 
-这个 wrapper 的离线几何固定为 `block-size=64`，KV dtype 使用 vLLM 默认；不要把它与在线
-脚本的 FP8/block=512 数字直接混在一起比较。需要调整离线几何时调用 driver 的 `--help`。
+wrapper缺省`block-size=64`，可通过`--block-size`或`BLOCK_SIZE`覆盖；KV dtype使用vLLM默认。
+`--kv-load-mode sync`可强制外部命中验收。不要把它与在线FP8/block=512数字混在一起比较。
 
 - A 计算并写入，B 复用 A 的一部分前缀。
 - Tutti 跑法在 A/B 间只清本地 HBM prefix cache，保留外部缓存。否则 B 可能只从 HBM 命中。
@@ -89,6 +90,48 @@ bash scripts/vllm/run/bench-8gpu-striped.sh \
 ```
 
 这是 HBM prefix-cache 参考，不是 B 全量重算参考。不要同时运行两组测试。
+
+### MiniMax-M3-MXFP8
+
+已验证本机`/mnt/nvme4/models/MiniMax-M3-MXFP8`，H20×8、TP8、双RAID0，
+`LOAD_FORMAT=auto`、KV dtype默认BF16、block128、eager。MXFP8是**权重量化**，
+不等于FP8 KV；H20由当前vLLM选择Marlin，不要求重启daemon或Phoenix loader。
+
+模型60层主KV，加57个稀疏attention index缓存，共117个实体。两种page分别64KiB/32KiB，
+Tutti逐实体注册和IO；每实体磁盘segment仍按最大page定宽，小page的尾部未使用。
+调度侧会简化cache spec，因此几何与namespace必须从保留的tensor分配恢复；只保存主KV
+或两侧namespace不一致都会导致错误或静默零命中。
+
+先确保GPU和实际payload路径无其它服务占用，再运行：
+
+```bash
+export MODEL=/mnt/nvme4/models/MiniMax-M3-MXFP8
+export LOAD_FORMAT=auto
+bash scripts/vllm/run/bench-8gpu-striped.sh \
+  --capacity "8 GiB" --block-size 128 --kv-load-mode sync \
+  --tokens 16384 --reuse-pct 80 --rounds 2
+```
+
+仍需按§1明确`DAEMON_CONFIG`、`DEVICE_GROUPS`、`KV_MOUNT`和NVMe scratch。
+注意`POOL_TAG`不隔离payload；本次验收使用测试专属同文件系统目录，没有复用Hy3生产段文件。
+
+支持限制：仅NVIDIA packed NHD主KV和连续index页、同一逻辑block表、64KiB base对齐及
+4KiB IO对齐。要求`enforce_eager=True`，CUDA graph、split K/V、HND及多group尚未支持。
+不会为了对齐再复制整份KV池。不要用`KV_CACHE_DTYPE=fp8`代替本次验证的`auto`。
+上述离线 driver 没有 EP、FP8 KV 或独立最大 context 参数，不能把在线参数直接当作
+离线已验证配置。在线服务另经本机 TP8/EP8、主 KV `fp8_e4m3`、index `bf16`、block128、
+纯文本/eager、`max_model_len=1048576` 和同步完成路径验证启动、HTTP/SSE 短请求及真实
+外部缓存命中；权重使用可选 Phoenix loader 与 EP weight filter。该记录不是完整 1M 请求、
+长期压力或 FP8 数值质量认证；checkpoint 缺少 KV scale 时使用 `1.0`，须单独验证质量。
+关闭思考使用模板的 `thinking_mode=disabled`；工具 auto 开关可用不代表完整工具解析兼容。
+视觉、CUDA graph、通用多 group 与关闭故障仍未认证。副本读取合并/GPU 分发属于 v0.2.1
+后续计划，见 [KV 副本读放大提案](../vllm-connector/kv-replica-read-amplification.md)。
+
+本机16K/80%复用、两轮A/B验证：4个请求的生成token与同口径纯vLLM全部一致。
+唯一稳态轮的B为1.139s，纯vLLM重算B为2.664s（约快57%，非多样本性能保证）。
+修复namespace后的nsys记录每rank B有117次read/117次write；该采集早于最后packed-only
+安全收窄及layout指纹，最终无profile回归使用了最后修改。退出有vLLM grace/shared-memory
+警告，因此不宣称已完成关闭故障认证；未做盘字节逐项校验或reset/late-CQE注入。
 
 ## 4. 在线服务：先预览、再启动
 

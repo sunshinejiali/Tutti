@@ -194,6 +194,18 @@ handle L2只在local低层使用，它不能解决所有L1项仍被open引用而
 `allocator_enabled`及未被native消费的`background_reclaim`传递链也已删除；后台预建
 仍由对象层根据分配前沿、ready余量和磁盘空间护栏驱动，不是这些空开关控制的。
 
+### MiniMax M3单组异构实体
+
+MiniMax-M3-MXFP8的主KV和稀疏attention index是同一逻辑block表下的独立实体，page大小
+不同。Tutti用固定的最大page宽保留磁盘segment，而每实体只搬实际page字节；capacity
+包含未使用padding，不能用60个模型层估算实际117实体占用。支持NVIDIA packed NHD及
+连续index页，eager；split K/V、HND、graph和多group尚未支持。
+
+worker的子spec与scheduler简化后的spec不同；两侧几何使用保留的tensor allocation
+恢复真实page宽。namespace包含实体page序列和NHD布局指纹，避免假驻留和错格式读回。
+自定义attention前后hook一起等待/保存main和index；写计划缺失任何callback都不能提交
+成功。当前模型参数和验证范围见[vLLM手册](intergration/tutti-vllm-manual.md#minimax-m3-mxfp8)。
+
 ### 模型及资源推导
 
 `max_in_flight_operations`与`max_batch_entries`仍是必要的内部边界，而不是必填项。

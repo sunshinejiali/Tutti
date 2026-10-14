@@ -2,7 +2,7 @@
 
 **A GPU-centric, SSD-backed KV cache object store for long-context LLM serving.**
 
-**Current release: v0.1.1** — stable `StorageRuntime` public API, striped multi-device data path, and a vendor-neutral GPU framework.
+**Current release: v0.2.0** — deployable vLLM KV connector, fixed segment-file storage, RAID0 support, automatic IO budgets, and MiniMax M3 main-KV/index GPU-direct offloading.
 
 Tutti (Italian for "all instruments together") makes NVMe SSDs a practical KV-cache tier for LLM inference, building on the ideas of [GeminiFS](https://www.usenix.org/conference/fast25/presentation/qiu) (FAST'25), a companion file system for GPUs. **The CPU launches I/O kernels; the GPU executes them.** Each GPU kernel moves KV cache between SSDs and HBM on its own — giving SSD-backed KV cache DRAM-like performance with hundreds of times the capacity.
 
@@ -36,7 +36,7 @@ The conductor doesn't play the instruments: the CPU only cues the orchestra (lau
 
 Tutti's answer is a GPU-centric data path where the CPU appears only **O(1) times per batch, not per I/O** — detailed in [doc/architecture/system-architecture.md](doc/architecture/system-architecture.md).
 
-## System Architecture (v0.1.1)
+## System Architecture
 
 ```text
 Application  (uri / offset / size)
@@ -69,9 +69,10 @@ symmetric per-vendor backends (nvidia done, metax symmetric).
 
 ## Deploy the vLLM KV cache connector
 
-**v0.2.0 preparation:** the vLLM connector, deployment scripts and agent skill
-are being prepared for community use. The release version/tag has not yet been
-changed. Supported-layout and compatibility limits are documented explicitly.
+**v0.2.0:** the external vLLM connector, deployment scripts and agent skill
+provide the community deployment entry. Supported layouts and compatibility
+limits are documented explicitly; software checks do not replace host-specific
+GPU/NVMe validation.
 
 Start with [Getting Started](doc/getting-started.md): build the C++ stack and
 both native Python extensions, review host/device ownership, run software and
@@ -85,10 +86,13 @@ host-specific device identity and explicit approval before privileged changes.
 Shipped daemon configurations are examples of the maintainer's machine, not
 safe defaults for arbitrary disks.
 
-MiniMax/DeepSeek new-model adaptation is a subsequent task. Hybrid/multi-group
-KV layouts are not currently supported. Experimental async completion is
-opt-in (`TUTTI_ASYNC_COMPLETION=1`); fault-path validation is still incomplete
-and it is not the production default.
+MiniMax M3 main KV and sparse-index caches use the single-group layerwise
+GPU-direct path on NVIDIA, with packed NHD/contiguous pages and eager execution.
+DeepSeek adaptation, CUDA graphs, split K/V, HND and general multi-group layouts
+remain unsupported. Experimental async completion is opt-in
+(`TUTTI_ASYNC_COMPLETION=1`); fault-path validation is still incomplete and it is
+not the production default. Cross-rank deduplicated reads and GPU fanout are
+planned for v0.2.1; see the [design proposal](doc/vllm-connector/kv-replica-read-amplification.md).
 
 ## Manual C++ KV workload
 
@@ -123,9 +127,11 @@ Legacy application fields (`gpu`, `nvme_service`, `nvme`, `local_nvme`,
 are not supported. There is no legacy configuration adapter; native Runtime
 and daemon inputs must use their current schemas.
 
-DataPath cache precedence remains programmatic override > DataPath spec
-config > test-only `TUTTI_*_CACHE_CAP` environment override > built-in default.
-Queue depth remains kernel-authoritative (controller maximum, NVMe CAP.MQES + 1).
+PRP cache backing is automatically budgeted per DataPath; application object
+pools retain file tickets without an additional finite handle-cache layer.
+Legacy application cache-capacity knobs are removed; see the configuration guide
+for scope and fallback behavior. Queue depth remains kernel-authoritative
+(controller maximum, NVMe CAP.MQES + 1).
 
 The repository root is the only supported CMake entry. All component
 `CMakeLists.txt` files are reached from that target graph and are not

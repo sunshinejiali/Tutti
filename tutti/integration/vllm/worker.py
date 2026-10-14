@@ -629,6 +629,10 @@ class WorkerImpl:
         请求调度查询之前完成——惰性绑定会把恢复推迟到首请求执行期，
         调度器的命中查询先于执行，重启后的首请求会错过恢复窗口。
         """
+        if self._kv_group_layer_names:
+            if set(kv_caches) != set(self._kv_group_layer_names):
+                raise ValueError("registered caches differ from the authoritative KV group")
+            kv_caches = {name: kv_caches[name] for name in self._kv_group_layer_names}
         self._kv_caches = dict(kv_caches)
         self._layer_names = list(kv_caches.keys())
         self._reserve_io_sms(next(iter(kv_caches.values()), None))
@@ -1172,6 +1176,11 @@ class WorkerImpl:
         """等待全部写入完成并结算。"""
         self._end_step_timing()
         first_error = self._save_error
+        if self._save_keys and getattr(self._engine, "_config", {}).get("kv_layer_page_bytes"):
+            expected = set(range(len(self._callback_to_physical)))
+            missing = expected.difference(self._save_seen_callbacks)
+            if missing and first_error is None:
+                first_error = RuntimeError(f"layerwise KV save omitted callbacks {sorted(missing)}")
         drained = False
         # Direct reads are fully pre-enqueued by start_load; staged
         # reads/scatter follow their existing plan.  Drain before TP failure

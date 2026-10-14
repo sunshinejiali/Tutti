@@ -25,6 +25,8 @@
 #   --reuse-pct N     shared prefix percentage, default 80
 #   --rounds N        rounds of (A,B), default 2
 #   --capacity SIZE   per-rank KV payload budget, e.g. "1 TiB"; required for Tutti
+#   --block-size N    backend KV block tokens; MiniMax M3 uses 128
+#   --kv-load-mode M  sync/async/auto; sync forces external-read validation
 #   --tag NAME        label for output files
 #   --pool-tag NAME   pool root suffix (checkpoint/metadata root). Segment
 #                     files live under <mount>/r<rank>/segments and are shared
@@ -52,6 +54,8 @@ KV_MOUNT="${KV_MOUNT:-/mnt/tutti_md0}"
 DEVICE_GROUPS="${DEVICE_GROUPS:-0,1,2,3;4,5,6,7}"
 MODEL="${MODEL:-}"
 TP_SIZE="${TP_SIZE:-8}"
+BLOCK_SIZE="${BLOCK_SIZE:-64}"
+KV_LOAD_MODE="${KV_LOAD_MODE:-auto}"
 NUM_QUEUES="${NUM_QUEUES:-8}"
 [[ "$NUM_QUEUES" =~ ^[1-9][0-9]*$ ]] || { echo "NUM_QUEUES must be a positive integer" >&2; exit 2; }
 # 空值不传：connector按模型和请求加载模式推导in-flight；不是越大越快。
@@ -72,6 +76,8 @@ while [[ $# -gt 0 ]]; do
         --pool-tag)    POOL_TAG="$2"; shift 2 ;;
         --model)       MODEL="$2"; shift 2 ;;
         --capacity)    CAPACITY="$2"; shift 2 ;;
+        --block-size)  BLOCK_SIZE="$2"; shift 2 ;;
+        --kv-load-mode) KV_LOAD_MODE="$2"; shift 2 ;;
         -h|--help)     sed -n '2,31p' "${BASH_SOURCE[0]}"; exit 0 ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
@@ -118,6 +124,8 @@ ARGS=(
     --model "$MODEL"
     --load-format "$LOAD_FORMAT"
     --tensor-parallel-size "$TP_SIZE"
+    --block-size "$BLOCK_SIZE"
+    --kv-load-mode "$KV_LOAD_MODE"
     --tokens "$TOKENS"
     --reuse-pct "$REUSE_PCT"
     --rounds "$ROUNDS"

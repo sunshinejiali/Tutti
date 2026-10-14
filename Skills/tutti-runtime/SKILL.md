@@ -113,10 +113,17 @@ IO. See the operation manual for runnable commands and API checks.
 
 ## Supported layouts and experimental features
 
-Current connector geometry is a single KV cache group with equal per-layer
-page bytes. Hybrid/multi-group layouts are rejected. A model loading in vLLM
-alone is not evidence of Tutti compatibility. MiniMax/DeepSeek new-version
-adaptation is pending model identification and separate verification.
+Support a single KV cache group. Use the uniform cross-layer path for Hy3;
+use layerwise GPU-direct for MiniMax M3 main KV and sparse-index caches with
+unequal page widths. Restore scheduler geometry from tensor allocations when
+vLLM simplifies child specs. Require matching namespace, real external reads
+and baseline-equal output; pure vLLM loading alone is insufficient.
+For MiniMax-M3-MXFP8 on NVIDIA, select block128, KV dtype auto, weight loader
+auto and enforce_eager. Accept only packed NHD pages / contiguous index pages
+with 64KiB bases; reject CUDA graphs, split K/V, HND and multi-group layouts.
+Use --kv-load-mode sync for offload verification; bench forwards --block-size.
+Read the operation manual for measured scope and model-specific settings.
+DeepSeek new-version adaptation still needs separate identification/verification.
 
 `TUTTI_ASYNC_COMPLETION=1` selects experimental submit/drain separation for the
 striped DataPath; default is synchronous completion. Lifetime fixes now retain

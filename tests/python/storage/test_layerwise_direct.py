@@ -1,0 +1,132 @@
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from tutti.storage.tutti_nvme.layerwise_direct import page_geometry, TuttiLayerwiseDirectBackend
+from tutti.storage.tutti_nvme.store import DirectAdmissionError
+
+
+def test_page_geometry_covers_packed_kv_and_key_only_index():
+    main = torch.empty((8, 128, 1, 256), dtype=torch.bfloat16).permute(0, 2, 1, 3)
+    index = torch.empty((8, 128, 128), dtype=torch.bfloat16)
+    g = page_geometry(main, 65536)
+    assert g.page_bytes == g.block_stride == 65536
+    assert g.num_blocks == 8
+    g = page_geometry(index, 32768)
+    assert g.page_bytes == g.block_stride == 32768
+
+
+def test_strided_or_unaligned_page_is_rejected():
+    with pytest.raises(DirectAdmissionError):
+        page_geometry(torch.empty((8, 128, 256))[:, :, ::2], 65536)
+    with pytest.raises(DirectAdmissionError):
+        page_geometry(torch.empty((8, 1024), dtype=torch.uint8), 1024)
+
+
+def test_ambiguous_two_block_split_and_hnd_layouts_are_rejected():
+    with pytest.raises(DirectAdmissionError, match="block-axis-0"):
+        page_geometry(torch.empty((2, 2, 128, 1, 128), dtype=torch.bfloat16), 65536)
+    with pytest.raises(DirectAdmissionError, match="packed NHD"):
+        page_geometry(torch.empty((8, 2, 128, 128), dtype=torch.bfloat16), 65536)
+
+
+def test_layerwise_requests_use_entity_ticket_and_fixed_disk_width():
+    store = SimpleNamespace(_layer_page_bytes=(65536, 32768))
+    backend = TuttiLayerwiseDirectBackend(store)
+    backend._layer_pages = (page_geometry(torch.empty((8, 1, 128, 256), dtype=torch.bfloat16), 65536),
+                            page_geometry(torch.empty((8, 128, 128), dtype=torch.bfloat16), 32768))
+    backend._layer_tickets = [11, 22]
+    backend._geometry = SimpleNamespace(segment_bytes=131072)
+    entry = SimpleNamespace(target_ticket=7, target_offset=262144)
+    plan = SimpleNamespace(direction="read")
+    assert backend._page_requests(0, 3, 1, entry, plan) == [
+        (7, 327680, 11, 196608, 65536, "read"),
+    ]
+    assert backend._page_requests(1, 3, 1, entry, plan) == [
+        (7, 425984, 22, 98304, 32768, "read"),
+    ]
+
+
+@pytest.mark.parametrize("fail_last", [False, True])
+def test_layerwise_close_releases_all_tickets_after_drain_error(fail_last):
+    calls = []
+
+    def release(ticket):
+        calls.append(ticket)
+        if ticket == 22 and fail_last and calls.count(22) == 1:
+            raise RuntimeError("BUSY")
+
+    def drain(chunks):
+        raise RuntimeError("drain failed")
+
+    store = SimpleNamespace(_runtime=SimpleNamespace(unregister_memory=release),
+                            _inflight_by_chunk={}, _wait_chunk_io=drain)
+    backend = TuttiLayerwiseDirectBackend(store)
+    backend._layer_tickets = [11, 22]
+    backend._memory_ticket = 11
+    backend._layer_tensors = (object(),)
+    with pytest.raises(RuntimeError, match="BUSY" if fail_last else "drain failed"):
+        backend.close()
+    if fail_last:
+        assert backend._layer_tensors
+        assert not backend._closed
+        store._wait_chunk_io = lambda _: None
+        backend.close()
+        assert calls == [11, 22, 22]
+    else:
+        assert calls == [11, 22]
+    assert backend._layer_tickets == []
+    assert backend._layer_tensors == ()
+    backend.close()
+
+
+def test_hook_install_rolls_back_if_second_registration_fails():
+    from tutti.integration.vllm.minimax import install_cache_callbacks
+
+    class Attention(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.indexer = SimpleNamespace(index_cache=SimpleNamespace(prefix="index"))
+
+        def register_forward_hook(self, hook):
+            raise RuntimeError("hook install failed")
+
+    module = Attention()
+    connector = SimpleNamespace(_impl=SimpleNamespace(_kv_group_layer_names=("index", "main")))
+    config = SimpleNamespace(compilation_config=SimpleNamespace(static_forward_context={"main": module}))
+    with pytest.raises(RuntimeError, match="hook install failed"):
+        install_cache_callbacks(config, connector, {"index": object(), "main": object()})
+    assert not module._forward_pre_hooks
+
+
+def test_callback_hooks_wait_both_caches_then_save_both(monkeypatch):
+    from tutti.integration.vllm.minimax import install_cache_callbacks
+    import vllm.forward_context
+
+    class Attention(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.indexer = SimpleNamespace(index_cache=SimpleNamespace(prefix="index"))
+
+        def forward(self, x):
+            events.append("compute")
+            return x
+
+    events = []
+    module = Attention()
+    caches = {"index": object(), "main": object()}
+    connector = SimpleNamespace(_impl=SimpleNamespace(_kv_group_layer_names=tuple(caches)),
+        has_connector_metadata=lambda: True,
+        wait_for_layer_load=lambda key: events.append(("wait", key)),
+        save_kv_layer=lambda key, tensor, meta: events.append(("save", key)))
+    monkeypatch.setattr(vllm.forward_context, "get_forward_context", lambda: SimpleNamespace(attn_metadata={}))
+    config = SimpleNamespace(compilation_config=SimpleNamespace(static_forward_context={"main": module}))
+    handles = install_cache_callbacks(config, connector, caches)
+    module(torch.tensor(1))
+    assert events == [("wait", "index"), ("wait", "main"), "compute", ("save", "index"), ("save", "main")]
+    for handle in handles:
+        handle.remove()
+    events.clear()
+    module(torch.tensor(1))
+    assert events == ["compute"]

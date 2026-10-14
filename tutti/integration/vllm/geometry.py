@@ -135,17 +135,39 @@ def resolve_geometry(extra: dict, kv_cache_config) -> dict:
     else:
         page_size = getattr(spec, "page_size_bytes", None)
         page_sizes = [page_size] * len(layer_names)
+    # vLLM's scheduler config simplifies UniformTypeKVCacheSpecs, but keeps
+    # per-entity tensor allocations. Recover physical widths from those facts
+    # rather than applying the arbitrary representative spec to every entity.
+    num_blocks = getattr(kv_cache_config, "num_blocks", 0)
+    allocations = list(getattr(kv_cache_config, "kv_cache_tensors", ()) or ())
+    physical_pages = {}
+    if isinstance(num_blocks, int) and num_blocks > 0:
+        for allocation in allocations:
+            shared = list(getattr(allocation, "shared_by", ()) or ())
+            size = getattr(allocation, "size", 0)
+            if len(shared) == 1 and isinstance(size, int) and size > 0 and size % num_blocks == 0:
+                physical_pages[shared[0]] = size // num_blocks
+    if all(name in physical_pages for name in layer_names):
+        derived_pages = [physical_pages[name] for name in layer_names]
+        if isinstance(child_specs, dict) and derived_pages != page_sizes:
+            raise ValueError("KV tensor allocation与逐实体page spec不一致")
+        page_sizes = derived_pages
     if any(not isinstance(size, int) or size <= 0 for size in page_sizes):
         raise ValueError("KV cache spec 含无效 page_size_bytes")
-    if len(set(page_sizes)) != 1:
-        raise ValueError(
-            "TuttiConnectorV1 当前要求每层 KV page 字节数一致；"
-            f"得到 {sorted(set(page_sizes))}"
-        )
+    resolved["kv_group_page_bytes"] = tuple(page_sizes)
+    independent_entities = (len(set(page_sizes)) != 1 or
+                            isinstance(child_specs, dict) and
+                            len({type(child_specs[name]) for name in layer_names}) > 1)
+    if independent_entities:
+        if any(size % 4096 for size in page_sizes):
+            raise ValueError("异构 KV page 必须按4KiB对齐")
+        # One logical group shares block IDs. Disk slots keep a fixed entity
+        # width; each entity transfers only its own physical bytes.
+        resolved["kv_layer_page_bytes"] = tuple(page_sizes)
 
     num_layers = len(layer_names)
     blocks_per_chunk = resolved["chunk_tokens"] // block_size
-    segment_bytes = blocks_per_chunk * page_sizes[0]
+    segment_bytes = blocks_per_chunk * max(page_sizes)
     chunk_kv_bytes = num_layers * segment_bytes
     for key, derived in (
         ("num_layers", num_layers),
@@ -160,7 +182,7 @@ def resolve_geometry(extra: dict, kv_cache_config) -> dict:
         resolved[key] = derived
     resolved["kv_group_layer_names"] = tuple(layer_names)
     resolved["kv_block_tokens"] = block_size
-    resolved["kv_page_bytes"] = page_sizes[0]
+    resolved["kv_page_bytes"] = max(page_sizes)
     return apply_wave_default(resolved, blocks_per_chunk=blocks_per_chunk)
 
 
@@ -343,4 +365,6 @@ def key_namespace(vllm_config, extra: dict) -> str:
         f"tp={tp}",
         f"chunk_kv_bytes={extra.get('chunk_kv_bytes')}",
         f"chunk_tokens={extra.get('chunk_tokens')}",
+        *([f"entity_pages={extra['kv_group_page_bytes']}", "kv_layout=NHD-v1"]
+          if "kv_group_page_bytes" in extra else []),
     ])

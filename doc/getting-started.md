@@ -18,9 +18,12 @@
 
 ### Connector 兼容性
 
-当前已验证的长上下文模型是 Hy3-FP8。Connector 接受单一 KV cache group、每层固定且相同的
-page 字节数；不支持多组/hybrid KV 布局，相关布局会拒绝启动。MiniMax 和 DeepSeek 的新模型
-适配是后续工作，**不应仅因 vLLM 可以加载就声称 Tutti 已支持**。
+当前支持 Hy3-FP8 的统一跨层缓存路径，以及 MiniMax-M3-MXFP8 主 KV 和稀疏 index 的
+逐实体 GPU-direct 路径；后者允许同一逻辑 block 表下不同实体 page 宽度，仅接受 NVIDIA
+packed NHD 主 KV / 连续 index 页并要求 eager。CUDA graph、split K/V、HND 及多 KV group
+尚未支持；DeepSeek 仍需单独适配。模型参数、实测范围与限制见
+[vLLM 操作手册](intergration/tutti-vllm-manual.md#minimax-m3-mxfp8)，
+**不应仅因 vLLM 可以加载就声称 Tutti 已支持**。
 
 维护者验证环境：Python 3.11.13、PyTorch 2.13.0+cu130、vLLM
 `0.23.1rc1.dev2467+g897ff4f39`、FlashInfer `0.6.15.post1`。这是一组验证记录，不是所有版本
@@ -163,6 +166,8 @@ Agent 用户可复制完整的 [`Skills/tutti-runtime`](../Skills/tutti-runtime)
 
 ## 7. 发布状态
 
-本轮在整理 v0.2.0；`VERSION` 与 release tag 暂不修改。默认仍是同步完成路径。
+v0.2.0 提供外部 vLLM connector、固定段文件/RAID0 部署及 MiniMax 主 KV/index 逐实体路径。
+默认仍是同步完成路径。跨 rank 副本读取合并与 GPU 分发计划在 v0.2.1 实现，
+当前未实现；设计见 [KV 副本读放大提案](vllm-connector/kv-replica-read-amplification.md)。
 `TUTTI_ASYNC_COMPLETION=1` 仅用于实验：生命周期修正已通过软件与 GPU-only 故障测试，
 修正后的真实 NVMe/LLM 回归及控制器永久故障恢复尚未验收，不能仅凭之前的性能结果升级为生产默认。
