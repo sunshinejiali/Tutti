@@ -155,7 +155,8 @@ def resolve_geometry(extra: dict, kv_cache_config) -> dict:
     if any(not isinstance(size, int) or size <= 0 for size in page_sizes):
         raise ValueError("KV cache spec 含无效 page_size_bytes")
     resolved["kv_group_page_bytes"] = tuple(page_sizes)
-    independent_entities = (len(set(page_sizes)) != 1 or
+    independent_entities = (resolved.get("replica_io", False) or
+                            len(set(page_sizes)) != 1 or
                             isinstance(child_specs, dict) and
                             len({type(child_specs[name]) for name in layer_names}) > 1)
     if independent_entities:
@@ -367,4 +368,5 @@ def key_namespace(vllm_config, extra: dict) -> str:
         f"chunk_tokens={extra.get('chunk_tokens')}",
         *([f"entity_pages={extra['kv_group_page_bytes']}", "kv_layout=NHD-v1"]
           if "kv_group_page_bytes" in extra else []),
+        *(["replica_io=minimax-tp8-index-only-v2"] if extra.get("replica_io", False) else []),
     ])

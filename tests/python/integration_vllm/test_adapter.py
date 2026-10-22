@@ -190,6 +190,18 @@ def _sched_output(new_reqs=(), cached=None, finished=(), scheduled_tokens=None):
     )
 
 
+@pytest.mark.parametrize("prompt_len,computed,count,expected", [
+    (4, 3, 1, True), (4, 4, 1, False), (4, 4, 4, False), (4, 0, 0, False),
+])
+def test_prefill_flag_uses_query_interval_not_decode_batch_size(prompt_len, computed, count, expected):
+    h = _make_harness()
+    request = _fake_request("query", list(range(prompt_len)), computed)
+    h.scheduler._live_requests["query"] = request
+    meta = h.scheduler.build_connector_meta(_sched_output(scheduled_tokens={"query": count}))
+    assert meta.prefill_work is expected
+    h.engine.close()
+
+
 class TestMounting:
     def test_isinstance_of_real_vllm_base(self):
         cfg = _make_vllm_config()
@@ -893,6 +905,12 @@ class TestLoadSemantics:
         impl = h.worker._impl
         assert impl._load_keys == []          # 不进本步同步读
         assert impl._external_load_step is False
+        assert h.worker.get_finished(set())[1] == set()
+        assert impl._async_active is None
+        h.engine.begin_prefill_feeder(True)
+        for callback, name in enumerate(h.layer_names):
+            h.engine.advance_prefill_feeder(callback)
+            h.worker.wait_for_layer_load(name)
         _, recving = h.worker.get_finished(set())
         assert recving == {"r2"}
         assert h.worker.get_block_ids_with_load_errors() == set()
@@ -904,6 +922,38 @@ class TestLoadSemantics:
             SimpleNamespace(finished_recving={"r2"}, kv_connector_worker_meta=None)
         )
         assert not h.scheduler._async_outstanding
+
+    def test_async_waiting_requests_keep_fifo_and_do_not_reload_on_repeated_metadata(self, monkeypatch):
+        from tutti.integration.vllm.worker import _AsyncLoad
+        h = _make_harness()
+        impl = h.worker._impl
+        first = _AsyncLoad("first", (b"a" * 16,), ((10,),))
+        second = _AsyncLoad("second", (b"b" * 16,), ((11,),))
+        impl._async_queue = [first, second]
+        calls, releases = [], []
+        class Plan:
+            def poll(self):
+                return None
+        monkeypatch.setattr(impl._engine, "start_async_read_plan", lambda keys, tables, layers:
+                            (calls.append((tuple(keys), tables)), Plan())[1])
+        monkeypatch.setattr(impl, "_release_async_load", lambda load: releases.append(load.req_id))
+        impl._poll_async_loads()
+        impl._kick_async_loads()
+        assert calls == []
+        impl._engine.begin_prefill_feeder(True)
+        impl._engine.advance_prefill_feeder(0)
+        impl._kick_async_loads()
+        assert calls == [((b"a" * 16,), [[10]])]
+        assert impl._async_queue == [second]
+        impl._enqueue_async_load(SimpleNamespace(req_id="first"))
+        assert calls == [((b"a" * 16,), [[10]])]
+        impl._async_finished.add("reported")
+        impl._enqueue_async_load(SimpleNamespace(req_id="reported"))
+        _, done = impl.get_finished({"second"})
+        assert done == {"second", "reported"}
+        assert impl._async_queue == []
+        assert releases == ["second"]
+        assert impl._async_active.loads == [first]
 
     def test_auto_load_mode_needs_running_batch_and_free_blocks(self, monkeypatch):
         """auto：只有它一个→同步；有别的请求在算且显存够→异步；池紧→同步。"""

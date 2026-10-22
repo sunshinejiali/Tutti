@@ -681,6 +681,9 @@ class WorkerImpl:
         补其后区间——起点非 chunk 边界时首个不完整 chunk 让渡
         （重算兜底），key 与块表按同一 chunk 区间切片。
         """
+        end_feeder = getattr(self._engine, "end_prefill_feeder", None)
+        if callable(end_feeder):
+            end_feeder()
         started_ns = time.perf_counter_ns()
         self._direct_start_load_started_ns = started_ns
         self._direct_first_callback_logged = False
@@ -822,9 +825,10 @@ class WorkerImpl:
                     self._mark_load_failure()
                     self._abort_step()
                     raise
-        # 异步加载在同步读计划之后发起：两者共用读流，同步读排在前面，
-        # 本步计算等的那部分先完成。
-        self._kick_async_loads()
+        begin_feeder = getattr(self._engine, "begin_prefill_feeder", None)
+        if callable(begin_feeder):
+            begin_feeder(bool(getattr(self._metadata, "prefill_work", False)))
+            self._kick_async_loads()
         self._start_step_timing(had_sync_read=bool(self._load_keys))
         # 写批准备（哈希/准入/对象池分配）在读计划预提交之后立即完成：
         # 此时读已在飞、计算未开始，这些 host 开销不与层 0→1 的计算
@@ -841,6 +845,10 @@ class WorkerImpl:
     def wait_for_layer_load(self, layer_name: str) -> None:
         """在 compute stream 等待本层 direct-read 或 staged-scatter fence。"""
         callback, idx = self._resolve_callback(layer_name)
+        advance = getattr(self._engine, "advance_prefill_feeder", None)
+        if callable(advance):
+            advance(callback)
+            self._kick_async_loads()
         self._diag_callback("wait", layer_name, callback, idx)
         direct = bool(getattr(self._engine, "direct", False))
         if direct and callback == 0 and not self._direct_first_callback_logged:
@@ -1116,6 +1124,10 @@ class WorkerImpl:
             return
         self._ensure_bound()
         callback, idx = self._resolve_callback(layer_name)
+        if callback == len(self._callback_to_physical) - 1:
+            end_feeder = getattr(self._engine, "end_prefill_feeder", None)
+            if callable(end_feeder):
+                end_feeder()
         self._diag_callback("save", layer_name, callback, idx)
         if self._load_failed:
             return
@@ -1174,6 +1186,9 @@ class WorkerImpl:
 
     def wait_for_save(self) -> None:
         """等待全部写入完成并结算。"""
+        end_feeder = getattr(self._engine, "end_prefill_feeder", None)
+        if callable(end_feeder):
+            end_feeder()
         self._end_step_timing()
         first_error = self._save_error
         if self._save_keys and getattr(self._engine, "_config", {}).get("kv_layer_page_bytes"):
@@ -1358,7 +1373,6 @@ class WorkerImpl:
         get_block_ids_with_load_errors 里——它紧随本调用，两者同步交出。
         已终止的请求若还在排队，直接不读了：vLLM 只等它的完成回报来释放块。
         """
-        self._poll_async_loads()
         finished = set(finished_req_ids or ())
         if finished and self._async_queue:
             keep = []
@@ -1369,6 +1383,7 @@ class WorkerImpl:
                 else:
                     keep.append(load)
             self._async_queue = keep
+        self._poll_async_loads()
         done = self._async_finished
         self._async_finished = set()
         return set(), done
@@ -1398,6 +1413,8 @@ class WorkerImpl:
             self._abort_step()
         finally:
             self._engine.close()
+            self._async_queue = []
+            self._async_active = None
 
     def abort(self) -> None:
         """请求失败收尾：drain 双 bank、回滚写计划并释放读 pin。"""
@@ -1479,6 +1496,11 @@ class WorkerImpl:
     def _enqueue_async_load(self, meta) -> None:
         """pin 一个异步加载的 chunk 区间并排队；不可读时直接报完成 + 失败块。"""
         req_id = str(getattr(meta, "req_id", ""))
+        queued = list(self._async_queue)
+        if self._async_active is not None:
+            queued.extend(self._async_active.loads)
+        if req_id in self._async_finished or any(load.req_id == req_id for load in queued):
+            return
         first_chunk, n_chunks = _load_chunk_span(
             meta.load_start_token, meta.load_tokens, self._chunk_tokens
         )
@@ -1508,14 +1530,15 @@ class WorkerImpl:
         _LOG.debug("ASYNC_LOAD_QUEUED req=%s chunks=%d", req_id, n_chunks)
 
     def _kick_async_loads(self) -> None:
-        """当前没有在途计划时，把排队的加载合并成一个读计划发起。
+        """按请求FIFO开启跨步层计划，不把后来的等待请求合进超大后台批。
 
-        每 rank 同时只跑一个异步计划：配额只多留了一个整层计划，而且合并后
-        批越大、盘越容易跑满；排队的请求只是多等一会儿。
+        计划每次只保留一个后台实体在途，提交前重新检查前台IO优先条件。
         """
         if self._async_active is not None or not self._async_queue:
             return
-        loads, self._async_queue = self._async_queue, []
+        if not getattr(self._engine, "_prefill_feeder_open", False):
+            return
+        loads = [self._async_queue.pop(0)]
         keys = [key for load in loads for key in load.keys]
         tables = [list(table) for load in loads for table in load.block_tables]
         layers = self._callback_to_physical or tuple(range(self._num_layers))
@@ -1533,13 +1556,11 @@ class WorkerImpl:
         self._async_active = _AsyncBatch(
             loads=loads, plan=plan, chunks=len(keys), queued_ns=queued_ns
         )
-        self._poll_async_loads()
 
     def _poll_async_loads(self) -> None:
-        """非阻塞推进在途计划；结束则解 pin、记完成，并发起下一批。"""
+        """只结算已接受的 IO；新任务只能由 prefill feeder 启动。"""
         batch = self._async_active
         if batch is None:
-            self._kick_async_loads()
             return
         state = batch.plan.poll()
         if state is None:
@@ -1559,7 +1580,6 @@ class WorkerImpl:
             getattr(batch.plan, "failure", None),
         )
         self._finish_async_loads(batch.loads, ok=ok)
-        self._kick_async_loads()
 
     def _finish_async_loads(self, loads, ok: bool) -> None:
         for load in loads:
@@ -1732,6 +1752,9 @@ class WorkerImpl:
 
     def _abort_step(self, timeout=None):
         """Best-effort full-direction drain while preserving the first error."""
+        end_feeder = getattr(self._engine, "end_prefill_feeder", None)
+        if callable(end_feeder):
+            end_feeder()
         first_error = None
         if self._read_plan is not None:
             try:

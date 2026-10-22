@@ -14,6 +14,13 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <pybind11/pybind11.h>
 #include <algorithm>
+#include <cstring>
+#include <memory>
+#include <mutex>
+#include <set>
+#include <limits>
+#include <c10/cuda/CUDAException.h>
+#include <cuda.h>
 #ifdef USE_ROCM
   #include <hip/hip_fp8.h>
 #else
@@ -274,7 +281,252 @@ void single_layer_kv_transfer(
 #undef LAUNCH_SINGLE_LAYER_KERNEL
 }
 
+class ReplicaIpcExport {
+ public:
+  explicit ReplicaIpcExport(torch::Tensor tensor) {
+    TORCH_CHECK(tensor.is_cuda() && tensor.scalar_type() == torch::kUInt8 &&
+                    tensor.is_contiguous() && tensor.numel() > 0,
+                "replica export requires contiguous CUDA uint8 storage");
+    device_ = tensor.get_device();
+    c10::cuda::CUDAGuard guard(device_);
+    void* function = nullptr;
+    C10_CUDA_CHECK(cudaGetDriverEntryPoint("cuMemGetAddressRange", &function,
+                                         cudaEnableDefault));
+    TORCH_CHECK(function, "CUDA allocation range query is unavailable");
+    using Query = CUresult (CUDAAPI *)(CUdeviceptr*, size_t*, CUdeviceptr);
+    CUdeviceptr base = 0;
+    size_t bytes = 0;
+    const auto pointer = reinterpret_cast<uintptr_t>(tensor.data_ptr());
+    const auto status = reinterpret_cast<Query>(function)(&base, &bytes, pointer);
+    TORCH_CHECK(status == CUDA_SUCCESS && base <= pointer &&
+                    bytes <= static_cast<size_t>(std::numeric_limits<int64_t>::max()) &&
+                    pointer - base <= bytes && tensor.numel() <= bytes - (pointer - base),
+                "replica KV allocation is not exportable without staging (VMM is unsupported)");
+    const auto exported = cudaIpcGetMemHandle(&handle_, reinterpret_cast<void*>(base));
+    TORCH_CHECK(exported == cudaSuccess,
+                "replica KV allocation is not exportable without staging: ",
+                cudaGetErrorString(exported));
+    offset_ = pointer - base;
+    bytes_ = bytes;
+    tensor_ = std::make_unique<torch::Tensor>(std::move(tensor));
+  }
+  ~ReplicaIpcExport() { if (tensor_) tensor_.release(); }
+  py::bytes handle() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    TORCH_CHECK(tensor_, "replica IPC export is closed");
+    return py::bytes(reinterpret_cast<const char*>(&handle_), sizeof(handle_));
+  }
+  int64_t offset() const { return offset_; }
+  int64_t allocation_bytes() const { return bytes_; }
+  void close() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    c10::cuda::CUDAGuard guard(device_);
+    tensor_.reset();
+  }
+ private:
+  std::unique_ptr<torch::Tensor> tensor_;
+  cudaIpcMemHandle_t handle_;
+  int device_;
+  int64_t offset_, bytes_;
+  std::mutex mutex_;
+};
+
+class ReplicaIpcMapping {
+ public:
+  ReplicaIpcMapping(const std::string& blob, int64_t offset, int64_t bytes, int device)
+      : offset_(offset), bytes_(bytes), device_(device) {
+    TORCH_CHECK(blob.size() == sizeof(cudaIpcMemHandle_t) && offset >= 0 && bytes > 0 &&
+                    offset <= std::numeric_limits<int64_t>::max() - bytes,
+                "invalid replica IPC descriptor");
+    cudaIpcMemHandle_t handle;
+    std::memcpy(&handle, blob.data(), sizeof(handle));
+    c10::cuda::CUDAGuard guard(device_);
+    TORCH_CHECK(cudaIpcOpenMemHandle(&base_, handle, cudaIpcMemLazyEnablePeerAccess)
+                    == cudaSuccess, "replica IPC import failed");
+  }
+  uintptr_t acquire_plan(int device, int64_t bytes) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    TORCH_CHECK(base_, "replica IPC mapping is closed");
+    TORCH_CHECK(device == device_ && bytes <= bytes_, "replica IPC source size or device mismatch");
+    ++live_plans_;
+    return reinterpret_cast<uintptr_t>(base_) + offset_;
+  }
+  void release_plan() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    --live_plans_;
+  }
+  void close() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!base_) return;
+    TORCH_CHECK(live_plans_ == 0, "replica IPC mapping still has live scatter plans");
+    c10::cuda::CUDAGuard guard(device_);
+    TORCH_CHECK(cudaIpcCloseMemHandle(base_) == cudaSuccess, "replica IPC close failed");
+    base_ = nullptr;
+  }
+ private:
+  void* base_ = nullptr;
+  int64_t offset_, bytes_;
+  int device_, live_plans_ = 0;
+  std::mutex mutex_;
+};
+
+__global__ void replica_page_scatter_kernel(const int64_t* descriptors,
+    uint8_t* destination, int64_t count, int64_t page_bytes, bool vectorized) {
+  for (int64_t page = blockIdx.x; page < count; page += gridDim.x) {
+    const auto* row = descriptors + page * 3;
+    const auto* source = reinterpret_cast<const uint8_t*>(row[0]) + row[1];
+    auto* target = destination + row[2];
+    if (vectorized) {
+      const auto* src = reinterpret_cast<const uint4*>(source);
+      auto* dst = reinterpret_cast<uint4*>(target);
+      for (int64_t i = threadIdx.x; i < page_bytes / 16; i += blockDim.x) dst[i] = src[i];
+    } else {
+      for (int64_t i = threadIdx.x; i < page_bytes; i += blockDim.x) target[i] = source[i];
+    }
+  }
+}
+
+class ReplicaPeerPagePlan {
+  struct State {
+    torch::Tensor destination, host, descriptors;
+    std::vector<std::shared_ptr<ReplicaIpcMapping>> mappings;
+    cudaEvent_t fence = nullptr;
+    bool submitted = false, reliable_fence = true;
+    ~State() {
+      if (fence) cudaEventDestroy(fence);
+      for (auto& mapping : mappings) mapping->release_plan();
+    }
+  };
+ public:
+  ReplicaPeerPagePlan(std::vector<std::shared_ptr<ReplicaIpcMapping>> peers,
+      std::vector<int64_t> offsets, std::vector<int64_t> sizes,
+      torch::Tensor destination, torch::Tensor pages)
+      : state_(std::make_unique<State>()) {
+    TORCH_CHECK(destination.is_cuda() && destination.scalar_type() == torch::kUInt8 &&
+                    destination.dim() == 2 && destination.is_contiguous() && destination.numel() > 0,
+                "scatter destination must be contiguous CUDA uint8 pages");
+    TORCH_CHECK(pages.device().is_cpu() && pages.scalar_type() == torch::kInt64 &&
+                    pages.dim() == 2 && pages.size(1) == 3 && pages.is_contiguous(),
+                "scatter page table must be contiguous CPU int64 [N,3]");
+    TORCH_CHECK(peers.size() < 8 && peers.size() == offsets.size() && peers.size() == sizes.size(),
+                "invalid scatter source members");
+    device_ = destination.get_device();
+    page_bytes_ = destination.size(1);
+    count_ = pages.size(0);
+    state_->destination = destination;
+    c10::cuda::CUDAGuard guard(device_);
+    std::vector<uintptr_t> sources;
+    sources.reserve(peers.size());
+    state_->mappings.reserve(peers.size());
+    for (size_t peer = 0; peer < peers.size(); ++peer) {
+      TORCH_CHECK(peers[peer] && offsets[peer] >= 0 && sizes[peer] > 0 &&
+                      sizes[peer] % page_bytes_ == 0 &&
+                      offsets[peer] <= std::numeric_limits<int64_t>::max() - sizes[peer],
+                  "invalid scatter source size or offset");
+      state_->mappings.push_back(peers[peer]);
+      uintptr_t base;
+      try {
+        base = peers[peer]->acquire_plan(device_, offsets[peer] + sizes[peer]);
+      } catch (...) {
+        state_->mappings.pop_back();
+        throw;
+      }
+      TORCH_CHECK(base <= std::numeric_limits<uintptr_t>::max() - offsets[peer] - sizes[peer],
+                  "scatter source address overflows");
+      sources.push_back(base + offsets[peer]);
+    }
+    const auto target = reinterpret_cast<uintptr_t>(destination.data_ptr());
+    TORCH_CHECK(target <= std::numeric_limits<uintptr_t>::max() - destination.numel(),
+                "scatter destination address overflows");
+    for (size_t peer = 0; peer < sources.size(); ++peer) {
+      TORCH_CHECK(target >= sources[peer] + sizes[peer] ||
+                      sources[peer] >= target + destination.numel(),
+                  "scatter source and destination overlap");
+    }
+    state_->host = torch::empty({count_, 3}, torch::TensorOptions().dtype(torch::kInt64).pinned_memory(true));
+    const auto* input = pages.data_ptr<int64_t>();
+    auto* output = state_->host.data_ptr<int64_t>();
+    std::set<int64_t> destinations;
+    vectorized_ = page_bytes_ % 16 == 0 && target % 16 == 0;
+    for (auto source : sources) vectorized_ = vectorized_ && source % 16 == 0;
+    for (int64_t i = 0; i < count_; ++i) {
+      const int64_t member = input[i * 3], src = input[i * 3 + 1], dst = input[i * 3 + 2];
+      TORCH_CHECK(member >= 0 && member < static_cast<int64_t>(sources.size()) &&
+                      src >= 0 && src < sizes[member] / page_bytes_ &&
+                      dst >= 0 && dst < destination.size(0), "scatter page index out of bounds");
+      TORCH_CHECK(destinations.insert(dst).second, "scatter destination pages overlap");
+      output[i * 3] = static_cast<int64_t>(sources[member]);
+      output[i * 3 + 1] = src * page_bytes_;
+      output[i * 3 + 2] = dst * page_bytes_;
+    }
+    C10_CUDA_CHECK(cudaEventCreateWithFlags(&state_->fence, cudaEventDisableTiming));
+    try {
+      state_->submitted = true;
+      state_->descriptors = state_->host.to(destination.device(), true);
+      C10_CUDA_CHECK(cudaEventRecord(state_->fence, at::cuda::getCurrentCUDAStream(device_)));
+    } catch (...) {
+      state_.release();
+      throw;
+    }
+  }
+  ~ReplicaPeerPagePlan() {
+    if (!state_) return;
+    try {
+      c10::cuda::CUDAGuard guard(device_);
+      if (!state_->reliable_fence ||
+          (state_->submitted && cudaEventQuery(state_->fence) != cudaSuccess)) state_.release();
+      else state_.reset();
+    } catch (...) {
+      state_.release();
+    }
+  }
+  void launch() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    TORCH_CHECK(state_ && state_->reliable_fence, "replica scatter plan is closed or poisoned");
+    c10::cuda::CUDAGuard guard(device_);
+    auto stream = at::cuda::getCurrentCUDAStream(device_);
+    C10_CUDA_CHECK(cudaStreamWaitEvent(stream, state_->fence, 0));
+    state_->reliable_fence = false;
+    if (count_) {
+      replica_page_scatter_kernel<<<std::min<int64_t>(count_, 256), 128, 0, stream>>>(
+          state_->descriptors.data_ptr<int64_t>(), state_->destination.data_ptr<uint8_t>(),
+          count_, page_bytes_, vectorized_);
+      C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+    C10_CUDA_CHECK(cudaEventRecord(state_->fence, stream));
+    state_->reliable_fence = true;
+  }
+  void close() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!state_) return;
+    c10::cuda::CUDAGuard guard(device_);
+    TORCH_CHECK(state_->reliable_fence && cudaEventQuery(state_->fence) == cudaSuccess,
+                "replica scatter plan is busy; backing retained");
+    state_.reset();
+  }
+ private:
+  std::unique_ptr<State> state_;
+  int device_;
+  int64_t page_bytes_, count_;
+  bool vectorized_;
+  std::mutex mutex_;
+};
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  py::class_<ReplicaIpcMapping, std::shared_ptr<ReplicaIpcMapping>>(m, "ReplicaIpcMapping")
+      .def(py::init<const std::string&, int64_t, int64_t, int>())
+      .def("close", &ReplicaIpcMapping::close, py::call_guard<py::gil_scoped_release>());
+  py::class_<ReplicaIpcExport>(m, "ReplicaIpcExport")
+      .def(py::init<torch::Tensor>())
+      .def("handle", &ReplicaIpcExport::handle)
+      .def_property_readonly("offset", &ReplicaIpcExport::offset)
+      .def_property_readonly("allocation_bytes", &ReplicaIpcExport::allocation_bytes)
+      .def("close", &ReplicaIpcExport::close, py::call_guard<py::gil_scoped_release>());
+  py::class_<ReplicaPeerPagePlan>(m, "ReplicaPeerPagePlan")
+      .def(py::init<std::vector<std::shared_ptr<ReplicaIpcMapping>>, std::vector<int64_t>,
+                    std::vector<int64_t>, torch::Tensor, torch::Tensor>())
+      .def("launch", &ReplicaPeerPagePlan::launch, py::call_guard<py::gil_scoped_release>())
+      .def("close", &ReplicaPeerPagePlan::close, py::call_guard<py::gil_scoped_release>());
   m.def(
       "single_layer_kv_transfer",
       [](torch::Tensor lmc_key_value_cache,

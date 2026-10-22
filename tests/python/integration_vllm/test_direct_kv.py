@@ -456,6 +456,349 @@ def test_detached_read_plan_submits_on_async_stream():
     backend.close()
 
 
+def _async_layer_engine(monkeypatch, layers=3):
+    from types import SimpleNamespace as NS
+    from tutti.engine.core import _AsyncReadPlan
+    monkeypatch.setattr(_AsyncReadPlan, "_timing_event", staticmethod(lambda: None))
+    engine = object.__new__(KVEngine)
+    engine._closed = False
+    engine._direct_submit_lock = threading.RLock()
+    engine._active_read_plan = None
+    engine._foreground_read_submit_pending = 0
+    engine._async_read_plans = set()
+    engine.begin_prefill_feeder(True)
+    engine.advance_prefill_feeder(0)
+    engine._store = NS(_accel_id=None)
+    calls, completions, ended = [], {}, []
+    class Completion:
+        def __init__(self):
+            self.done = False
+            self.wait_count = 0
+        def poll(self):
+            return True if self.done else None
+        def wait(self):
+            self.wait_count += 1
+            self.done = True
+    backend = NS(begin_detached_read_plan=lambda keys: object(),
+                 end_detached_read_plan=lambda plan: ended.append(plan))
+    def load(keys, layer, tables, target_plan):
+        calls.append((layer, tuple(keys), tuple(tuple(t) for t in tables)))
+        completion = Completion()
+        completions[layer] = completion
+        return completion
+    engine._transfer = NS(_backend=backend, load_layer=load)
+    return engine, calls, completions, ended
+
+
+def _wait_until(predicate, seconds=2):
+    import time
+    deadline = time.monotonic() + seconds
+    while not predicate():
+        assert time.monotonic() < deadline, "background feeder did not progress"
+        time.sleep(.001)
+
+
+def test_async_layer_list_pauses_between_prefills_without_host_sync(monkeypatch):
+    from types import SimpleNamespace as NS
+    from tutti.engine.core import _AsyncReadPlan
+    engine, calls, completed, ended = _async_layer_engine(monkeypatch)
+    engine.end_prefill_feeder()
+    engine._active_read_plan = NS(failed=None, all_io_done=lambda: True,
+        fence_event=lambda callback: pytest.fail("gate must not use only the last fence"))
+    plan = _AsyncReadPlan(engine, [b"queued"], [[7]], (0, 1, 2))
+    try:
+        assert not plan._feeder_done.wait(.05)
+        assert calls == []
+        engine.begin_prefill_feeder(True)
+        engine.advance_prefill_feeder(0)
+        _wait_until(lambda: len(calls) == 1)
+        assert plan.submitted_layers == (0,)
+        assert plan.poll() is None
+        assert len(calls) == 1
+        engine.end_prefill_feeder()
+        completed[0].done = True
+        assert not plan._feeder_done.wait(.05)
+        assert len(calls) == 1
+        engine.begin_prefill_feeder(False)
+        engine.advance_prefill_feeder(1)
+        assert not plan._feeder_done.wait(.05)
+        assert len(calls) == 1
+        engine.begin_prefill_feeder(True)
+        engine.advance_prefill_feeder(0)
+        _wait_until(lambda: len(calls) == 2)
+        completed[1].done = True
+        engine.advance_prefill_feeder(1)
+        _wait_until(lambda: len(calls) == 3)
+        completed[2].done = True
+        assert plan._feeder_done.wait(2)
+        assert plan.poll() is True
+        assert [c[0] for c in calls] == [0, 1, 2]
+        assert all(c.wait_count == 0 for c in completed.values())
+        assert len(ended) == 1
+    finally:
+        plan.abort()
+
+
+@pytest.mark.parametrize("main_done,index_done", [(False, False), (True, False), (False, True), (True, True)])
+def test_all_io_done_checks_both_frontend_streams(main_done, index_done):
+    plan = object.__new__(_DirectAllLayerReadPlan)
+    plan.physical_layers = (2, 0)
+    plan.terminal_failure = None
+    plan._all_io_complete = False
+    plan._ready_cond = threading.Condition()
+    states = [index_done, main_done]
+    events = [SimpleNamespace(query=lambda i=i: states[i],
+                synchronize=lambda: pytest.fail("host synchronization is forbidden"))
+              for i in range(2)]
+    plan.read_ready_events = {0: events[0]}
+    assert not plan.all_io_done(), "a partial submission cannot open the gate"
+    plan.read_ready_events[1] = events[1]
+    assert plan.all_io_done() is (main_done and index_done)
+    states[:] = [True, True]
+    assert plan.all_io_done()
+    plan.terminal_failure = RuntimeError("late IO failure")
+    assert not plan.all_io_done()
+
+
+def test_all_io_done_query_error_fails_closed():
+    plan = object.__new__(_DirectAllLayerReadPlan)
+    plan.physical_layers = (0,)
+    plan.terminal_failure = None
+    plan._all_io_complete = False
+    plan._ready_cond = threading.Condition()
+    plan.on_failure = None
+    error = RuntimeError("CUDA event query failed")
+    def query():
+        raise error
+    plan.read_ready_events = {0: SimpleNamespace(query=query)}
+    assert not plan.all_io_done()
+    assert plan.failed is error
+
+
+def test_background_waits_for_front_read_tail_and_stays_closed_after_prefill(monkeypatch):
+    from tutti.engine.core import _AsyncReadPlan
+    engine, calls, completed, ended = _async_layer_engine(monkeypatch, layers=1)
+    plan = object.__new__(_DirectAllLayerReadPlan)
+    plan.physical_layers = (2, 0)
+    plan.terminal_failure = None
+    plan._all_io_complete = False
+    plan._ready_cond = threading.Condition()
+    state = [False, True]
+    plan.read_ready_events = {i: SimpleNamespace(query=lambda i=i: state[i]) for i in range(2)}
+    engine._active_read_plan = plan
+    background = _AsyncReadPlan(engine, [b"queued"], [[7]], (0,))
+    try:
+        assert not background._feeder_done.wait(.05)
+        assert calls == [], "main tail alone cannot permit background reads"
+        state[0] = True
+        _wait_until(lambda: len(calls) == 1)
+        completed[0].done = True
+        assert background._feeder_done.wait(2)
+        assert background.poll() is True
+        engine.end_prefill_feeder()
+        assert not engine._background_read_allowed()
+        engine.begin_prefill_feeder(False)
+        engine.advance_prefill_feeder(0)
+        assert not engine._background_read_allowed()
+    finally:
+        background.abort()
+
+
+def test_new_foreground_plan_takes_priority_over_unsubmitted_background_layers(monkeypatch):
+    from tutti.engine.core import _AsyncReadPlan
+    engine, calls, completed, ended = _async_layer_engine(monkeypatch)
+    plan = _AsyncReadPlan(engine, [b"queued"], [[7]], (0, 1, 2))
+    try:
+        _wait_until(lambda: len(calls) == 1)
+        engine._foreground_read_submit_pending = 1
+        completed[0].done = True
+        assert not plan._feeder_done.wait(.05)
+        assert len(calls) == 1
+        assert plan.submitted_layers == (0,)
+        engine._foreground_read_submit_pending = 0
+        engine.advance_prefill_feeder(1)
+        _wait_until(lambda: len(calls) == 2)
+        completed[1].done = True
+        engine.advance_prefill_feeder(2)
+        _wait_until(lambda: len(calls) == 3)
+        completed[2].done = True
+        assert plan._feeder_done.wait(2)
+        assert plan.poll() is True
+    finally:
+        engine._foreground_read_submit_pending = 0
+        plan.abort()
+
+
+def test_cancel_partial_async_read_keeps_submitted_io_until_drained(monkeypatch):
+    from tutti.engine.core import _AsyncReadPlan
+    engine, calls, completed, ended = _async_layer_engine(monkeypatch)
+    plan = _AsyncReadPlan(engine, [b"queued"], [[7]], (0, 1, 2))
+    _wait_until(lambda: len(calls) == 1)
+    plan.abort()
+    assert len(calls) == 1
+    assert completed[0].wait_count == 1
+    assert len(ended) == 1
+
+
+@pytest.mark.parametrize("late_failure", [False, True])
+def test_managed_async_cleanup_never_blocks_poll_or_releases_early(monkeypatch, late_failure):
+    from tutti.engine.core import _AsyncReadPlan
+    engine, calls, completed, ended = _async_layer_engine(monkeypatch, layers=1)
+    backend = engine._transfer._backend
+    backend.manages_background_reads = True
+    owner = threading.get_ident()
+    cleanup_entered, release = threading.Event(), threading.Event()
+    backend.prepare_detached_read = lambda *args: None
+    backend.start_detached_read = lambda *args: None
+    def load(*args, **kwargs):
+        return type("Ready", (), {"poll": lambda self: True})()
+    engine._transfer.load_layer = load
+    def cleanup(target):
+        assert threading.get_ident() != owner
+        cleanup_entered.set()
+        assert release.wait(3)
+        if late_failure and not ended:
+            ended.append("failed")
+            raise RuntimeError("late owned IO failure")
+        ended.append(target)
+    backend.end_detached_read_plan = cleanup
+    plan = _AsyncReadPlan(engine, [b"queued"], [[7]], (0,))
+    try:
+        assert cleanup_entered.wait(2)
+        assert plan.poll() is None
+        assert not plan._ended
+    finally:
+        release.set()
+        plan._feeder.join(3)
+    if late_failure:
+        assert plan.failure is not None
+        assert plan.poll() is None
+        plan._feeder.join(3)
+        assert plan.poll() is False
+    else:
+        assert plan.poll() is True
+
+
+def test_managed_async_cleanup_returned_error_stays_failed(monkeypatch):
+    from tutti.engine.core import _AsyncReadPlan
+    engine, calls, completed, ended = _async_layer_engine(monkeypatch, layers=1)
+    backend = engine._transfer._backend
+    backend.manages_background_reads = True
+    backend.prepare_detached_read = lambda *args: None
+    backend.start_detached_read = lambda *args: None
+    engine._transfer.load_layer = lambda *args, **kwargs: type(
+        "Ready", (), {"poll": lambda self: True})()
+    error = RuntimeError("sticky owned IO failure")
+    backend.end_detached_read_plan = lambda target: error
+    plan = _AsyncReadPlan(engine, [b"queued"], [[7]], (0,))
+    plan._feeder.join(3)
+    assert plan.poll() is False and plan.failure is error
+    assert plan not in engine._async_read_plans
+
+
+def test_prefill_close_serializes_with_actual_background_enqueue(monkeypatch):
+    engine, _, _, _ = _async_layer_engine(monkeypatch, layers=1)
+    entered, release, closed = threading.Event(), threading.Event(), threading.Event()
+    def submit():
+        with engine._background_submit_scope() as allowed:
+            assert allowed
+            entered.set()
+            assert release.wait(3)
+    def close():
+        engine.end_prefill_feeder()
+        closed.set()
+    submitting = threading.Thread(target=submit)
+    submitting.start()
+    assert entered.wait(2)
+    closing = threading.Thread(target=close)
+    closing.start()
+    try:
+        assert not closed.wait(.03)
+    finally:
+        release.set()
+        submitting.join(3)
+        closing.join(3)
+    assert closed.is_set()
+    with engine._background_submit_scope() as allowed:
+        assert not allowed
+
+
+def test_async_partial_submit_failure_does_not_release_blocks_before_accepted_io_finishes(monkeypatch):
+    from types import SimpleNamespace as NS
+    from tutti.engine.core import _AsyncReadPlan
+    engine, calls, completed, ended = _async_layer_engine(monkeypatch)
+    accepted_done = threading.Event()
+    completion = NS(poll=lambda: True if accepted_done.is_set() else None,
+                    wait=lambda: accepted_done.set())
+    engine._store._deferred_completions = [completion]
+    def load(*args, **kwargs):
+        error = RuntimeError("partial read submit failed")
+        error.tutti_submitted_completions = (completion,)
+        raise error
+    engine._transfer.load_layer = load
+    plan = _AsyncReadPlan(engine, [b"queued"], [[7]], (0, 1, 2))
+    assert plan._feeder_done.wait(2)
+    assert engine._store._deferred_completions == []
+    assert plan.poll() is None and ended == []
+    accepted_done.set()
+    assert plan.poll() is False and len(ended) == 1
+    assert str(plan.failure) == "partial read submit failed"
+
+
+def test_background_failure_stops_before_next_entity_and_optional_timing_does_not_leak(monkeypatch):
+    from tutti.engine.core import _AsyncReadPlan
+    engine, calls, completed, ended = _async_layer_engine(monkeypatch)
+    plan = _AsyncReadPlan(engine, [b"queued"], [[7]], (0, 1, 2))
+    _wait_until(lambda: len(calls) == 1)
+    def failed():
+        raise RuntimeError("device read failed")
+    completed[0].poll = failed
+    assert plan._feeder_done.wait(2)
+    assert plan.poll() is None and ended == []
+    assert [c[0] for c in calls] == [0]
+    completed[0].poll = lambda: True
+    assert plan.poll() is False and len(ended) == 1
+    assert str(plan.failure) == "device read failed"
+
+
+@pytest.mark.parametrize("fail_at", ["timing", "thread"])
+def test_async_constructor_failure_closes_unsubmitted_detached_plan(monkeypatch, fail_at):
+    from tutti.engine.core import _AsyncReadPlan
+    engine, calls, completed, ended = _async_layer_engine(monkeypatch)
+    def fail(*args, **kwargs):
+        raise RuntimeError("start failed")
+    if fail_at == "timing":
+        monkeypatch.setattr(_AsyncReadPlan, "_timing_event", staticmethod(lambda: object()))
+        engine._store.record_read_async_event = fail
+    else:
+        monkeypatch.setattr(threading.Thread, "start", fail)
+    with pytest.raises(RuntimeError, match="start failed"):
+        _AsyncReadPlan(engine, [b"queued"], [[7]], (0, 1, 2))
+    assert calls == [] and len(ended) == 1
+
+
+def test_async_abort_observation_error_retains_plan_until_io_is_terminal(monkeypatch):
+    from tutti.engine.core import _AsyncReadPlan
+    engine, calls, completed, ended = _async_layer_engine(monkeypatch)
+    plan = _AsyncReadPlan(engine, [b"queued"], [[7]], (0, 1, 2))
+    engine._async_read_plans.add(plan)
+    _wait_until(lambda: len(calls) == 1)
+    def fail():
+        raise RuntimeError("observation unavailable")
+    completed[0].wait = fail
+    error = engine._abort_async_read_plans()
+    assert str(error) == "observation unavailable"
+    assert plan in engine._async_read_plans and ended == []
+    assert not plan._ended
+    with pytest.raises(RuntimeError, match="observation unavailable"):
+        engine.close()
+    assert not engine._closed
+    completed[0].wait = lambda: None
+    completed[0].io_terminal = True
+    assert engine._abort_async_read_plans() is None
+    assert not engine._async_read_plans and len(ended) == 1
+
+
 def test_direct_target_plan_rejects_chunk_not_in_immutable_plan():
     runtime = FakeRuntime()
     store = FakeStoreOwner(runtime)
@@ -1099,6 +1442,21 @@ class EventStore:
         self.log.append(("compute_wait", event))
 
 
+def test_direct_plan_keeps_backend_entity_fence(monkeypatch):
+    log = []
+    engine = _direct_engine(log)
+    ready = object()
+    def load(keys, layer, tables):
+        completion = FakeCompletion(log, layer)
+        completion.fence_event = ready
+        return completion
+    monkeypatch.setattr(engine._transfer._backend, "get_paged_batch", load)
+    plan = _DirectAllLayerReadPlan(engine, [b"f" * 16], [[1, 2]], (0,))
+    assert plan.fence_event(0) is ready
+    assert plan.handles[0].fence_event is ready
+    assert not any(item[0] == "read_record" for item in log)
+
+
 def _direct_engine(log):
     backend = EventBackend(log)
     transfer = DirectTransfer(
@@ -1112,6 +1470,10 @@ def _direct_engine(log):
     engine._store = EventStore(log)
     engine._inflight = []
     engine._max_in_flight_operations = 0
+    engine._direct_submit_lock = threading.RLock()
+    engine._foreground_read_submit_pending = 0
+    engine._active_read_plan = None
+    engine.begin_prefill_feeder(False)
     return engine
 
 
@@ -1152,6 +1514,112 @@ def test_staged_read_plan_submission_behavior_is_unchanged(monkeypatch):
     assert all(handle.wait_count == 0 for handle in plan._handles.values())
 
 
+@pytest.mark.parametrize("independent", [False, True])
+def test_direct_read_lock_does_not_block_write_for_independent_backend(independent):
+    import threading
+    log = []
+    engine = _direct_engine(log)
+    engine._direct_submit_lock = threading.RLock()
+    engine._direct_read_lock = threading.RLock()
+    backend = engine._transfer._backend
+    backend.independent_read_write = independent
+    entered, release, written = threading.Event(), threading.Event(), threading.Event()
+    errors = []
+    original = backend.get_paged_batch
+
+    def read(keys, layer, blocks):
+        entered.set()
+        assert release.wait(3)
+        return original(keys, layer, blocks)
+
+    def run(call):
+        try:
+            call()
+        except Exception as exc:
+            errors.append(exc)
+
+    backend.get_paged_batch = read
+    reader = threading.Thread(target=run, args=(lambda: engine.load_layer([b"r" * 16], 0, [[2, 7]]),))
+    writer = threading.Thread(target=run, args=(lambda: (
+        engine.store_layer([b"w" * 16], 0, [[3, 8]]), written.set()),))
+    reader.start()
+    try:
+        assert entered.wait(2)
+        writer.start()
+        assert written.wait(0.2) is independent
+    finally:
+        release.set()
+        reader.join(3)
+        if writer.ident is not None:
+            writer.join(3)
+    assert not errors and not reader.is_alive() and not writer.is_alive()
+    assert written.is_set()
+
+
+def test_feeder_outer_lock_is_independent_for_replica_backend(monkeypatch):
+    import threading
+    engine = _direct_engine([])
+    engine._transfer._backend.independent_read_write = True
+    engine._direct_submit_lock = threading.RLock()
+    engine._direct_read_lock = threading.RLock()
+    entered, release, written = threading.Event(), threading.Event(), threading.Event()
+    original = engine._transfer._backend.get_paged_batch
+
+    def read(keys, layer, blocks):
+        if layer == 1:
+            entered.set()
+            assert release.wait(3)
+        return original(keys, layer, blocks)
+
+    engine._transfer._backend.get_paged_batch = read
+    monkeypatch.setattr("torch.cuda.is_available", lambda: True)
+    monkeypatch.setattr("torch.cuda.Event", lambda enable_timing=False: object())
+    plan = _DirectAllLayerReadPlan(engine, [b"r" * 16], [[2, 7]], (0, 1, 2))
+    writer = threading.Thread(target=lambda: (
+        engine.store_layer([b"w" * 16], 0, [[3, 8]]), written.set()))
+    try:
+        assert entered.wait(2)
+        writer.start()
+        assert written.wait(1), "feeder peer wait still holds the write lock"
+    finally:
+        release.set()
+        plan.join_feeder()
+        if writer.ident is not None:
+            writer.join(3)
+    assert plan.failed is None
+
+
+def test_latest_read_event_does_not_wait_for_feeder_submission(monkeypatch):
+    import threading
+    engine = _direct_engine([])
+    entered, release, queried = threading.Event(), threading.Event(), threading.Event()
+    original = engine._transfer._backend.get_paged_batch
+
+    def read(keys, layer, blocks):
+        if layer == 1:
+            entered.set()
+            assert release.wait(3)
+        return original(keys, layer, blocks)
+
+    engine._transfer._backend.get_paged_batch = read
+    monkeypatch.setattr("torch.cuda.is_available", lambda: True)
+    monkeypatch.setattr("torch.cuda.Event", lambda enable_timing=False: object())
+    plan = _DirectAllLayerReadPlan(engine, [b"r" * 16], [[2, 7]], (0, 1, 2))
+    result = []
+    reader = threading.Thread(target=lambda: (
+        result.append(plan.latest_read_event()), result.append(plan.all_io_done()), queried.set()))
+    try:
+        assert entered.wait(2)
+        reader.start()
+        assert queried.wait(1), "read-tail snapshot blocked on the feeder's long submission lock"
+        assert result == [plan.read_ready_events[0], False]
+    finally:
+        release.set()
+        plan.join_feeder()
+        if reader.ident is not None:
+            reader.join(3)
+
+
 def test_direct_all_layer_constructor_submits_complete_order(monkeypatch):
     log = []
     engine = _direct_engine(log)
@@ -1177,6 +1645,47 @@ def test_direct_all_layer_constructor_submits_complete_order(monkeypatch):
     assert plan.next_read_to_submit == 3
     assert set(plan.handles) == {0, 1, 2}
     assert set(plan.read_ready_events) == {0, 1, 2}
+
+
+def test_replica_collectives_submit_only_on_ordered_main_thread_callbacks(monkeypatch):
+    log = []
+    engine = _direct_engine(log)
+    engine._transfer._backend.requires_ordered_collectives = True
+    monkeypatch.setattr("torch.cuda.is_available", lambda: True)
+    monkeypatch.setattr("torch.cuda.Event", lambda enable_timing=False: object())
+    plan = _DirectAllLayerReadPlan(
+        engine, [b"replica" * 4], [[2, 7]], (0, 1, 2)
+    )
+    assert plan._feeder_thread is None
+    assert [item for item in log if item[0] == "read_submit"] == [("read_submit", 0)]
+    plan.wait_layer(0, 0)
+    plan.wait_layer(1, 1)
+    before = list(log)
+    plan.wait_layer(1, 1)
+    assert log == before
+    plan.wait_layer(2, 2)
+    plan.require_complete()
+    assert [item for item in log if item[0] == "read_submit"] == [
+        ("read_submit", 0), ("read_submit", 1), ("read_submit", 2)
+    ]
+
+
+def test_owned_prefetch_starts_before_first_collective_and_abort_stops_it(monkeypatch):
+    log = []
+    engine = _direct_engine(log)
+    backend = engine._transfer._backend
+    backend.requires_ordered_collectives = True
+    backend.begin_prefetch = lambda keys, blocks, layers: log.append(("prefetch", tuple(layers)))
+    backend.join_prefetch = lambda: log.append(("join_prefetch",))
+    backend.stop_prefetch = lambda: log.append(("stop_prefetch",))
+    monkeypatch.setattr("torch.cuda.is_available", lambda: True)
+    monkeypatch.setattr("torch.cuda.Event", lambda enable_timing=False: object())
+    plan = _DirectAllLayerReadPlan(engine, [b"r" * 32], [[2, 7]], (0, 1, 2))
+    assert log[:2] == [("prefetch", (0, 1, 2)), ("read_submit", 0)]
+    plan.abort()
+    assert ("stop_prefetch",) in log
+    assert ("join_prefetch",) in log
+    assert not any(item == ("read_submit", 1) for item in log)
 
 
 def test_direct_feeder_submits_without_kick_and_join_is_idempotent(monkeypatch):

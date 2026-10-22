@@ -148,6 +148,7 @@ class TuttiConnectorMetadata(KVConnectorMetadata):
     #: 本步调度的 token 总数：worker 用它把本步 GPU 计算耗时折成
     #: compute_ms(tokens) 样本（load_policy 的计算侧拟合）。
     step_tokens: int = 0
+    prefill_work: bool = False
 
 
 class TuttiConnectorV1(KVConnectorBase_V1):
@@ -161,6 +162,8 @@ class TuttiConnectorV1(KVConnectorBase_V1):
         """三参与 vLLM 工厂签名对齐；role 决定本实例承载的回调面。"""
         super().__init__(vllm_config, role, kv_cache_config)
         extra = resolve_geometry(extra_config(vllm_config), kv_cache_config)
+        from .replica_layout import validate_replica_io
+        validate_replica_io(vllm_config, extra)
         self._vllm_config = vllm_config
         self._layerwise_kv = "kv_layer_page_bytes" in extra
         self._cache_hook_handles = ()
@@ -556,6 +559,12 @@ class TuttiConnectorV1(KVConnectorBase_V1):
             self._live_requests.pop(req_id, None)
             self._pending_loads.pop(req_id, None)
             self._load_starts.pop(req_id, None)
+        prefill_work = False
+        scheduled_tokens = getattr(scheduler_output, "num_scheduled_tokens", None) or {}
+        for req_id, count in scheduled_tokens.items():
+            live = self._live_requests.get(req_id)
+            if live is not None and count > 0:
+                prefill_work |= live.num_computed_tokens < len(live.prompt_token_ids)
         scheduled: list[str] = []
         for new_req in scheduler_output.scheduled_new_reqs:
             block_ids = flatten_blocks(new_req.block_ids)
@@ -655,7 +664,7 @@ class TuttiConnectorV1(KVConnectorBase_V1):
             )
         return TuttiConnectorMetadata(
             requests=requests, evicted_keys=evicted_keys,
-            step_tokens=int(step_tokens or 0),
+            step_tokens=int(step_tokens or 0), prefill_work=prefill_work,
         )
 
     def update_connector_output(self, connector_output) -> None:

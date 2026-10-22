@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 import logging
 import os
 import threading
@@ -206,9 +206,11 @@ class _AsyncReadPlan:
             raise ValueError("async read plan requires keys and layers")
         backend = getattr(engine._transfer, "_backend", None)
         self._backend = backend
+        self._managed = bool(getattr(backend, "manages_background_reads", False))
         self._target_plan = backend.begin_detached_read_plan(self.keys)
         self._lock = threading.Lock()
         self._completions: list = []
+        self._submitted_layers: list[int] = []
         self._polled = 0
         self.failure: BaseException | None = None
         self._ended = False
@@ -219,12 +221,35 @@ class _AsyncReadPlan:
         store = engine._store
         self._origin = self._timing_event()
         self._last = None
-        if self._origin is not None:
-            store.record_read_async_event(self._origin)
-        self._feeder = threading.Thread(
-            target=self._run, name="tutti-async-read-feeder", daemon=True
-        )
-        self._feeder.start()
+        record = getattr(store, "record_read_async_event", None)
+        try:
+            if self._origin is not None and callable(record):
+                self._origin = record(self._origin)
+            else:
+                self._origin = None
+            if self._managed:
+                backend.prepare_detached_read(
+                    self._target_plan, self.keys, self.block_tables, self.physical_layers,
+                    lambda: None if self._stop.is_set() else engine._background_read_token(),
+                    engine._background_submit_scope,
+                )
+            self._feeder = threading.Thread(
+                target=self._run, name="tutti-async-read-feeder", daemon=True
+            )
+            engine._async_read_plans.add(self)
+            self._feeder.start()
+        except Exception as exc:
+            if self._managed:
+                self.failure = exc
+                self._stop.set()
+                engine._async_read_plans.add(self)
+                self._feeder = threading.Thread(target=self._finish_managed,
+                    name="tutti-async-read-cleanup", daemon=True)
+                self._feeder.start()
+            else:
+                engine._async_read_plans.discard(self)
+                self._backend.end_detached_read_plan(self._target_plan)
+                raise
 
     @staticmethod
     def _timing_event():
@@ -237,35 +262,92 @@ class _AsyncReadPlan:
             pass
         return None
 
+    @property
+    def submitted_layers(self) -> tuple[int, ...]:
+        with self._lock:
+            return tuple(self._submitted_layers)
+
     def _run(self) -> None:
         engine = self.engine
         _bind_thread_cuda_device(engine._store)
         try:
+            if self._managed:
+                self._backend.start_detached_read(self._target_plan)
+            last_token = None
             for physical in self.physical_layers:
-                if self._stop.is_set():
+                completion = None
+                while not self._stop.is_set():
+                    if self._managed:
+                        completion = engine._transfer.load_layer(
+                            self.keys, physical, self.block_tables, target_plan=self._target_plan)
+                        break
+                    with engine._direct_submit_lock:
+                        if self._stop.is_set():
+                            break
+                        token = engine._background_read_token()
+                        if token is not None and token != last_token:
+                            with engine._background_submit_scope() as allowed:
+                                if allowed:
+                                    last_token = token
+                                    with nvtx_range(f"tutti.async.layer_submit|physical={physical}|chunks={len(self.keys)}|feeder={token}"):
+                                        completion = engine._transfer.load_layer(
+                                            self.keys, physical, self.block_tables,
+                                            target_plan=self._target_plan,
+                                        )
+                            if completion is not None:
+                                break
+                    self._stop.wait(0.001)
+                if completion is None:
                     break
-                with engine._direct_submit_lock:
-                    completion = engine._transfer.load_layer(
-                        self.keys, physical, self.block_tables,
-                        target_plan=self._target_plan,
-                    )
                 with self._lock:
                     self._completions.append(completion)
+                    self._submitted_layers.append(physical)
+                while not self._stop.is_set():
+                    state = completion.poll()
+                    observation_error = getattr(completion, "observation_error", None)
+                    if state is None and observation_error is not None:
+                        raise observation_error
+                    if state is not None:
+                        if state is False:
+                            raise RuntimeError(f"async direct layer {physical} read failed")
+                        break
+                    self._stop.wait(0.001)
             last = self._timing_event()
-            if last is not None:
-                engine._store.record_read_async_event(last)
-                self._last = last
+            record = getattr(engine._store, "record_read_async_event", None)
+            if last is not None and callable(record):
+                self._last = record(last)
         except Exception as exc:  # 提交失败：已提交的照常结算后再报失败
+            self._stop.set()
+            retained = tuple(getattr(exc, "tutti_submitted_completions", ()))
+            if retained:
+                with self._lock:
+                    self._completions.extend(retained)
+                deferred = getattr(engine._store, "_deferred_completions", None)
+                if deferred is not None:
+                    deferred[:] = [completion for completion in deferred if completion not in retained]
             if self.failure is None:
                 self.failure = exc
             _LOG.error("ASYNC_READ_SUBMIT_FAILED chunks=%d: %s", len(self.keys), exc)
         finally:
+            if self._managed:
+                try:
+                    self._end()
+                except Exception as exc:
+                    if self.failure is None:
+                        self.failure = exc
             self._feeder_done.set()
 
     def poll(self) -> bool | None:
         """None = 未完成；True = 全部层成功；False = 失败（已提交 IO 均已结算）。"""
         if self._ended:
             return self.failure is None
+        if self._managed:
+            if self._feeder_done.is_set():
+                self._feeder_done.clear()
+                self._feeder = threading.Thread(target=self._finish_managed,
+                    name="tutti-async-read-cleanup", daemon=True)
+                self._feeder.start()
+            return None
         while True:
             with self._lock:
                 if self._polled >= len(self._completions):
@@ -274,13 +356,20 @@ class _AsyncReadPlan:
             try:
                 state = completion.poll()
             except Exception as exc:
-                state = False
                 if self.failure is None:
                     self.failure = exc
-            if state is None:
+                self._stop.set()
                 return None
-            if state is False and self.failure is None:
-                self.failure = RuntimeError("async direct read failed")
+            if state is None:
+                observation_error = getattr(completion, "observation_error", None)
+                if observation_error is not None:
+                    if self.failure is None:
+                        self.failure = observation_error
+                    self._stop.set()
+                return None
+            if state is False:
+                if self.failure is None:
+                    self.failure = RuntimeError("async direct read failed")
                 self._stop.set()
             self._polled += 1
         if not self._feeder_done.is_set():
@@ -303,10 +392,24 @@ class _AsyncReadPlan:
         except Exception:
             return None
 
+    def _finish_managed(self):
+        try:
+            self._end()
+        except Exception as exc:
+            if self.failure is None:
+                self.failure = exc
+        finally:
+            self._feeder_done.set()
+
     def abort(self) -> None:
         """停止提交并阻塞等待已提交 IO 结算（只用于关闭/中止）。"""
         self._stop.set()
+        if self._managed:
+            self._backend.cancel_detached_read(self._target_plan)
         self._feeder.join()
+        if self._managed:
+            self._end()
+            return
         with self._lock:
             pending = self._completions[self._polled:]
         for completion in pending:
@@ -315,17 +418,26 @@ class _AsyncReadPlan:
             except Exception as exc:
                 if self.failure is None:
                     self.failure = exc
+                if not bool(getattr(completion, "io_terminal", False)):
+                    raise
         self._polled = len(self._completions)
         self._end()
 
     def _end(self) -> None:
         if self._ended:
             return
-        self._ended = True
-        self.finished_ns = time.perf_counter_ns()
         end = getattr(self._backend, "end_detached_read_plan", None)
         if callable(end):
-            end(self._target_plan)
+            try:
+                error = end(self._target_plan)
+                if isinstance(error, BaseException) and self.failure is None:
+                    self.failure = error
+            except Exception as exc:
+                if self.failure is None:
+                    self.failure = exc
+                raise
+        self._ended = True
+        self.finished_ns = time.perf_counter_ns()
         plans = getattr(self.engine, "_async_read_plans", None)
         if plans is not None:
             plans.discard(self)
@@ -371,6 +483,7 @@ class _DirectAllLayerReadPlan:
         self.physical_layers = tuple(physical_layers)
         self.handles = {}
         self.read_ready_events = {}
+        self._all_io_complete = False
         self.next_read_to_submit = 0
         self.waited_callbacks = set()
         self.advanced_callbacks = set()
@@ -388,6 +501,8 @@ class _DirectAllLayerReadPlan:
         self._feeder_stop = threading.Event()
         self._feeder_done = threading.Event()
         self._feeder_thread = None
+        backend = getattr(getattr(engine, "_transfer", None), "_backend", None)
+        self._ordered_collectives = bool(getattr(backend, "requires_ordered_collectives", False))
         # 读窗口计时：原点 event 在提交任何读之前记于 compute stream，作为
         # "该步计算开始"的近似锚点；最后一层读的 fence 兼作收尾计时点。
         # 两者相减即读窗口的 GPU 时长（见 _capture_read_tail 的判据）。
@@ -405,8 +520,16 @@ class _DirectAllLayerReadPlan:
             self._timing_origin = None
         if not self.physical_layers:
             raise ValueError("direct all-layer read plan requires at least one layer")
-        self._submit_layer(0)
-        if self.layer_count > 1:
+        self._prefetch_backend = backend if callable(getattr(backend, "begin_prefetch", None)) else None
+        try:
+            if self._prefetch_backend is not None:
+                self._prefetch_backend.begin_prefetch(self.keys, self.block_tables, self.physical_layers)
+            self._submit_layer(0)
+        except Exception:
+            if self._prefetch_backend is not None:
+                self._prefetch_backend.stop_prefetch()
+            raise
+        if self.layer_count > 1 and not self._ordered_collectives:
             # feeder 立即起跑：余下层不等首个 compute 回调。提前提交让读尽早占满
             # 盘侧带宽，并把"某层尚未提交"的窗口压到最小；并发由 in-flight 配额
             # 约束，不需要靠 compute 节奏限流。
@@ -428,8 +551,32 @@ class _DirectAllLayerReadPlan:
     def fence_event(self, callback):
         return self.read_ready_events.get(callback)
 
+    def all_io_done(self) -> bool:
+        if self.terminal_failure is not None:
+            return False
+        if self._all_io_complete:
+            return True
+        with self._ready_cond:
+            events = tuple(self.read_ready_events.get(callback)
+                           for callback in range(self.layer_count))
+        if any(event is None for event in events):
+            return False
+        try:
+            if not all(callable(getattr(event, "query", None)) and event.query()
+                       for event in events):
+                return False
+        except Exception as exc:
+            self._record_failure(exc)
+            return False
+        self._all_io_complete = True
+        return self.terminal_failure is None
+
     def wait_layer(self, callback, physical=None):
         self._validate_callback(callback, physical)
+        if self._ordered_collectives and callback not in self.read_ready_events:
+            if callback != len(self.waited_callbacks):
+                raise RuntimeError("out-of-order replica collective callback")
+            self._submit_layer(callback)
         event = self._await_ready_event(callback)
         if callback in self.waited_callbacks:
             return event
@@ -517,7 +664,7 @@ class _DirectAllLayerReadPlan:
         主机不阻塞）。feeder 会把全部读层在请求开头提交完，因此它推进到最后一
         层后，这个事件就代表"全部读完成"（同一读流按层序提交，FIFO）。
         """
-        with self._state_lock:
+        with self._ready_cond:
             if not self.read_ready_events:
                 return None
             return self.read_ready_events[max(self.read_ready_events)]
@@ -552,9 +699,10 @@ class _DirectAllLayerReadPlan:
             with self._state_lock:
                 if callback in self.handles or self._feeder_stop.is_set():
                     return
-                submit_lock = getattr(
-                    self.engine, "_direct_submit_lock", self._state_lock
-                )
+                backend = getattr(getattr(self.engine, "_transfer", None), "_backend", None)
+                lock_name = ("_direct_read_lock" if getattr(backend, "independent_read_write", False)
+                             else "_direct_submit_lock")
+                submit_lock = getattr(self.engine, lock_name, self._state_lock)
                 with submit_lock:
                     handle = self.engine.load_layer(
                         self.keys,
@@ -570,8 +718,7 @@ class _DirectAllLayerReadPlan:
                 self._abort_submitted()
                 raise
             return
-        if fence_event is None:
-            fence_event = getattr(handle, "fence_event", None)
+        fence_event = getattr(handle, "fence_event", None) or fence_event
         if fence_event is None:
             error = RuntimeError(
                 f"direct read layer {callback} did not record a ready event"
@@ -642,9 +789,10 @@ class _DirectAllLayerReadPlan:
 
     def join_feeder(self) -> None:
         thread = self._feeder_thread
-        if thread is None or thread is threading.current_thread():
-            return
-        thread.join()
+        if thread is not None and thread is not threading.current_thread():
+            thread.join()
+        if self._prefetch_backend is not None:
+            self._prefetch_backend.join_prefetch()
 
     def _completion_callback(self, callback: int):
         """把完成回调绑定到层号：最后一层的完成即"全部读完成"。"""
@@ -748,6 +896,8 @@ class _DirectAllLayerReadPlan:
     def abort(self):
         self._feeder_stop.set()
         self._publish_ready()
+        if self._prefetch_backend is not None:
+            self._prefetch_backend.stop_prefetch()
         self.join_feeder()
         self._abort_submitted()
 
@@ -1153,7 +1303,13 @@ class KVEngine:
         self._planned_store_keys: set[bytes] = set()
         self._write_reuse_event = None
         self._direct_submit_lock = threading.RLock()
+        self._direct_read_lock = threading.RLock()
         self._active_read_plan = None
+        self._foreground_read_submit_pending = 0
+        self._prefill_submit_lock = threading.RLock()
+        self._prefill_feeder_epoch = 0
+        self._prefill_feeder_open = False
+        self._prefill_feeder_callback = -1
         # 在途的异步读计划（不在 _inflight 里，见 _AsyncReadPlan）；关闭/中止
         # 时逐个 drain。
         self._async_read_plans: set = set()
@@ -1551,12 +1707,19 @@ class KVEngine:
         """
         keys = self._prepare_layer_call(keys, layer_idx)
         if isinstance(self._transfer, DirectTransfer):
-            direct_lock = getattr(self, "_direct_submit_lock", None)
+            backend = getattr(self._transfer, "_backend", None)
+            lock_name = ("_direct_read_lock" if getattr(backend, "independent_read_write", False)
+                         else "_direct_submit_lock")
+            direct_lock = getattr(self, lock_name, None)
             with (direct_lock if direct_lock is not None else nullcontext()):
                 completion = self._transfer.load_layer(
                     keys, layer_idx, dst_first_blocks
                 )
                 record_read = getattr(self._store, "record_read_event", None)
+                ready = getattr(completion, "fence_event", None)
+                if ready is not None:
+                    self._inflight.append(completion)
+                    return completion
                 if fence_event is not None and not callable(record_read):
                     raise RuntimeError("direct read event recorder is unavailable")
                 if callable(record_read):
@@ -1680,20 +1843,71 @@ class KVEngine:
             ))
         )
 
+    def begin_prefill_feeder(self, enabled: bool) -> None:
+        if not hasattr(self, "_prefill_submit_lock"):
+            self._prefill_submit_lock = threading.RLock()
+        with self._prefill_submit_lock:
+            self._prefill_feeder_epoch = getattr(self, "_prefill_feeder_epoch", 0) + 1
+            self._prefill_feeder_callback = -1
+            self._prefill_feeder_open = bool(enabled)
+
+    def advance_prefill_feeder(self, callback: int) -> None:
+        with self._prefill_submit_lock:
+            if self._prefill_feeder_open:
+                self._prefill_feeder_callback = max(self._prefill_feeder_callback, callback)
+
+    def end_prefill_feeder(self) -> None:
+        if not hasattr(self, "_prefill_submit_lock"):
+            self._prefill_submit_lock = threading.RLock()
+        with self._prefill_submit_lock:
+            self._prefill_feeder_open = False
+
+    @contextmanager
+    def _background_submit_scope(self):
+        with self._prefill_submit_lock:
+            yield self._background_read_allowed()
+
+    def _background_read_allowed(self) -> bool:
+        if not getattr(self, "_prefill_feeder_open", False):
+            return False
+        if getattr(self, "_prefill_feeder_callback", -1) < 0:
+            return False
+        if getattr(self, "_foreground_read_submit_pending", 0):
+            return False
+        plan = self._active_read_plan
+        if plan is None:
+            return True
+        if plan.failed is not None:
+            return False
+        done = getattr(plan, "all_io_done", None)
+        return callable(done) and bool(done())
+
+    def _background_read_token(self):
+        if not self._background_read_allowed():
+            return None
+        return self._prefill_feeder_epoch, self._prefill_feeder_callback
+
     def start_read_plan(self, keys, block_tables, physical_layers, depth,
                         on_failure=None):
         if not self.read_plan_supported:
             raise RuntimeError("read CUDA event bridge unavailable")
         if self.direct:
-            backend = getattr(self._transfer, "_backend", None)
-            begin_plan = getattr(backend, "begin_target_plan", None)
-            if callable(begin_plan):
-                begin_plan(keys, "read")
-            plan = _DirectAllLayerReadPlan(
-                self, keys, block_tables, physical_layers, on_failure
-            )
-            self._active_read_plan = plan
-            return plan
+            with self._direct_submit_lock:
+                self._foreground_read_submit_pending = getattr(self, "_foreground_read_submit_pending", 0) + 1
+            try:
+                backend = getattr(self._transfer, "_backend", None)
+                begin_plan = getattr(backend, "begin_target_plan", None)
+                if callable(begin_plan):
+                    begin_plan(keys, "read")
+                plan = _DirectAllLayerReadPlan(
+                    self, keys, block_tables, physical_layers, on_failure
+                )
+                with self._direct_submit_lock:
+                    self._active_read_plan = plan
+                return plan
+            finally:
+                with self._direct_submit_lock:
+                    self._foreground_read_submit_pending -= 1
         return _ReadPlan(
             self, keys, block_tables, physical_layers, depth, on_failure
         )
@@ -1707,9 +1921,7 @@ class KVEngine:
         if self.direct and callable(getattr(
                 getattr(self._transfer, "_backend", None),
                 "begin_detached_read_plan", None)):
-            plan = _AsyncReadPlan(self, keys, block_tables, physical_layers)
-            self._async_read_plans.add(plan)
-            return plan
+            return _AsyncReadPlan(self, keys, block_tables, physical_layers)
         return _CompletedReadPlan(self, keys, block_tables, physical_layers)
 
     def _abort_async_read_plans(self) -> BaseException | None:
@@ -1720,7 +1932,6 @@ class KVEngine:
             except Exception as exc:
                 if first_error is None:
                     first_error = exc
-        self._async_read_plans.clear()
         return first_error
 
     def checkpoint_if_due(self) -> bool:
@@ -2000,6 +2211,7 @@ class KVEngine:
         异步读计划不在这里 drain：它们不属于任何一步，worker 的 abort 只回滚
         本步；整体关闭（close）时才逐个等待（见 _abort_async_read_plans）。
         """
+        self.end_prefill_feeder()
         active_plan = getattr(self, "_active_read_plan", None)
         if active_plan is not None:
             active_plan.abort()
@@ -2052,7 +2264,10 @@ class KVEngine:
         """收尾：等待在途批次并关闭 store；幂等。"""
         if self._closed:
             return
+        self.end_prefill_feeder()
         first_error = self._abort_async_read_plans()
+        if self._async_read_plans:
+            raise first_error or RuntimeError("async reads still own GPU blocks; backing retained")
         try:
             self.wait_idle()
         except Exception as exc:

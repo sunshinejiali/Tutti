@@ -22,7 +22,7 @@ def page_geometry(tensor, page_bytes: int) -> LayerPageGeometry:
     if page_bytes <= 0 or page_bytes % 4096 or size % page_bytes:
         raise DirectAdmissionError("layer page and storage must be 4KiB aligned")
     blocks = size // page_bytes
-    if len(shape) not in (3, 4) or shape[0] != blocks or blocks <= 0:
+    if len(shape) not in (3, 4) or blocks <= 0 or shape[0] <= 0:
         raise DirectAdmissionError(f"packed block-axis-0 KV layout required: {shape}")
     element = tensor.element_size()
     if len(shape) == 3:
@@ -34,9 +34,11 @@ def page_geometry(tensor, page_bytes: int) -> LayerPageGeometry:
     if any(count > 1 and stride != required
            for count, stride, required in zip(shape, strides, expected)):
         raise DirectAdmissionError("layer page must have compact packed NHD bytes")
-    if strides[0] != page_bytes:
-        raise DirectAdmissionError("layer block stride does not match its physical page")
-    return LayerPageGeometry(page_bytes, strides[0], blocks)
+    kernel_page_bytes = expected[0]
+    if (kernel_page_bytes <= 0 or strides[0] != kernel_page_bytes or
+            page_bytes % kernel_page_bytes or shape[0] % (page_bytes // kernel_page_bytes)):
+        raise DirectAdmissionError("layer block stride does not form complete logical pages")
+    return LayerPageGeometry(page_bytes, page_bytes, blocks)
 
 
 class TuttiLayerwiseDirectBackend(TuttiDirectBackend):

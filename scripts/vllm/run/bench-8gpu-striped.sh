@@ -27,6 +27,18 @@
 #   --capacity SIZE   per-rank KV payload budget, e.g. "1 TiB"; required for Tutti
 #   --block-size N    backend KV block tokens; MiniMax M3 uses 128
 #   --kv-load-mode M  sync/async/auto; sync forces external-read validation
+#   --load-format F   weight loader, default LOAD_FORMAT or auto
+#   --enable-expert-parallel    use expert parallelism across TP ranks
+#   --enable-ep-weight-filter   load only rank-local experts
+#   --kv-cache-dtype D          main KV dtype, e.g. fp8
+#   --indexer-kv-dtype D        sparse index KV dtype, e.g. bf16
+#   --max-model-len N           override tokens + 8
+#   --max-num-seqs N            override max(256, batch_size)
+#   --max-num-batched-tokens N  override vLLM's scheduling token budget
+#   --gpu-memory-utilization F  override vLLM's memory fraction
+#   --language-model-only      skip multimodal components
+#   --replica-io                enable cooperative Tutti reads (not baseline)
+#   --payload-tag NAME          isolate segment payloads for this experiment
 #   --tag NAME        label for output files
 #   --pool-tag NAME   pool root suffix (checkpoint/metadata root). Segment
 #                     files live under <mount>/r<rank>/segments and are shared
@@ -55,6 +67,8 @@ DEVICE_GROUPS="${DEVICE_GROUPS:-0,1,2,3;4,5,6,7}"
 MODEL="${MODEL:-}"
 TP_SIZE="${TP_SIZE:-8}"
 BLOCK_SIZE="${BLOCK_SIZE:-64}"
+CHUNK_TOKENS="${CHUNK_TOKENS:-256}"
+SHARED_TOKENS=""
 KV_LOAD_MODE="${KV_LOAD_MODE:-auto}"
 NUM_QUEUES="${NUM_QUEUES:-8}"
 [[ "$NUM_QUEUES" =~ ^[1-9][0-9]*$ ]] || { echo "NUM_QUEUES must be a positive integer" >&2; exit 2; }
@@ -64,6 +78,8 @@ MAX_IN_FLIGHT="${MAX_IN_FLIGHT:-}"
 # Standard vLLM loading requires no Phoenix installation. Alternative weight
 # loaders may be selected explicitly via LOAD_FORMAT and PHXLOADER_DIR.
 LOAD_FORMAT="${LOAD_FORMAT:-auto}"
+MODEL_ARGS=()
+REPLICA_IO=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -77,8 +93,17 @@ while [[ $# -gt 0 ]]; do
         --model)       MODEL="$2"; shift 2 ;;
         --capacity)    CAPACITY="$2"; shift 2 ;;
         --block-size)  BLOCK_SIZE="$2"; shift 2 ;;
+        --chunk-tokens) CHUNK_TOKENS="$2"; shift 2 ;;
+        --shared-tokens) SHARED_TOKENS="$2"; shift 2 ;;
         --kv-load-mode) KV_LOAD_MODE="$2"; shift 2 ;;
-        -h|--help)     sed -n '2,31p' "${BASH_SOURCE[0]}"; exit 0 ;;
+        --load-format) LOAD_FORMAT="$2"; shift 2 ;;
+        --enable-expert-parallel|--enable-ep-weight-filter|--language-model-only)
+            MODEL_ARGS+=( "$1" ); shift ;;
+        --kv-cache-dtype|--indexer-kv-dtype|--max-model-len|--gpu-memory-utilization|--max-num-seqs|--max-num-batched-tokens)
+            MODEL_ARGS+=( "$1" "$2" ); shift 2 ;;
+        --replica-io)   REPLICA_IO=1; shift ;;
+        --payload-tag) export TUTTI_E2E_PAYLOAD_TAG="$2"; shift 2 ;;
+        -h|--help)     sed -n '2,46p' "${BASH_SOURCE[0]}"; exit 0 ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
 done
@@ -91,10 +116,8 @@ source "$SCRIPT_DIR/profile-env.sh"
 PYTHON="${TUTTI_PYTHON:?profile-env.sh did not set TUTTI_PYTHON}"
 DRIVER="$REPO_ROOT/scripts/vllm/vllm_profile_offline.py"
 
-# phxsafetensors 的 python 侧 (phxloader) 不在 vllm-env 里，是 Phoenix 仓库里
-# 构建出的包（与 serve-8gpu-striped.sh 同一路径）：前置到 PYTHONPATH。
-if [[ "$LOAD_FORMAT" == "phxsafetensors" ]]; then
-    : "${PHXLOADER_DIR:?Set PHXLOADER_DIR for the optional phxsafetensors loader}"
+# 可用调用者的 PYTHONPATH；显式 PHXLOADER_DIR 优先，driver 校验包能否导入。
+if [[ "$LOAD_FORMAT" == "phxsafetensors" && -n "${PHXLOADER_DIR:-}" ]]; then
     [[ -f "$PHXLOADER_DIR/phxloader/__init__.py" ]] || {
         echo "phxloader missing: $PHXLOADER_DIR/phxloader (set PHXLOADER_DIR)" >&2; exit 1;
     }
@@ -138,6 +161,11 @@ ARGS=(
     # baseline and Tutti runs, so comparisons stay valid.
     --disable-flashinfer-autotune
 )
+ARGS+=( --chunk-tokens "$CHUNK_TOKENS" )
+if [[ -n "$SHARED_TOKENS" ]]; then
+    ARGS+=( --shared-tokens "$SHARED_TOKENS" )
+fi
+ARGS+=( "${MODEL_ARGS[@]}" )
 
 if [[ "$BASELINE" == 1 ]]; then
     ARGS+=( --without-tutti )
@@ -150,6 +178,9 @@ else
     # 读计划 0 次，而 B 的墙钟又很漂亮（因为它确实复用了，只是没经过 NVMe），
     # 于是极易误判为"直连读很快"。
     ARGS+=( --reset-local-prefix-between-requests )
+    if (( REPLICA_IO )); then
+        ARGS+=( --replica-io )
+    fi
     # Groups partition TP ranks evenly. IDs are from daemon YAML, not nvmeN.
     # Syntax: comma-separated IDs per group, semicolon-separated groups.
     ARGS+=(

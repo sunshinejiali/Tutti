@@ -1005,6 +1005,35 @@ def test_completion_poll_settles_invalid_observation():
     assert not completion.wait_result(timeout=0).ok
 
 
+@pytest.mark.parametrize("error", ["exception", "invalid"])
+def test_async_completion_retains_unknown_observation_without_releasing_dma(error):
+    class Runtime:
+        def __init__(self):
+            self.done = False
+            self.released = []
+        def wait_result(self, handle, timeout_ms=0):
+            if not self.done:
+                if error == "exception":
+                    raise RuntimeError("observation unavailable")
+                return FakeWaitResult("INVALID_HANDLE", "", 0, False, (), "WHOLE_OPERATION",
+                                      "UNKNOWN", None, None, "observation unavailable")
+            return FakeWaitResult("OK", "COMPLETED", 0, False, (), "NONE", None, None, None, "")
+        def release_io(self, handle):
+            self.released.append(handle)
+    runtime = Runtime()
+    completion = _TuttiCompletion(runtime, [19], lambda ok: None, auto_watch=False,
+                                  retain_observation_errors=True)
+    assert completion.poll() is None
+    assert completion.observation_error is not None
+    assert not completion.io_terminal and runtime.released == []
+    with pytest.raises(RuntimeError, match="observation unavailable"):
+        completion.wait()
+    assert runtime.released == []
+    runtime.done = True
+    assert completion.poll() is True and completion.io_terminal
+    assert runtime.released == [19]
+
+
 def test_get_batch_auto_releases_terminal_handle(tmp_path):
     """Pre-enqueued reads cannot retain all handles until layer callbacks."""
     runtime = FakeRuntime()

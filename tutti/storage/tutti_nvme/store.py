@@ -855,6 +855,7 @@ class TuttiDirectBackend:
         completion = _TuttiCompletion(
             store._runtime, handles, settled,
             auto_watch=False, direction=direction,
+            retain_observation_errors=stream_direction == "read_async",
         )
         completion_holder["completion"] = completion
         store._track_completion(completion, keys)
@@ -916,7 +917,9 @@ class _TuttiCompletion:
     """一批 runtime IO 的完成句柄，terminal 详情在 release 后仍保留。"""
 
     def __init__(self, runtime, handles, on_settled, *, auto_watch: bool = True,
-                 direction: str | None = None):
+                 direction: str | None = None, retain_observation_errors: bool = False):
+        self._retain_observation_errors = retain_observation_errors
+        self._observation_error = None
         self._runtime = runtime
         self._submitted = [
             item if isinstance(item, _SubmittedHandle)
@@ -965,6 +968,18 @@ class _TuttiCompletion:
         if not self._ready.is_set():
             return None
         return self._finish()
+
+    @property
+    def observation_error(self):
+        return self._observation_error
+
+    @property
+    def io_terminal(self) -> bool:
+        with self._terminal_lock:
+            return all(item.handle in self._terminal_results and
+                       self._terminal_results[item.handle].observation == "OK" and
+                       self._terminal_results[item.handle].state in ("COMPLETED", "FAILED")
+                       for item in self._submitted)
 
     def query(self) -> bool:
         if self._settled:
@@ -1084,6 +1099,9 @@ class _TuttiCompletion:
                 result = self._observe(submitted, 0)
                 if result.observation == "TIMEOUT":
                     return
+                if self._retain_observation_errors and result.observation != "OK":
+                    self._observation_error = RuntimeError(result.message or result.observation)
+                    return
                 if (result.observation == "OK" and
                         result.state not in ("COMPLETED", "FAILED")):
                     return
@@ -1096,6 +1114,9 @@ class _TuttiCompletion:
                                 self._format_failure(failures[0])
                                 if failures else None)
         except Exception as exc:
+            if self._retain_observation_errors:
+                self._observation_error = exc
+                return
             self._mark_terminal(False, f"tutti IO 等待异常：{exc}")
 
     def _watch_runtime(self) -> None:
@@ -1107,6 +1128,8 @@ class _TuttiCompletion:
                     result = self._observe(submitted, _COMPLETION_WAIT_MS)
                     if result.observation == "TIMEOUT":
                         continue
+                    if self._retain_observation_errors and result.observation != "OK":
+                        raise RuntimeError(result.message or result.observation)
                     if (result.observation != "OK" or
                             result.state in ("COMPLETED", "FAILED")):
                         self._record_result(result)
@@ -1119,6 +1142,9 @@ class _TuttiCompletion:
                                 if failures else None)
             self._release_handles()
         except Exception as exc:
+            if self._retain_observation_errors:
+                self._observation_error = exc
+                raise
             self._mark_terminal(False, f"tutti IO 等待异常：{exc}")
             self._release_handles()
 
@@ -1239,7 +1265,7 @@ class TuttiKVStore:
                  segment_header_bytes: int = DEFAULT_SEGMENT_HEADER_BYTES,
                  rank_id: int = 0, tp_size: int = 1,
                  defer_writes_after_reads: bool | None = None,
-                 layer_page_bytes=None):
+                 layer_page_bytes=None, replica_groups=None):
         """preset 为 dict 时优先于 TUTTI_NVME_PRESET 环境变量构造 runtime。
 
         preset 的字符串值恰为纯十进制整数时转为 int（配置占位符替换后
@@ -1272,6 +1298,7 @@ class TuttiKVStore:
         self._num_chunks = num_chunks
         self._segment_bytes = segment_bytes
         self._layer_page_bytes = tuple(layer_page_bytes or ())
+        self._replica_groups = tuple(tuple(group) for group in (replica_groups or ()))
         self._runtime = runtime
         self._own_runtime = runtime is None
         self._preset = prepare_preset(preset, mounts=mounts) if preset is not None else None
@@ -1713,6 +1740,9 @@ class TuttiKVStore:
         layer, and block-table semantics above Runtime/DataPath.
         """
         self._require_open()
+        if self._replica_groups:
+            from .replica_direct import TuttiReplicaDirectBackend
+            return TuttiReplicaDirectBackend(self)
         if isinstance(kv_caches, dict) and self._layer_page_bytes:
             from .layerwise_direct import TuttiLayerwiseDirectBackend
             return TuttiLayerwiseDirectBackend(self)
@@ -1842,6 +1872,8 @@ class TuttiKVStore:
         False，调用方照旧用 fence。
         """
         if not _ASYNC_COMPLETION:
+            return False
+        if any(getattr(completion, "fence_event", None) is not None for completion in completions):
             return False
         handles = []
         for completion in completions:
@@ -2324,7 +2356,8 @@ class TuttiKVStore:
             raise
 
     def _submit_retry(self, requests, direction: str,
-                      stream_direction: str | None = None):
+                      stream_direction: str | None = None, *, on_backpressure=None,
+                      before_submit=None):
         """提交整批；超宽先按上限切段，partial-commit 的被拒请求窗口重发。
 
         宽度处理分两层：
@@ -2335,10 +2368,14 @@ class TuttiKVStore:
           * **被拒后拆半**：预切用的是"请求条数"，而 runtime 的上限算的是
             展开后的 sub-IO 条目数（一个请求跨分片/超 MDTS 时会展开成多条）。
             若仍撞上限就拆半重投；拆到单笔仍被拒才说明是那一笔自身的问题。
-        窗口耗尽（在飞配额/容量）另算：重投，连续两轮零接受才 RuntimeError。
+        窗口耗尽（在飞配额/容量）另算：默认连续两轮零接受才 RuntimeError；
+        提前下发调用者可用 on_backpressure 推进尚未移交的已接受 handles。
+        该回调仅用于在途配额拒绝，不取得句柄所有权或改变永久错误的失败策略。
         """
         handles = []
         indexed = list(enumerate(requests))
+        if not indexed:
+            return handles
         width_limit = self._batch_width_limit()
         if width_limit and len(indexed) > width_limit:
             # 逆序入栈：循环取 segments[-1]，倒着压保证按原顺序提交。
@@ -2358,12 +2395,14 @@ class TuttiKVStore:
         try:
             while segments:
                 pending = segments[-1]
-                result = self._runtime.submit(
-                    [request for _, request in pending],
-                    accel_id=self._accel_id,
-                    stream=self._stream_for(stream_direction or direction)[0],
-                    execution=self._execution,
-                )
+                scope = before_submit(tuple(handles)) if before_submit is not None else None
+                with scope if scope is not None else nullcontext():
+                    result = self._runtime.submit(
+                        [request for _, request in pending],
+                        accel_id=self._accel_id,
+                        stream=self._stream_for(stream_direction or direction)[0],
+                        execution=self._execution,
+                    )
                 rejected = list(result.rejected or [])
                 # Runtime partial-commit deliberately returns a non-OK status
                 # together with a valid handle for the accepted prefix/subset.
@@ -2407,6 +2446,10 @@ class TuttiKVStore:
                             result.status_msg,
                         )
                         continue
+                    if (on_backpressure is not None and
+                            "in-flight operation capacity exhausted" in result.status_msg):
+                        on_backpressure(tuple(handles))
+                        continue
                     all_rejected_rounds += 1
                     if all_rejected_rounds >= 2:
                         raise RuntimeError(
@@ -2422,14 +2465,16 @@ class TuttiKVStore:
                     result.status_msg,
                 )
                 segments[-1] = [pending[i] for i in rejected]
-        except Exception:
+        except Exception as exc:
             if handles:
-                self._deferred_completions.append(
-                    _TuttiCompletion(
-                        self._runtime, handles, lambda _ok: None,
-                        auto_watch=False,
-                    )
+                completion = _TuttiCompletion(
+                    self._runtime, handles, lambda _ok: None,
+                    auto_watch=False, direction=direction,
+                    retain_observation_errors=stream_direction == "read_async",
                 )
+                self._deferred_completions.append(completion)
+                if stream_direction == "read_async":
+                    exc.tutti_submitted_completions = (completion,)
             raise
         return handles
 

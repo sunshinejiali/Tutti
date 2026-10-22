@@ -2,7 +2,7 @@
 
 日期：2026-10-14。
 
-状态：**v0.2.1 后续设计提案，尚未实现、尚未验收，不属于 v0.2.0 已交付能力。** 本文不改变当前在线服务、模型计算路径或磁盘布局。
+状态：**历史问题分析与初始 P2P/IPC 方案，不属于 v0.2.0 已交付能力。** 2026-10-20 按批准的方案 B 改为原生 CUDA IPC/P2P、CPU epoch 通知和后台恢复，修复读写/状态查询锁等待；完成小型多轮/预提交失败门禁及16K/256K/512K模型恢复。旧memcpy/scatter版256K/512K仍未取得净加速；随后实现单wave融合kernel直达KV页，16K/256K恢复与边界门禁通过，但256K仍无净加速，融合版512K未重测。driver失联、rank崩溃等故障边界仍未完成验收。当前方案、DCP/第三方已有解法、必要性与实验记录以 [设计分析文档](../design/replica-sharded-io-allgather.md) 为准；下文原位 IPC fanout 是备选设计，不表示当前实验已经实现该路径。
 
 ## 1. 问题与范围
 
@@ -131,7 +131,7 @@ GPU peer scatter/fanout kernel，经 NVLink
 
 ## 5. GPU 分发与同步
 
-每个 owner、每层或有界波次启动一个 fused peer scatter/fanout kernel，处理该批多个块与消费者。避免每页一次 Python 调用、跨进程消息或 `cudaMemcpy`。
+每个 owner 将本实体全部 owned 页一次提交 NVMe，直接写最终 KV 页；每个消费者随后启动一个 fused peer scatter kernel，读取 owner 最终离散页并写自己的最终离散页，跳过本地 owned 页。当前不切 wave、不分配 payload staging，也不逐页调用 Python、跨进程消息或 `cudaMemcpy`。
 
 流水线为：
 
@@ -229,4 +229,4 @@ GPU 分发量是逻辑副本 payload，不是含拓扑路由后的 NVLink 线缆
 
 外部模型依据是本机 vLLM 的 `vllm/models/minimax_m3/common/indexer.py`、`vllm/models/minimax_m3/nvidia/model.py` 和 `vllm/model_executor/layers/linear.py`；其版本和缓存布局变化后须重新确认上述副本关系。
 
-**当前仓库没有完整的跨进程 KV allocation 映射、peer fanout 和协调恢复生命周期实现。本文只记录方案，不宣称已经降低线上读量、解决 overlap 或支持无 CPU 的全设备失败处理。**
+**当前仓库已有默认关闭的实验实现：原生 KV allocation IPC、owner整实体直读最终页、单kernel远端离散页恢复和协调关闭。2026-10-20的256K/95%复用/TP8同配置四轮对照，ON/OFF 8/8输出一致，读量17.620GiB（确认计数）对55.529GiB（页几何核算），稳态B 5.217s对5.094s，仍未净加速。随后按组复用页描述并预预算owned集合，构建约308ms降为20ms。256K/99%新对照ON/OFF 8/8输出一致，稳态2.595s对2.899s（延迟下降10.5%），读量18.363GiB（确认）对57.872GiB（几何），ON prefill非模型IO暴露约12–19ms。之后提交/完成解耦的提前下发版，全机读跨度缩到约472ms，但99%稳态2.742s；更密集的IO未带来额外端到端加速，prefill IO-only增至约167–199ms。同步专项进一步确认：普通路径117个fence都在read kernel完成前record；去冗余117个计算fence都在scatter完成及CPU ACK后才record，恢复feeder被主机完成门槛串行化。trace的EventSynchronize来自已有vLLM输入/输出路径，不是新增读线程API；但Python event.query循环同样阻断提前下发，应优先恢复设备event依赖链。2026-10-21已将正常恢复改为IPC事件设备依赖，CPU只等事件已record通知，不等GPU完成；当天99%同配置四轮ON/OFF 8/8输出一致，稳态2.643s对2.852s（延迟下降7.3%）。此前126.7ms中途计算气泡不再出现，但首步/结算空档、peer记录通知和已有Runtime同步状态D2H仍存在；全机读跨度502ms，比50GiB/s八盘探针对应的367ms下界多约135ms。不能宣称完全恢复零主机通知或所有气泡消失。以上99%结果与95%不可当纯优化前后对比；结果与报告路径见 `doc/design/replica-sharded-io-allgather.md`。不宣称支持rank崩溃或无CPU的全设备失败处理。**

@@ -47,7 +47,7 @@ def worker_engine_for(vllm_config, extra: dict):
         raw_options = resolve_io_budget(raw_options, extra, vllm_config)
     keys = tuple(sorted(
         (k, extra.get(k))
-        for k in (*_ENGINE_KEYS, *_ENGINE_OPTIONAL_KEYS, "num_layers", "kv_layer_page_bytes")
+        for k in (*_ENGINE_KEYS, *_ENGINE_OPTIONAL_KEYS, "num_layers", "kv_layer_page_bytes", "replica_io")
     ))
     entry = _ENGINE_CACHE.get(id(vllm_config))
     if entry is None or entry[0] is not vllm_config:
@@ -78,6 +78,9 @@ def worker_engine_for(vllm_config, extra: dict):
             )
             options.setdefault("rank_id", int(worker_rank))
             options.setdefault("tp_size", tp_size)
+            if extra.get("replica_io", False):
+                from .replica_layout import replica_groups_for
+                options["replica_groups"] = replica_groups_for(extra, int(worker_rank))
         configured_segment = options.get("segment_bytes")
         if configured_segment is not None and configured_segment != segment_bytes:
             raise ValueError(
@@ -125,7 +128,7 @@ def scheduler_index_for(vllm_config, extra: dict):
         raw_options = resolve_io_budget(raw_options, extra, vllm_config)
     keys = tuple(sorted(
         (k, extra.get(k))
-        for k in (*_ENGINE_KEYS, "num_layers")
+        for k in (*_ENGINE_KEYS, "num_layers", "replica_io")
     ))
     entry = _SCHEDULER_CACHE.get(id(vllm_config))
     if entry is None or entry[0] is not vllm_config:

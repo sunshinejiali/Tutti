@@ -17,6 +17,29 @@ def test_page_geometry_covers_packed_kv_and_key_only_index():
     assert g.page_bytes == g.block_stride == 32768
 
 
+@pytest.mark.parametrize("group", [2, 4])
+def test_logical_page_groups_contiguous_kernel_blocks_without_copy(group):
+    main = torch.empty((16, 128, 1, 256), dtype=torch.uint8).permute(0, 2, 1, 3)
+    index = torch.empty((16, 128, 128), dtype=torch.bfloat16)
+    for tensor in (main, index):
+        geometry = page_geometry(tensor, 32768 * group)
+        assert geometry.page_bytes == geometry.block_stride == 32768 * group
+        assert geometry.num_blocks == 16 // group
+        backend = TuttiLayerwiseDirectBackend(SimpleNamespace())
+        backend._layer_pages = (geometry,)
+        backend._layer_tickets = [11]
+        backend._geometry = SimpleNamespace(segment_bytes=32768 * group * 2)
+        entry = SimpleNamespace(target_ticket=7, target_offset=0)
+        assert backend._page_requests(0, 2, 1, entry, SimpleNamespace(direction="read")) == [
+            (7, 32768 * group, 11, 2 * 32768 * group, 32768 * group, "read")]
+
+
+@pytest.mark.parametrize("page_bytes", [49152, 131072])
+def test_logical_page_rejects_non_integral_or_incomplete_kernel_groups(page_bytes):
+    with pytest.raises(DirectAdmissionError):
+        page_geometry(torch.empty((6, 128, 256), dtype=torch.uint8), page_bytes)
+
+
 def test_strided_or_unaligned_page_is_rejected():
     with pytest.raises(DirectAdmissionError):
         page_geometry(torch.empty((8, 128, 256))[:, :, ::2], 65536)

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import os
 import time
 from pathlib import Path
@@ -55,7 +56,8 @@ class _NullAnnotate:
         return False
 
 
-def _tokens(model: str, length: int, reuse_pct: int) -> tuple[list[int], list[int]]:
+def _tokens(model: str, length: int, reuse_pct: int,
+            shared_tokens: int | None = None) -> tuple[list[int], list[int]]:
     tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=False)
     seed = tokenizer.encode(
         "Tutti layerwise KV overlap profile request. ",
@@ -65,12 +67,16 @@ def _tokens(model: str, length: int, reuse_pct: int) -> tuple[list[int], list[in
         raise RuntimeError("tokenizer returned no seed tokens")
 
     request_a = (seed * ((length + len(seed) - 1) // len(seed)))[:length]
-    shared = length * reuse_pct // 100
+    shared = length * reuse_pct // 100 if shared_tokens is None else shared_tokens
+    if not 0 < shared < length:
+        raise ValueError("shared tokens must be between zero and prompt length")
     suffix_length = length - shared
     reversed_seed = list(reversed(seed))
     suffix_b = (
         reversed_seed * ((suffix_length + len(seed) - 1) // len(seed))
     )[:suffix_length]
+    if shared_tokens is not None and suffix_b[0] == request_a[shared]:
+        suffix_b[0] = next(token for token in seed if token != request_a[shared])
     return request_a, request_a[:shared] + suffix_b
 
 
@@ -184,6 +190,7 @@ def _generate(
             f"[{request_id}] requests={len(prompts)} "
             f"prompt_tokens={total_prompt_tokens} "
             f"completion_tokens={total_completion_tokens} "
+            f"cached_tokens={[output.num_cached_tokens for output in outputs]} "
             f"finish_reason={sorted(finish_reasons)} wall={elapsed:.3f}s "
             f"token_ids={list(outputs[0].outputs[0].token_ids)}",
             flush=True,
@@ -201,9 +208,27 @@ def main() -> int:
     parser.add_argument("--load-format", default="auto")
     parser.add_argument("--capacity", help="每rank KV payload预算，须带单位，例如 1 TiB")
     parser.add_argument("--tensor-parallel-size", type=int, default=4)
+    parser.add_argument("--enable-expert-parallel", action="store_true")
+    parser.add_argument("--enable-ep-weight-filter", action="store_true")
+    parser.add_argument("--kv-cache-dtype")
     parser.add_argument(
-        "--block-size", type=int, choices=(64, 128, 256), default=64
+        "--indexer-kv-dtype", choices=("auto", "bf16", "fp8", "mxfp4", "nvfp4")
     )
+    parser.add_argument("--max-model-len", type=int)
+    parser.add_argument("--max-num-seqs", type=int)
+    parser.add_argument("--max-num-batched-tokens", type=int)
+    parser.add_argument("--gpu-memory-utilization", type=float)
+    parser.add_argument("--language-model-only", action="store_true")
+    parser.add_argument(
+        "--replica-io", action="store_true",
+        help="enable cooperative replica reads in the Tutti connector",
+    )
+    parser.add_argument(
+        "--block-size", type=int, choices=(64, 128, 256, 512), default=64
+    )
+    parser.add_argument("--chunk-tokens", type=int, default=256)
+    parser.add_argument("--shared-tokens", type=int,
+                        help="exact common prefix for matched HBM/NVMe compute shapes")
     parser.add_argument(
         "--without-tutti",
         action="store_true",
@@ -360,6 +385,22 @@ def main() -> int:
     args = parser.parse_args()
     if not 1 <= args.reuse_pct < 100:
         parser.error("--reuse-pct must be in [1, 99]")
+    if args.shared_tokens is not None and not 0 < args.shared_tokens < args.tokens:
+        parser.error("--shared-tokens must be between zero and --tokens")
+    if args.chunk_tokens <= 0 or args.chunk_tokens % args.block_size:
+        parser.error("--chunk-tokens must be positive and divisible by --block-size")
+    if args.max_model_len is not None and args.max_model_len < args.tokens + args.max_tokens:
+        parser.error("--max-model-len must cover --tokens + --max-tokens")
+    if args.gpu_memory_utilization is not None and not 0 < args.gpu_memory_utilization <= 1:
+        parser.error("--gpu-memory-utilization must be in (0, 1]")
+    if args.load_format == "phxsafetensors":
+        try:
+            importlib.import_module("phxloader")
+        except (ImportError, OSError) as exc:
+            parser.error(
+                f"--load-format phxsafetensors requires importable phxloader; "
+                f"configure PYTHONPATH for the selected Python environment: {exc}"
+            )
     for option, path in (
         ("--wait-for-start-file", args.wait_for_start_file),
         ("--wait-for-exit-file", args.wait_for_exit_file),
@@ -374,8 +415,8 @@ def main() -> int:
         except ValueError as exc:
             parser.error(str(exc))
 
-    request_a, request_b = _tokens(args.model, args.tokens, args.reuse_pct)
-    shared = args.tokens * args.reuse_pct // 100
+    request_a, request_b = _tokens(args.model, args.tokens, args.reuse_pct, args.shared_tokens)
+    shared = args.tokens * args.reuse_pct // 100 if args.shared_tokens is None else args.shared_tokens
     print(
         f"profile workload: tokens={args.tokens} shared={shared} "
         f"reuse={args.reuse_pct}% rounds={args.rounds} "
@@ -419,7 +460,7 @@ def main() -> int:
                 args.max_in_flight_operations
             )
         connector_extra = {
-            "chunk_tokens": 256,
+            "chunk_tokens": args.chunk_tokens,
             "store": {
                 "type": "tutti_nvme",
                 "options": store_options,
@@ -427,6 +468,8 @@ def main() -> int:
         }
         connector_extra["direct_transfer"] = True
         connector_extra["load_mode"] = args.kv_load_mode
+        if args.replica_io:
+            connector_extra["replica_io"] = True
         kv_transfer_config = KVTransferConfig(
             kv_connector="TuttiConnectorV1",
             kv_connector_module_path="tutti.integration.vllm.connector",
@@ -434,15 +477,36 @@ def main() -> int:
             kv_load_failure_policy=args.kv_load_failure_policy,
             kv_connector_extra_config=connector_extra,
         )
+    model_options = {}
+    if args.enable_expert_parallel:
+        model_options["enable_expert_parallel"] = True
+    if args.enable_ep_weight_filter:
+        model_options["enable_ep_weight_filter"] = True
+    if args.kv_cache_dtype is not None:
+        model_options["kv_cache_dtype"] = args.kv_cache_dtype
+    if args.indexer_kv_dtype is not None:
+        model_options["attention_config"] = {"indexer_kv_dtype": args.indexer_kv_dtype}
+    if args.gpu_memory_utilization is not None:
+        model_options["gpu_memory_utilization"] = args.gpu_memory_utilization
+    if args.max_num_batched_tokens is not None:
+        model_options["max_num_batched_tokens"] = args.max_num_batched_tokens
+    if args.language_model_only:
+        model_options["language_model_only"] = True
     llm = LLM(
         model=args.model,
         tensor_parallel_size=args.tensor_parallel_size,
         block_size=args.block_size,
         enforce_eager=not args.enable_compile,
-        max_model_len=args.tokens + args.max_tokens,
+        max_model_len=(
+            args.max_model_len if args.max_model_len is not None
+            else args.tokens + args.max_tokens
+        ),
         # 必须 >= batch_size，否则批量请求被拆成多个调度步，读计划不会合并，
         # 复现不出线上「一批请求共享同一读计划」的 chunks 量级。
-        max_num_seqs=max(256, args.batch_size),
+        max_num_seqs=(
+            args.max_num_seqs if args.max_num_seqs is not None
+            else max(256, args.batch_size)
+        ),
         load_format=args.load_format,
         enable_prefix_caching=True,
         enable_layerwise_nvtx_tracing=args.layerwise_nvtx,
@@ -460,6 +524,7 @@ def main() -> int:
             else {"profiler": "cuda"}
         ),
         kv_transfer_config=kv_transfer_config,
+        **model_options,
     )
     sampling_params = SamplingParams(
         temperature=0.0,
@@ -484,6 +549,7 @@ def main() -> int:
         llm.start_profile()
     walls_a: list[float] = []
     walls_b: list[float] = []
+    request_b_label = f"B-{args.reuse_pct}pct"
     _start_bench_range()
     for round_idx in range(args.rounds):
         tokens_a, tokens_b = _distinct_pair(request_a, request_b, round_idx)
@@ -512,13 +578,13 @@ def main() -> int:
             llm.start_profile()
         try:
             walls_b.append(
-                _generate(llm, prompts_b, sampling_params, f"B-80pct{suffix}")
+                _generate(llm, prompts_b, sampling_params, f"{request_b_label}{suffix}")
             )
         except Exception as exc:
             if not args.expect_b_failure:
                 raise
             print(
-                f"[B-80pct{suffix}] expected_request_failure="
+                f"[{request_b_label}{suffix}] expected_request_failure="
                 f"{type(exc).__name__}: {exc}",
                 flush=True,
             )
@@ -554,7 +620,7 @@ def main() -> int:
                 flush=True,
             )
         _stats("A-cold", walls_a)
-        _stats("B-80pct", walls_b)
+        _stats(request_b_label, walls_b)
     print("profile workload complete", flush=True)
     if torch_profiling and not b_only_window:
         llm.stop_profile()
