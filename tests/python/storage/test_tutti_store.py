@@ -58,6 +58,587 @@ FakeWaitResult = namedtuple(
 )
 
 
+def _direct_read_cell(monkeypatch, *, width=None, detached=False):
+    import threading
+    from contextlib import contextmanager
+    from types import SimpleNamespace as NS
+    import tutti.storage.tutti_nvme.store as module
+    monkeypatch.setattr(module, "_ASYNC_COMPLETION", False)
+    active, submitted, released, observations, events = {}, [], [], [], []
+    ready, generation, stream = [False], [1], [None]
+    def submit(requests, **kwargs):
+        submitted.append((tuple(requests), kwargs["stream"]))
+        if active:
+            return FakeSubmitResult(False, "in-flight operation capacity exhausted", None,
+                                    (False,) * len(requests), tuple(range(len(requests))))
+        handle = 10 + len(submitted)
+        active[handle] = tuple(requests[:1])
+        return FakeSubmitResult(len(requests) == 1, "partial", handle,
+                                (True,) + (False,) * (len(requests) - 1),
+                                tuple(range(1, len(requests))))
+    def query(handle):
+        assert handle in active, "query after release"
+        return "COMPLETED" if ready[0] else "IN_FLIGHT"
+    def observe(handle, timeout):
+        assert handle in active
+        observations.append(timeout)
+        return FakeWaitResult("OK", "COMPLETED", 4096, False, (), "NONE", None, None, None, "")
+    def release(handle):
+        assert handle in active, "double release"
+        del active[handle]
+        released.append(handle)
+    @contextmanager
+    def context(direction):
+        previous, stream[0] = stream[0], direction
+        try:
+            yield
+        finally:
+            stream[0] = previous
+    def fence(direction):
+        assert stream[0] == direction
+        event = NS(query=lambda: ready[0])
+        events.append(("fence", direction, event))
+        return event
+    runtime = NS(submit=submit, query_io=query, wait_result=observe, release_io=release,
+                 caps=lambda: {"max_batch_requests": width})
+    store = NS(_runtime=runtime, _batch_width_limit=lambda: width, _accel_id=0, _execution="device",
+               _inflight_lock=threading.Lock(), _inflight_by_chunk={},
+               _stream_for=lambda direction: (123 if direction == "read" else 456, None),
+               stream_context=context, _record_event=fence,
+               _layout=NS(target_generation=lambda chunk: generation[0]),
+               _targets={"file://cell": NS(ticket=7)}, _read_async_stream=456)
+    store._track_completion = lambda part, keys: TuttiKVStore._track_completion(store, part, keys)
+    backend = module.TuttiDirectBackend(store)
+    backend._memory_ticket = 3
+    backend._geometry = module.DirectPoolGeometry(65536, 32768, 4096, 4096, 4096,
+                                                 8, 1, 1, 2, 8192, 0)
+    key = b"k" * 16
+    store._live = {io_key(key, 0)}
+    entry = module.DirectTargetPlanEntry(key, 7, "file://cell", 8192, 1, 0)
+    plan = module.DirectTargetPlan("read", 3, 1, (entry,))
+    if detached:
+        backend._detached_plans[1] = plan
+    else:
+        backend._target_plans["read"] = plan
+    return NS(backend=backend, plan=plan, keys=(key,), tables=((1, 7),), active=active,
+              submitted=submitted, released=released, observations=observations,
+              ready=ready, generation=generation, events=events, stream=stream)
+
+
+def _direct_write_cell(monkeypatch, *, width=None):
+    from tutti.storage.tutti_nvme.store import DirectTargetPlan
+    cell = _direct_read_cell(monkeypatch, width=width)
+    cell.plan = DirectTargetPlan("write", 3, 1, cell.plan.entries)
+    cell.backend._target_plans = {"write": cell.plan}
+    cell.settled = []
+    cell.backend._store._on_direct_put_settled = (
+        lambda ok, keys, completion: cell.settled.append((ok, tuple(keys), completion)))
+    return cell
+
+
+@pytest.mark.parametrize("width", [None, 1])
+def test_direct_try_write_cap_one_partial_settles_whole_layer_once(monkeypatch, width):
+    cell = _direct_write_cell(monkeypatch, width=width)
+    def advance():
+        before = len(cell.submitted)
+        result = cell.backend.try_put_paged_batch(cell.keys, 0, cell.tables, cell.plan)
+        assert len(cell.submitted) - before <= 1
+        return result
+    assert not cell.backend.has_pending_write_io()
+    assert advance() is None
+    assert cell.backend.has_pending_write_io() and cell.settled == []
+    assert advance() is None
+    assert len(cell.active) == 1 and cell.observations == []
+    cell.ready[0] = True
+    cell.backend.poll_write_plan()
+    assert cell.released == [11] and cell.settled == []
+    assert not cell.backend.has_pending_write_io() and len(cell.submitted) == 2
+    completion = advance()
+    assert completion._direction == "write" and cell.settled == []
+    assert cell.backend._target_plans["write"] is cell.plan
+    cell.backend.poll_write_plan()
+    result = completion.wait_result(0)
+    assert result.ok and sum(item.confirmed_bytes for item in result.results) == 8192
+    assert {item.batch_indices for item in result.results} == {(0,), (1,)}
+    assert cell.settled == [(True, (io_key(cell.keys[0], 0),), completion)]
+    assert advance() is completion
+    assert len(cell.submitted) == 3 and len(cell.settled) == 1
+    assert cell.released == [11, 13] and not cell.backend.has_pending_write_io()
+    assert all(request[-1] == "write" for batch, _ in cell.submitted for request in batch)
+    assert cell.events[-1][1] == "write" and completion.fence_event is cell.events[-1][2]
+    cell.backend.end_target_plan("write")
+    assert not cell.backend._write_batches and not cell.backend._target_plans
+
+
+def test_direct_write_layer_poll_does_not_scan_or_observe_other_cells(monkeypatch):
+    from types import SimpleNamespace as NS
+    cell = _direct_write_cell(monkeypatch, width=1)
+    assert cell.backend.try_put_paged_batch(cell.keys, 0, cell.tables) is None
+    def forbidden(*args, **kwargs):
+        raise AssertionError("layer poll scanned or advanced another write cell")
+    class ExactCells(dict):
+        items = forbidden
+    foreign = dict(parts=[NS(_settled=False, poll=forbidden)], completion=NS(poll=forbidden), error=None)
+    cell.backend._write_batches = ExactCells(cell.backend._write_batches)
+    cell.backend._write_batches[1, 1] = foreign
+    assert cell.backend.has_pending_write_io(0)
+    assert cell.backend.has_pending_write_io(1)
+    assert not cell.backend.has_pending_write_io(2)
+    cell.backend.poll_write_plan(2)
+    assert cell.observations == [] and len(cell.submitted) == 1
+    cell.ready[0] = True
+    cell.backend.poll_write_plan(0)
+    assert cell.released == [11] and cell.observations == [0]
+    assert not cell.backend.has_pending_write_io(0) and cell.backend.has_pending_write_io(1)
+    assert cell.settled == [] and len(cell.submitted) == 1
+    completion = cell.backend.try_put_paged_batch(cell.keys, 0, cell.tables)
+    cell.backend.poll_write_plan(0)
+    assert completion.poll() is True and len(cell.settled) == 1
+    assert cell.observations == [0, 0] and len(cell.submitted) == 2
+    cell.backend._write_batches = {(1, 0): cell.backend._write_batches[1, 0]}
+    cell.backend.end_target_plan("write")
+
+
+def test_write_layer_cleanup_drains_only_accepted_own_io_without_retry(monkeypatch):
+    from types import SimpleNamespace as NS
+    cell = _direct_write_cell(monkeypatch, width=1)
+    assert cell.backend.try_put_paged_batch(cell.keys, 0, cell.tables) is None
+    foreign = NS(wait_result=lambda: pytest.fail("cleanup waited another write layer"))
+    cell.backend._write_batches[1, 1] = dict(parts=[foreign], completion=None, error=None)
+    cell.backend.drain_write_layer(0)
+    assert len(cell.submitted) == 1 and cell.released == [11]
+    assert cell.settled == [] and cell.backend._target_plans["write"] is cell.plan
+    cell.backend._write_batches.pop((1, 1))
+    cell.backend.end_target_plan("write")
+
+
+def test_write_layer_cleanup_retains_unconfirmed_dma_until_safe_retry(monkeypatch):
+    cell = _direct_write_cell(monkeypatch, width=1)
+    assert cell.backend.try_put_paged_batch(cell.keys, 0, cell.tables) is None
+    wait = cell.backend._store._runtime.wait_result
+    def failed(*args):
+        raise RuntimeError("write completion unknown")
+    cell.backend._store._runtime.wait_result = failed
+    with pytest.raises(RuntimeError, match="write completion unknown"):
+        cell.backend.drain_write_layer(0)
+    assert cell.released == [] and cell.backend._target_plans["write"] is cell.plan
+    assert cell.backend.has_pending_write_io(layer_idx=0)
+    cell.backend._store._runtime.wait_result = wait
+    cell.backend.drain_write_layer(0)
+    assert cell.released == [11] and cell.settled == []
+    cell.backend.end_target_plan("write")
+
+
+@pytest.mark.parametrize("failure", ["keys", "tables", "generation", "invalid_token", "submit"])
+def test_direct_try_write_retry_failure_drains_without_partial_commit(monkeypatch, failure):
+    cell = _direct_write_cell(monkeypatch)
+    assert cell.backend.try_put_paged_batch(cell.keys, 0, cell.tables) is None
+    keys, tables = cell.keys, cell.tables
+    if failure == "keys":
+        keys = (b"z" * 16,)
+    elif failure == "tables":
+        tables = ((2, 7),)
+    elif failure == "generation":
+        cell.generation[0] = 2
+    elif failure == "invalid_token":
+        cell.backend._invalid_plan_tokens.add(1)
+    else:
+        def failed(*args, **kwargs):
+            raise RuntimeError("write retry submit failed")
+        cell.backend._store._runtime.submit = failed
+    with pytest.raises(RuntimeError) as error:
+        cell.backend.try_put_paged_batch(keys, 0, tables)
+    assert len(error.value.tutti_submitted_completions) == 1
+    assert cell.backend.has_pending_write_io() and cell.released == []
+    cell.backend.end_target_plan("write")
+    assert cell.released == [11] and cell.settled == []
+    assert not cell.backend._write_batches and not cell.backend.has_pending_write_io()
+
+
+@pytest.mark.parametrize("failure", ["cq", "observation"])
+def test_direct_try_write_closed_window_failure_retains_unsafe_plan(monkeypatch, failure):
+    cell = _direct_write_cell(monkeypatch, width=1)
+    assert cell.backend.try_put_paged_batch(cell.keys, 0, cell.tables) is None
+    observe = cell.backend._store._runtime.wait_result
+    def result(handle, timeout):
+        if failure == "observation":
+            raise RuntimeError("write observation failed")
+        return observe(handle, timeout)._replace(state="FAILED", failure_kind="NVME_CQ")
+    cell.backend._store._runtime.wait_result = result
+    cell.ready[0] = True
+    with pytest.raises(RuntimeError) as error:
+        cell.backend.poll_write_plan()
+    assert len(error.value.tutti_submitted_completions) == 1
+    assert len(cell.submitted) == 1 and cell.settled == []
+    if failure == "observation":
+        assert cell.backend.has_pending_write_io() and cell.released == []
+        with pytest.raises(RuntimeError, match="write observation failed"):
+            cell.backend.end_target_plan("write")
+        assert cell.backend._target_plans["write"] is cell.plan
+        assert cell.backend._write_batches
+        cell.backend._store._runtime.wait_result = observe
+    else:
+        assert not cell.backend.has_pending_write_io() and cell.released == [11]
+    cell.backend.end_target_plan("write")
+    assert not cell.active and cell.settled == [] and not cell.backend._write_batches
+
+
+@pytest.mark.parametrize("failure", ["cq", "observation"])
+def test_direct_try_write_whole_completion_preserves_late_failure(monkeypatch, failure):
+    cell = _direct_write_cell(monkeypatch)
+    assert cell.backend.try_put_paged_batch(cell.keys, 0, cell.tables) is None
+    cell.ready[0] = True
+    completion = cell.backend.try_put_paged_batch(cell.keys, 0, cell.tables)
+    assert cell.released == [11] and cell.settled == []
+    observe = cell.backend._store._runtime.wait_result
+    def result(handle, timeout):
+        if failure == "observation":
+            raise RuntimeError("late write observation failed")
+        return observe(handle, timeout)._replace(state="FAILED", failed_request_indices=(0,),
+                                                failure_scope="REQUEST_INDICES", failure_kind="NVME_CQ")
+    cell.backend._store._runtime.wait_result = result
+    if failure == "observation":
+        assert completion.poll() is None and cell.settled == []
+        with pytest.raises(RuntimeError, match="late write observation failed"):
+            cell.backend.end_target_plan("write")
+        assert cell.backend.has_pending_write_io() and cell.backend._write_batches
+        cell.backend._store._runtime.wait_result = observe
+    else:
+        assert completion.poll() is False
+        assert completion.wait_result(0).failed_batch_indices == (1,)
+        assert cell.settled == [(False, (io_key(cell.keys[0], 0),), completion)]
+        assert cell.backend._target_plans["write"] is cell.plan
+    cell.backend.end_target_plan("write")
+    assert len(cell.settled) == 1 and not cell.active and cell.released == [11, 12]
+
+
+@pytest.mark.parametrize("empty", [False, True])
+def test_direct_try_write_final_empty_noop_and_stale_replay(monkeypatch, empty):
+    cell = _direct_write_cell(monkeypatch)
+    keys, tables = ((), ()) if empty else (cell.keys, cell.tables)
+    if not empty:
+        cell.backend.try_put_paged_batch(keys, 0, tables)
+        cell.ready[0] = True
+    completion = cell.backend.try_put_paged_batch(keys, 0, tables)
+    assert completion.poll() is True and len(cell.settled) == 1
+    if empty:
+        assert not cell.submitted and completion.wait_result(0).results == ()
+    accepted = len(cell.submitted)
+    cell.backend.end_target_plan("write")
+    with pytest.raises(RuntimeError, match="no longer active"):
+        cell.backend.try_put_paged_batch(keys, 0, tables, cell.plan)
+    assert len(cell.submitted) == accepted and len(cell.settled) == 1
+
+
+def test_direct_async_try_write_enqueues_partials_before_write_fence(monkeypatch):
+    import tutti.storage.tutti_nvme.store as module
+    cell = _direct_write_cell(monkeypatch)
+    monkeypatch.setattr(module, "_ASYNC_COMPLETION", True)
+    def enqueue(parts):
+        assert cell.stream[0] == "write"
+        cell.events.append(("wait", tuple(handle for part in parts for handle in part._handles)))
+    cell.backend._store.enqueue_compute_wait = enqueue
+    assert cell.backend.try_put_paged_batch(cell.keys, 0, cell.tables) is None
+    cell.ready[0] = True
+    completion = cell.backend.try_put_paged_batch(cell.keys, 0, cell.tables)
+    assert [event[0] for event in cell.events] == ["wait", "wait", "fence"]
+    assert completion.fence_event is cell.events[-1][2] and cell.events[-1][1] == "write"
+    cell.backend.end_target_plan("write")
+
+
+@pytest.mark.parametrize("width", [None, 1])
+def test_direct_try_read_yields_once_and_releases_partial_handles_before_retry(monkeypatch, width):
+    cell = _direct_read_cell(monkeypatch, width=width)
+    def advance():
+        before = len(cell.submitted)
+        completion = cell.backend.try_get_paged_batch(cell.keys, 0, cell.tables, cell.plan)
+        assert len(cell.submitted) - before <= 1
+        return completion
+    assert advance() is None
+    assert len(cell.active) == 1 and len(cell.submitted) == 1
+    assert cell.observations == []
+    assert advance() is None
+    assert len(cell.active) == 1 and len(cell.submitted) == 2
+    cell.ready[0] = True
+    completion = advance()
+    assert completion is not None and len(cell.active) == 1
+    assert cell.released == [11] and cell.observations == [0]
+    callbacks = []
+    completion.add_done_callback(callbacks.append)
+    assert completion.poll() is True
+    result = completion.wait_result(0)
+    assert result.ok and sum(item.confirmed_bytes for item in result.results) == 8192
+    assert {item.batch_indices for item in result.results} == {(0,), (1,)}
+    assert callbacks == [result] and cell.released == [11, 13]
+    assert completion.poll() is True and callbacks == [result]
+    assert cell.backend._store._inflight_by_chunk == {}
+    assert all(request[-1] == "read" for batch, _ in cell.submitted for request in batch)
+    assert cell.events[-1][2] is completion.fence_event
+    cell.backend.end_target_plan("read")
+    assert cell.backend._read_batches == {} and cell.active == {}
+
+
+@pytest.mark.parametrize("failure", ["keys", "tables", "generation", "invalid_token", "submit"])
+@pytest.mark.parametrize("detached", [False, True])
+def test_direct_try_read_retry_failure_retains_accepted_dma_until_cleanup(monkeypatch, failure, detached):
+    cell = _direct_read_cell(monkeypatch, detached=detached)
+    assert cell.backend.try_get_paged_batch(cell.keys, 0, cell.tables, cell.plan) is None
+    keys, tables = cell.keys, cell.tables
+    if failure == "keys":
+        keys = (b"z" * 16,)
+    elif failure == "tables":
+        tables = ((2, 7),)
+    elif failure == "generation":
+        cell.generation[0] = 2
+    elif failure == "invalid_token":
+        cell.backend._invalid_plan_tokens.add(1)
+    else:
+        def failed(*a, **k):
+            raise RuntimeError("retry submit failed")
+        cell.backend._store._runtime.submit = failed
+    with pytest.raises(RuntimeError) as error:
+        cell.backend.try_get_paged_batch(keys, 0, tables, cell.plan)
+    parts = error.value.tutti_submitted_completions
+    assert len(parts) == 1 and parts[0]._handles == [11]
+    assert len(cell.active) == 1 and cell.released == []
+    if detached:
+        cell.backend.end_detached_read_plan(cell.plan)
+        assert cell.backend._detached_plans == {}
+    else:
+        cell.backend.end_target_plan("read")
+        assert cell.backend._target_plans == {}
+    assert cell.active == {} and cell.released == [11]
+    assert cell.backend._read_batches == {}
+    assert parts[0].wait_result(0).ok
+
+
+def test_direct_partial_closed_window_reaps_cap_one_without_submit_or_spurious_wake(monkeypatch):
+    from types import SimpleNamespace as NS
+    cell = _direct_read_cell(monkeypatch, width=1)
+    wakes = []
+    cell.backend._store._read_service = NS(wake=lambda: wakes.append(True))
+    assert cell.backend.has_pending_read_io(cell.plan) is False
+    cell.backend.poll_read_plan(cell.plan)
+    assert not wakes and not cell.submitted
+    assert cell.backend.try_get_paged_batch(cell.keys, 0, cell.tables, cell.plan) is None
+    assert len(wakes) == 1 and cell.backend.has_pending_read_io(cell.plan)
+    cell.backend.poll_read_plan(cell.plan)
+    cell.backend.poll_read_plan(cell.plan)
+    assert len(wakes) == 1 and not cell.observations and len(cell.submitted) == 1
+    cell.ready[0] = True
+    cell.backend.poll_read_plan(cell.plan)
+    assert cell.released == [11] and cell.observations == [0]
+    assert len(wakes) == 2 and not cell.backend.has_pending_read_io(cell.plan)
+    cell.backend.poll_read_plan(cell.plan)
+    assert len(wakes) == 2 and len(cell.submitted) == 1
+    completion = cell.backend.try_get_paged_batch(cell.keys, 0, cell.tables, cell.plan)
+    assert completion is not None and len(wakes) == 3
+    assert cell.backend.has_pending_read_io(cell.plan)
+    cell.backend.poll_read_plan(cell.plan)
+    assert len(wakes) == 4 and not cell.backend.has_pending_read_io(cell.plan)
+    assert completion.poll() is True and cell.released == [11, 12]
+
+
+@pytest.mark.parametrize("failure", ["cq", "observation"])
+def test_direct_partial_closed_window_failure_keeps_accepted_ownership_for_cancel(monkeypatch, failure):
+    cell = _direct_read_cell(monkeypatch, width=1, detached=True)
+    assert cell.backend.try_get_paged_batch(cell.keys, 0, cell.tables, cell.plan) is None
+    observe = cell.backend._store._runtime.wait_result
+    late = RuntimeError("closed window observation failure")
+    def result(handle, timeout):
+        if failure == "observation":
+            raise late
+        return observe(handle, timeout)._replace(state="FAILED", failed_request_indices=(0,),
+                                                failure_scope="REQUEST_INDICES", failure_kind="NVME_CQ",
+                                                message="closed window CQ failure")
+    cell.backend._store._runtime.wait_result = result
+    cell.ready[0] = True
+    with pytest.raises(RuntimeError) as error:
+        cell.backend.poll_read_plan(cell.plan)
+    assert len(cell.submitted) == 1
+    parts = error.value.tutti_submitted_completions
+    assert len(parts) == 1
+    if failure == "cq":
+        assert not cell.backend.has_pending_read_io(cell.plan)
+        assert cell.released == [11] and not parts[0].wait_result(0).ok
+    else:
+        assert cell.backend.has_pending_read_io(cell.plan)
+        assert not cell.released
+        with pytest.raises(RuntimeError, match="closed window observation failure"):
+            cell.backend.end_detached_read_plan(cell.plan)
+        assert cell.plan.plan_token in cell.backend._detached_plans
+        cell.backend._store._runtime.wait_result = observe
+    cell.backend.end_detached_read_plan(cell.plan)
+    assert cell.released == [11] and not cell.active and not cell.backend._read_batches
+    assert not cell.backend.has_pending_read_io(cell.plan)
+
+
+def test_direct_partial_invalidated_plan_can_reap_before_cancel_without_submitting(monkeypatch):
+    cell = _direct_read_cell(monkeypatch, width=1)
+    assert cell.backend.try_get_paged_batch(cell.keys, 0, cell.tables, cell.plan) is None
+    cell.backend._invalid_plan_tokens.add(cell.plan.plan_token)
+    cell.ready[0] = True
+    cell.backend.poll_read_plan(cell.plan)
+    assert cell.released == [11] and not cell.backend.has_pending_read_io(cell.plan)
+    with pytest.raises(RuntimeError, match="plan token 1 is invalid") as error:
+        cell.backend.try_get_paged_batch(cell.keys, 0, cell.tables, cell.plan)
+    assert error.value.tutti_submitted_completions[0].wait_result(0).ok
+    cell.backend.end_target_plan("read")
+    assert not cell.backend._read_batches and len(cell.submitted) == 1
+
+
+def test_direct_empty_try_read_needs_no_submit_and_keeps_empty_completion_contract(monkeypatch):
+    cell = _direct_read_cell(monkeypatch)
+    completion = cell.backend.try_get_paged_batch((), 0, (), cell.plan)
+    assert cell.submitted == [] and completion.poll() is True
+    assert completion.wait_result(0).results == ()
+
+
+def test_direct_async_try_read_enqueues_each_partial_on_submission_stream_before_fence(monkeypatch):
+    import tutti.storage.tutti_nvme.store as module
+    cell = _direct_read_cell(monkeypatch, detached=True)
+    monkeypatch.setattr(module, "_ASYNC_COMPLETION", True)
+    def enqueue(parts):
+        assert cell.stream[0] == "read_async"
+        cell.events.append(("wait", tuple(handle for part in parts for handle in part._handles)))
+        return True
+    cell.backend._store.enqueue_compute_wait = enqueue
+    assert cell.backend.try_get_paged_batch(cell.keys, 0, cell.tables, cell.plan) is None
+    cell.ready[0] = True
+    completion = cell.backend.try_get_paged_batch(cell.keys, 0, cell.tables, cell.plan)
+    assert [event[0] for event in cell.events] == ["wait", "wait", "fence"]
+    assert [batch[1] for batch in cell.submitted] == [456, 456]
+    assert cell.events[-1][1] == "read_async" and completion.fence_event is cell.events[-1][2]
+
+
+@pytest.mark.parametrize("failure", ["cq", "observation"])
+def test_direct_try_batch_preserves_late_failure_after_prior_segment_release(monkeypatch, failure):
+    cell = _direct_read_cell(monkeypatch)
+    cell.backend.try_get_paged_batch(cell.keys, 0, cell.tables, cell.plan)
+    cell.ready[0] = True
+    completion = cell.backend.try_get_paged_batch(cell.keys, 0, cell.tables, cell.plan)
+    assert cell.released == [11]
+    observe = cell.backend._store._runtime.wait_result
+    late = RuntimeError("late read observation failed")
+    def result(handle, timeout):
+        if failure == "observation":
+            raise late
+        return observe(handle, timeout)._replace(state="FAILED", failed_request_indices=(0,),
+                                                failure_scope="REQUEST_INDICES", failure_kind="NVME_CQ",
+                                                message="late read CQ failed")
+    cell.backend._store._runtime.wait_result = result
+    callbacks = []
+    completion.add_done_callback(callbacks.append)
+    if failure == "cq":
+        assert completion.poll() is False
+        outcome = completion.wait_result(0)
+        assert outcome.failed_batch_indices == (1,) and len(outcome.results) == 2
+        assert callbacks == [outcome] and cell.released == [11, 12]
+        cell.backend.end_target_plan("read")
+    else:
+        assert completion.poll() is None and completion.observation_error is late
+        assert cell.released == [11] and callbacks == []
+        with pytest.raises(RuntimeError, match="late read observation failed"):
+            cell.backend.end_target_plan("read")
+        assert cell.backend._target_plans["read"] is cell.plan
+        assert cell.backend._read_batches and cell.active
+        cell.backend._store._runtime.wait_result = observe
+        cell.backend.end_target_plan("read")
+        assert cell.released == [11, 12] and not cell.active
+        with pytest.raises(RuntimeError, match="late read observation failed"):
+            completion.wait_result(0)
+
+
+def test_layerwise_try_read_reuses_nonblocking_submission_with_entity_memory_ticket(monkeypatch):
+    from tutti.storage.tutti_nvme.layerwise_direct import TuttiLayerwiseDirectBackend, LayerPageGeometry
+    cell = _direct_read_cell(monkeypatch)
+    backend = TuttiLayerwiseDirectBackend(cell.backend._store)
+    backend._geometry = cell.backend._geometry
+    backend._memory_ticket = 3
+    backend._layer_tickets = [22]
+    backend._layer_pages = (LayerPageGeometry(4096, 4096, 8),)
+    backend._target_plans["read"] = cell.plan
+    assert backend.try_get_paged_batch(cell.keys, 0, cell.tables, cell.plan) is None
+    cell.ready[0] = True
+    completion = backend.try_get_paged_batch(cell.keys, 0, cell.tables, cell.plan)
+    assert completion.poll() is True
+    assert all(request[2] == 22 and request[4:] == (4096, "read")
+               for batch, _ in cell.submitted for request in batch)
+    assert cell.released == [11, 12]
+
+
+def test_ordinary_and_replica_share_submit_step_and_read_batch_completion():
+    from tutti.storage.tutti_nvme.replica_direct import _ReplicaSubmit, _ReplicaBatchCompletion
+    from tutti.storage.tutti_nvme.store import _SubmitStep, _ReadBatchCompletion
+    assert _ReplicaSubmit is _SubmitStep and _ReplicaBatchCompletion is _ReadBatchCompletion
+
+
+def test_ordinary_sync_read_cannot_duplicate_pending_nonblocking_cell(monkeypatch):
+    cell = _direct_read_cell(monkeypatch, detached=True)
+    backend = cell.backend
+    assert backend.try_get_paged_batch(cell.keys, 0, cell.tables, cell.plan) is None
+    accepted = len(cell.submitted)
+    with pytest.raises(RuntimeError, match="already owned"):
+        backend.get_paged_batch(cell.keys, 0, cell.tables, cell.plan)
+    assert len(cell.submitted) == accepted
+    cell.ready[0] = True
+    backend.end_detached_read_plan(cell.plan)
+    with pytest.raises(RuntimeError, match="no longer active"):
+        backend.try_get_paged_batch(cell.keys, 0, cell.tables, cell.plan)
+    assert len(cell.submitted) == accepted
+
+
+def test_ordinary_terminal_io_failure_does_not_permanently_retain_target_plan(monkeypatch):
+    cell = _direct_read_cell(monkeypatch, detached=True)
+    backend = cell.backend
+    assert backend.try_get_paged_batch(cell.keys, 0, cell.tables, cell.plan) is None
+    cell.ready[0] = True
+    observe = backend._store._runtime.wait_result
+    backend._store._runtime.wait_result = lambda handle, timeout: observe(handle, timeout)._replace(
+        state="FAILED", failed_request_indices=(0,), failure_scope="REQUEST_INDICES",
+        failure_kind="NVME_CQ", message="read CQ failure")
+    with pytest.raises(RuntimeError, match="read CQ failure"):
+        backend.poll_read_plan(cell.plan)
+    backend.end_detached_read_plan(cell.plan)
+    assert cell.released == [11]
+    assert backend._read_batches == {}
+    assert backend._detached_plans == {}
+
+
+def test_segment_failure_notifies_parent_before_other_accepted_dma_finishes():
+    from types import SimpleNamespace as NS
+    from tutti.storage.tutti_nvme.store import _ReadBatchCompletion, _SubmittedHandle, _TuttiCompletion
+    ready, released = {11: True, 12: False}, []
+    def result(handle, timeout):
+        failed = handle == 11
+        return NS(observation="OK", state="FAILED" if failed else "COMPLETED",
+                  confirmed_bytes=4096, timeout_seen=False,
+                  failed_request_indices=(0,) if failed else (),
+                  failure_scope="REQUEST_INDICES" if failed else "NONE",
+                  failure_kind="NVME_CQ" if failed else None, first_failed_entry=None,
+                  raw_cq_status=None, message="first segment failed" if failed else "")
+    runtime = NS(query_io=lambda handle: "COMPLETED" if ready[handle] else "IN_FLIGHT",
+                 wait_result=result, release_io=released.append)
+    parts = [_TuttiCompletion(runtime, [_SubmittedHandle(handle, (index,))], lambda ok: None,
+                              auto_watch=False, retain_observation_errors=True)
+             for handle, index in ((11, 3), (12, 7))]
+    batch = _ReadBatchCompletion(runtime, parts)
+    terminal, done = [], []
+    batch.add_terminal_callback(terminal.append)
+    batch.add_done_callback(done.append)
+    assert parts[0].poll() is False
+    assert len(terminal) == 1 and terminal[0].failed_batch_indices == (3,)
+    assert done == [] and not batch.io_terminal
+    assert released == [11] and parts[1]._handles == [12]
+    late = []
+    batch.add_terminal_callback(late.append)
+    assert late == terminal
+    ready[12] = True
+    assert batch.poll() is False
+    assert len(terminal) == len(done) == 1 and released == [11, 12]
+    assert {result.batch_indices for result in done[0].results} == {(3,), (7,)}
+
+
 def _reject_none(round_idx: int, count: int) -> set[int]:
     return set()
 
@@ -1601,3 +2182,24 @@ def test_checkpoint_if_due_rejects_bad_env(tmp_path, monkeypatch):
     monkeypatch.setenv("TUTTI_CHECKPOINT_INTERVAL_S", "not-a-number")
     store = TuttiKVStore(tmp_path / "bad", 4, SEG)
     assert store._checkpoint_interval_s == 60.0
+def test_drain_deferred_reads_retains_writes_and_unobserved_reads():
+    from types import SimpleNamespace
+    from tutti.storage.tutti_nvme.store import TuttiKVStore
+
+    store = object.__new__(TuttiKVStore)
+    calls = []
+    error = RuntimeError("read observation failed")
+    def failed_read():
+        calls.append("read")
+        raise error
+    read = SimpleNamespace(_direction="read", wait_result=failed_read)
+    write = SimpleNamespace(_direction="write", wait_result=lambda: calls.append("write"))
+    store._deferred_completions = [read, write]
+    with pytest.raises(RuntimeError, match="read observation failed"):
+        store.drain_deferred_completions(direction="read")
+    assert calls == ["read"]
+    assert store._deferred_completions == [write, read]
+    read.wait_result = lambda: calls.append("read-recovered")
+    store.drain_deferred_completions()
+    assert calls == ["read", "write", "read-recovered"]
+    assert store._deferred_completions == []

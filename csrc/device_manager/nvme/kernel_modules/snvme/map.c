@@ -60,17 +60,22 @@ typedef void (*phxfs_p2p_deregister_fn)(struct phxfs_p2p_handle*);
 
 static phxfs_p2p_register_fn   phx_register_fn;
 static phxfs_p2p_deregister_fn phx_deregister_fn;
+static bool phoenix_p2p;
+module_param(phoenix_p2p, bool, 0444);
+MODULE_PARM_DESC(phoenix_p2p, "Whether the Phoenix P2P service was selected at module init");
 
 /* Defined later in this file; used by force_release_gpu_memory's guard. */
 void release_gpu_memory(struct map* map);
 
 void map_p2p_service_probe(void)
 {
+    phoenix_p2p = false;
     phx_register_fn   = (phxfs_p2p_register_fn)   __symbol_get("phxfs_p2p_register");
     phx_deregister_fn = (phxfs_p2p_deregister_fn) __symbol_get("phxfs_p2p_deregister");
 
     if (phx_register_fn != NULL && phx_deregister_fn != NULL)
     {
+        phoenix_p2p = true;
         printk(KERN_INFO "snvme: phoenix P2P service detected, using it for GPU memory registration\n");
     }
     else
@@ -558,7 +563,7 @@ int map_gpu_memory(struct map* map, struct list* list)
     map->data = gd;
     map->release = release_gpu_memory;
 
-    /* ---- Try the Phoenix P2P service first (resolved once at init) ---- */
+    /* ---- Phoenix is the selected backend when resolved at init ---- */
     if (phx_register_fn != NULL)
     {
         struct phxfs_p2p_handle* handle = NULL;
@@ -567,25 +572,23 @@ int map_gpu_memory(struct map* map, struct list* list)
 
         err = phx_register_fn(map->vaddr, GPU_PAGE_SIZE * map->n_addrs,
                               &handle, &ioaddrs, &n);
-        if (err == 0 && handle != NULL)
+        gd->phx_handle = handle; /* unified cleanup owns any returned handle */
+        if (err == 0 && (handle == NULL || ioaddrs == NULL || n != map->n_addrs))
+            err = -EIO;
+        if (err != 0)
         {
-            /*
-             * Phoenix pinned the pages and returned bus addresses
-             * directly (skipping the peer-memory dma_map_pages, which fails
-             * once Phoenix has remapped the GPU BAR).  The handle owns
-             * the lifecycle -- including the phoenixfs module refcount
-             * -- until release_gpu_memory -> phx_deregister_fn.
-             */
-            gd->phx_handle = handle;
-            map->n_addrs = n;
-            for (i = 0; i < n; ++i)
-                map->addrs[i] = ioaddrs[i];
-            return 0;
+            printk(KERN_ERR "snvme: phoenix P2P registration failed, "
+                   "vaddr=0x%llx len=%llu expected_pages=%lu returned_pages=%u "
+                   "err=%d; native fallback disabled\n",
+                   (unsigned long long) map->vaddr,
+                   (unsigned long long) (GPU_PAGE_SIZE * map->n_addrs),
+                   map->n_addrs, n, err);
+            return err;
         }
-        /*
-         * Registration failed for this GPU -- fall through to the
-         * normal nvidia_p2p path.
-         */
+        /* The borrowed address table is owned by the Phoenix handle. */
+        for (i = 0; i < n; ++i)
+            map->addrs[i] = ioaddrs[i];
+        return 0;
     }
 
     /* ---- Normal path: peer_memory get_pages + dma_map_pages ---- */

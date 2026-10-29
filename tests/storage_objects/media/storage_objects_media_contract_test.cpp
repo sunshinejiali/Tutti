@@ -184,6 +184,33 @@ void test_materialisation(const std::string& dir) {
     CHECK(segment_file_is_ready(path, kFile, &ready).ok());
     CHECK(ready);
 
+    // A crash after ftruncate but before zero-fill/ready publication leaves a
+    // full-size unpublished file. Materialisation must rebuild it instead of
+    // retrying the same invalid FIEMAP layout forever.
+    const std::string interrupted = dir + "/mat/interrupted.seg";
+    {
+        const int raw = ::open(interrupted.c_str(), O_CREAT | O_RDWR, 0644);
+        REQUIRE(raw >= 0);
+        const bool sized = ::ftruncate(raw, static_cast<off_t>(kFile)) == 0;
+        const char byte = 'Z';
+        const bool marked = ::pwrite(raw, &byte, 1, 0) == 1;
+        ::close(raw);
+        REQUIRE(sized && marked);
+    }
+    CHECK(materialise_segment_file(interrupted, kFile).ok());
+    bool interrupted_ready = false;
+    CHECK(segment_file_is_ready(interrupted, kFile, &interrupted_ready).ok());
+    CHECK(interrupted_ready);
+    {
+        const int raw = ::open(interrupted.c_str(), O_RDONLY);
+        REQUIRE(raw >= 0);
+        char head = 0, tail = 1;
+        CHECK(::pread(raw, &head, 1, 0) == 1);
+        CHECK(::pread(raw, &tail, 1, kFile - 1) == 1);
+        CHECK(::close(raw) == 0);
+        CHECK(head == 'Z' && tail == 0);
+    }
+
     // Idempotent: a ready file is left alone, so re-materialising preserves a
     // committed object (tested by consequence rather than mtime).
     const ObjectKey survivor = key_of(0x7E);

@@ -86,6 +86,24 @@ def test_simplified_equal_page_specs_keep_independent_entities():
     validate_replica_io(config(), resolved)
 
 
+def test_replica_allows_explicit_compilation_without_graph(monkeypatch):
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "0")
+    c = config()
+    c.model_config.enforce_eager = False
+    c.compilation_config = NS(mode=3, cudagraph_mode=NS(name="NONE"))
+    validate_replica_io(c, extra())
+
+
+@pytest.mark.parametrize("graph", ["FULL", "PIECEWISE", None])
+def test_replica_rejects_graph_capture_even_with_compilation(monkeypatch, graph):
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "0")
+    c = config()
+    c.model_config.enforce_eager = False
+    c.compilation_config = NS(mode=3, cudagraph_mode=graph)
+    with pytest.raises(ValueError, match="CUDA graph"):
+        validate_replica_io(c, extra())
+
+
 def test_configuration_module_does_not_import_data_plane():
     import subprocess
     result = subprocess.run([sys.executable, "-c",

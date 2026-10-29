@@ -55,6 +55,13 @@ class TuttiWorkerMetadata(KVConnectorWorkerMetadata):
     read_samples: list[tuple[int, float]] = field(default_factory=list)
     #: 无同步读的步的 GPU 计算耗时样本 (tokens, ms)，供拟合 compute_ms(tokens)。
     step_samples: list[tuple[int, float]] = field(default_factory=list)
+    #: 传输 profile：(mode, chunks, layers, logical_io_ops, stream_ms, wall_ms,
+    #: queue_ms, bytes, overlap_ratio, exposed_wait_ms)。
+    profile_samples: list[tuple] = field(default_factory=list)
+    #: 请求级预读计数：(queued, started, completed, failed_or_cancelled)。
+    prefetch_stats: tuple[int, int, int, int] = (0, 0, 0, 0)
+    #: 请求级预读的端到端 worker 等待样本（毫秒），入队到所有层读完成。
+    prefetch_wait_ms: list[float] = field(default_factory=list)
 
     def aggregate(
         self, other: "KVConnectorWorkerMetadata"
@@ -71,4 +78,9 @@ class TuttiWorkerMetadata(KVConnectorWorkerMetadata):
             evicted=self.evicted | other.evicted,
             read_samples=list(self.read_samples) + list(other.read_samples),
             step_samples=list(self.step_samples) + list(other.step_samples),
+            profile_samples=list(self.profile_samples) + list(other.profile_samples),
+            prefetch_stats=tuple(a + b for a, b in zip(
+                self.prefetch_stats, other.prefetch_stats
+            )),
+            prefetch_wait_ms=list(self.prefetch_wait_ms) + list(other.prefetch_wait_ms),
         )

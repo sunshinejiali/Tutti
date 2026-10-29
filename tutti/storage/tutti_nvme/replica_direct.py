@@ -4,18 +4,19 @@ Main KV uses rank-local IO; index owners read into final paged index KV.
 Consumers pull remote index pages with one kernel per entity. Epoch-scoped notifications
 protect readiness and the final source pages until all consumers finish.
 """
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 import hashlib
 import json
 import logging
-import queue
 import struct
 import threading
 import time
 
 from tutti.common.nvtx import range as nvtx_range
 from .layerwise_direct import TuttiLayerwiseDirectBackend
-from .store import DirectAdmissionError, _TuttiCompletion
+from .store import (DirectAdmissionError, _TuttiCompletion,
+                    _SubmitStep as _ReplicaSubmit,
+                    _ReadBatchCompletion as _ReplicaBatchCompletion)
 
 _LOG = logging.getLogger(__name__)
 
@@ -182,14 +183,31 @@ class _ReplicaSignals:
 
 
 class _ScatterCompletion(_TuttiCompletion):
-    def __init__(self, runtime, event, check_failure=None):
+    def __init__(self, runtime, event, check_failure=None, owned_io=None, on_failure=None):
         super().__init__(runtime, [], lambda ok: None, auto_watch=False, direction="read")
         self.fence_event = event
         self._check_failure = check_failure
+        self._owned_io = owned_io
+        self._on_failure = on_failure
 
     def poll(self):
         if self._check_failure is not None:
             self._check_failure()
+        if self._settled:
+            return not self._failed
+        if self._owned_io is not None:
+            try:
+                status = self._owned_io.poll()
+                if self._owned_io.observation_error is not None:
+                    raise self._owned_io.observation_error
+                if status is False:
+                    raise RuntimeError(str(self._owned_io.wait_result(0)))
+            except Exception as exc:
+                if self._on_failure is not None:
+                    self._on_failure(exc)
+                raise
+            if status is None:
+                return None
         return super().poll() if self.fence_event.query() else None
 
     def query(self):
@@ -197,17 +215,119 @@ class _ScatterCompletion(_TuttiCompletion):
 
     def wait_result(self, timeout=None):
         deadline = time.monotonic() + timeout if timeout is not None else None
-        if self._check_failure is not None:
-            self._check_failure()
-        while not self.fence_event.query():
-            if self._check_failure is not None:
-                self._check_failure()
+        while self.poll() is None:
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError("replica scatter completion timed out")
             time.sleep(0.001)
-        if self._check_failure is not None:
-            self._check_failure()
-        return super().wait_result(timeout)
+        return super().wait_result(0)
+
+
+class _ReplicaReadTask:
+    def __init__(self, backend, plan):
+        self.backend, self.plan = backend, plan
+        self.states = []
+        self.produced = 0
+        self.failed = False
+        self._clock = time.monotonic()
+        self._paused = not self._window_open()
+
+    def _window_open(self):
+        return self.backend._background_allowed is None or self.backend._background_allowed() is not None
+
+    def _tick_window(self):
+        now = time.monotonic()
+        paused = not self._window_open()
+        if self._paused or paused:
+            elapsed = now - self._clock
+            for state in self.states:
+                state["deadline"] += elapsed
+            if self.backend._initializing:
+                self.backend._init_deadline += elapsed
+        self._clock, self._paused = now, paused
+
+    def needs_poll(self):
+        self._tick_window()
+        if self.failed or self.backend._prefetch_stop.is_set() or not self._paused:
+            return True
+        return any(any(index not in state.get("accounted", ())
+                       for index in range(len(state.get("parts", ())))) or
+                   (state["phase"] == "fence" and not state.get("finished")) or
+                   state["phase"] == "ack" for state in self.states)
+
+    def _retain_submissions(self):
+        for state in self.states:
+            self.backend._capture_submissions(state)
+            if state.get("parts") and state.get("completion") is None:
+                state["completion"] = self.backend._batch_completion(state["parts"])
+
+    def fail(self, exc):
+        self.failed = True
+        self._retain_submissions()
+        self.backend._fail(exc)
+
+    def advance(self):
+        before = self._progress()
+        finished = self._advance()
+        if self._progress() != before:
+            service = getattr(self.backend._store, "_read_service", None)
+            if service is not None:
+                service.wake()
+        return finished
+
+    def _progress(self):
+        return (self.backend._initializing, self.produced, self.backend._next_entity,
+                tuple((state["phase"], state.get("cq_done", False), state.get("finished", False),
+                       len(state.get("accounted", ())), len(state["submit"].handles),
+                       tuple(len(segment) for segment in state["submit"].segments))
+                      for state in self.states))
+
+    def _advance(self):
+        backend = self.backend
+        if self.failed:
+            return True
+        if backend._prefetch_stop.is_set():
+            self._retain_submissions()
+            return True
+        self._tick_window()
+        backend._check_read_failure()
+        for state in self.states:
+            backend._advance_owned(state)
+        if backend._initializing and not backend._advance_plan_init():
+            return False
+        if self.produced < len(backend._entity_sequence):
+            state = self.states[-1] if self.states and self.states[-1]["phase"] == "submit" else None
+            if state is None:
+                background_busy = (backend._parent is not None and self.states and
+                                   not self.states[-1].get("finished", False))
+                if not background_busy:
+                    physical = backend._entity_sequence[self.produced]
+                    with backend._cancel_lock, backend._background_scope() as allowed:
+                        if allowed and backend._admit_background_entity(physical):
+                            state = backend._new_entity(self.plan, physical)
+                            self.states.append(state)
+                            backend._advance_submit(state)
+            else:
+                with backend._cancel_lock, backend._background_scope() as allowed:
+                    if allowed and backend._admit_background_entity(state["physical"]):
+                        backend._advance_submit(state)
+            if state is not None and state["phase"] != "submit":
+                self.produced += 1
+        for state in self.states:
+            backend._advance_owned(state)
+        for state in self.states:
+            if state["phase"] == "submit":
+                break
+            if state["phase"] != "fence":
+                backend._advance_scatter(state)
+                if state["phase"] != "fence":
+                    break
+        for state in self.states:
+            if (state["phase"] == "fence" and state.get("cq_done")
+                    and not state.get("finished", False)):
+                if backend._parent is None or state["ready"].query():
+                    state["finished"] = True
+        return (self.produced == len(backend._entity_sequence) and
+                all(state.get("finished", False) for state in self.states))
 
 
 class TuttiReplicaDirectBackend(TuttiLayerwiseDirectBackend):
@@ -226,11 +346,10 @@ class TuttiReplicaDirectBackend(TuttiLayerwiseDirectBackend):
         self._exports = []
         self._raw_layers = ()
         self._entity_names = ()
-        self._prefetch_thread = None
-        self._completion_thread = None
-        self._scatter_thread = None
-        self._submitted_entities = queue.Queue()
-        self._recovered_entities = queue.Queue()
+        self._prefetch_job = None
+        self._prefetch_task = None
+        self._initializing = False
+        self._callback_entity = 0
         self._owned_work = []
         self._ipc_events = []
         self._peer_events = {}
@@ -301,7 +420,7 @@ class TuttiReplicaDirectBackend(TuttiLayerwiseDirectBackend):
 
     def start_detached_read(self, plan):
         reader = self._detached_readers[plan.plan_token]
-        reader.begin_prefetch(*reader._detached_args)
+        reader.begin_prefetch(*reader._detached_args, deferred_init=True)
 
     def cancel_detached_read(self, plan):
         reader = self._detached_readers.get(plan.plan_token)
@@ -309,6 +428,7 @@ class TuttiReplicaDirectBackend(TuttiLayerwiseDirectBackend):
             with reader._cancel_lock:
                 reader._cancel_requested.set()
                 reader._prefetch_stop.set()
+            self._store._read_service.wake()
 
     def end_detached_read_plan(self, plan):
         reader = self._detached_readers.get(plan.plan_token)
@@ -419,7 +539,7 @@ class TuttiReplicaDirectBackend(TuttiLayerwiseDirectBackend):
     def _record_write_result(self, result):
         self._stats["write_bytes"] += sum(item.confirmed_bytes for item in result.results)
 
-    def _check_plan(self, keys, block_tables, physical_layers):
+    def _check_plan(self, keys, block_tables, physical_layers, *, deferred=False):
         digest = hashlib.sha256()
         digest.update(repr((self.geometry.blocks_per_chunk, self.geometry.segment_bytes,
                             self._entity_names, physical_layers, tuple(len(g) for g in self._store._replica_groups),
@@ -428,22 +548,52 @@ class TuttiReplicaDirectBackend(TuttiLayerwiseDirectBackend):
             digest.update(struct.pack("<I", len(key)))
             digest.update(bytes(key))
             digest.update(struct.pack("<I", len(blocks)))
-        self._signals.begin(self._epoch, digest.digest())
+        if deferred:
+            self._signals.check()
+            if self._epoch <= self._signals.epoch:
+                raise RuntimeError("replica request epoch must increase")
+            self._signals.epoch = self._epoch
+            self._init_descriptor = digest.digest()
+            self._signals.store.set(f"{self._epoch}/plan/{self._rank}", self._init_descriptor)
+            self._initializing = True
+            self._init_deadline = time.monotonic() + _POLL_SECONDS
+        else:
+            self._signals.begin(self._epoch, digest.digest())
         prefix = f"{self._epoch}/blocks/"
         flat = [int(b) for table in block_tables for b in table]
         self._signals.store.set(prefix + str(self._rank), struct.pack(f"<{len(flat)}q", *flat))
-        self._signals.wait([prefix + str(r) for r in self._signals.ranks])
+        if not deferred:
+            self._signals.wait([prefix + str(r) for r in self._signals.ranks])
+            self._read_peer_tables(len(flat))
+
+    def _read_peer_tables(self, count):
         self._peer_tables = {}
         width = self.geometry.blocks_per_chunk
         for rank in self._signals.ranks:
-            blob = self._signals.store.get(prefix + str(rank))
-            if len(blob) != len(flat) * 8:
+            blob = self._signals.store.get(f"{self._epoch}/blocks/{rank}")
+            if len(blob) != count * 8:
                 raise ValueError("replica peer block table size differs")
-            blocks = struct.unpack(f"<{len(flat)}q", blob)
+            blocks = struct.unpack(f"<{count}q", blob)
             if any(b < 0 for b in blocks) or len(blocks) != len(set(blocks)):
                 raise ValueError("replica peer block table is negative or overlapping")
             self._peer_tables[rank] = tuple(tuple(blocks[i:i + width])
                                             for i in range(0, len(blocks), width))
+
+    def _advance_plan_init(self):
+        keys = [f"{self._epoch}/{phase}/{rank}" for phase in ("plan", "blocks")
+                for rank in self._signals.ranks]
+        if not self._signals.store.check(keys):
+            if time.monotonic() >= self._init_deadline:
+                raise TimeoutError("replica plan initialization timed out")
+            return False
+        if any(self._signals.store.get(f"{self._epoch}/plan/{rank}") != self._init_descriptor
+               for rank in self._signals.ranks):
+            raise RuntimeError("replica keys or entity geometry differ across ranks")
+        self._read_peer_tables(sum(map(len, self._prefetch_tables)))
+        with self._store.stream_context(self._read_direction):
+            self._build_scatter_plans(self._entity_sequence)
+        self._initializing = False
+        return True
 
     def _fail(self, error):
         if self._cancel_requested.is_set() and str(error) in (
@@ -534,12 +684,11 @@ class TuttiReplicaDirectBackend(TuttiLayerwiseDirectBackend):
             plan.close()
         self._scatter_plans.clear()
 
-    def begin_prefetch(self, keys, block_tables, physical_layers):
+    def begin_prefetch(self, keys, block_tables, physical_layers, *, deferred_init=False):
         import torch
         if self._closing or self._poisoned:
             raise RuntimeError("replica backend is closing or poisoned; restart the worker")
-        if (self._prefetch_thread is not None or self._completion_thread is not None
-                or self._scatter_thread is not None or self._active_token is not None):
+        if self._prefetch_job is not None or self._active_token is not None:
             raise RuntimeError("replica prefetch already active")
         plan = self._target_plans["read"]
         self._validate_target_plan(plan)
@@ -566,301 +715,203 @@ class TuttiReplicaDirectBackend(TuttiLayerwiseDirectBackend):
                 self._compute_prefix.record(torch.cuda.current_stream(self.geometry.accel_id))
             self._entity_fences.clear()
             self._local_completions.clear()
-            self._check_plan(self._prefetch_keys, self._prefetch_tables, physical_layers)
+            if deferred_init:
+                self._check_plan(self._prefetch_keys, self._prefetch_tables, physical_layers, deferred=True)
+            else:
+                self._check_plan(self._prefetch_keys, self._prefetch_tables, physical_layers)
             with self._store.stream_context(self._io_direction):
                 self._store._stream_for(self._io_direction)[1].wait_event(self._compute_prefix)
-            with self._store.stream_context(self._read_direction):
-                self._build_scatter_plans(physical_layers)
+            if not deferred_init:
+                with self._store.stream_context(self._read_direction):
+                    self._build_scatter_plans(physical_layers)
+            for key in self._prefetch_keys:
+                self._validate_plan_entry(plan.entry_for(key))
             self._entity_sequence = physical_layers
-            self._ready_entities = queue.Queue()
-            self._submitted_entities = queue.Queue()
-            self._recovered_entities = queue.Queue()
-            self._next_entity = 0
-            self._completion_thread = threading.Thread(target=self._complete_owned,
-                args=(), name="tutti-replica-completion", daemon=True)
-            self._prefetch_thread = threading.Thread(target=self._produce_owned,
-                args=(plan,), name="tutti-replica-prefetch", daemon=True)
-            # The cross-rank restore runs ahead of the consumer: the forward
-            # thread only waits for the fence of a layer that is already
-            # restored instead of paying the per-entity notifications.
-            self._scatter_thread = threading.Thread(target=self._drive_scatter,
-                args=(), name="tutti-replica-scatter", daemon=True)
-            try:
-                self._completion_thread.start()
-            except Exception:
-                self._completion_thread = self._prefetch_thread = self._scatter_thread = None
-                raise
-            try:
-                self._prefetch_thread.start()
-            except Exception:
-                self._prefetch_thread = self._scatter_thread = None
-                raise
-            try:
-                self._scatter_thread.start()
-            except Exception:
-                self._scatter_thread = None
-                raise
+            self._next_entity = self._callback_entity = 0
+            self._prefetch_task = _ReplicaReadTask(self, plan)
+            self._prefetch_job = self._store._read_service.submit(
+                self._prefetch_task, priority=1 if self._parent is not None else 0)
         except Exception as exc:
             self._fail(exc)
             self._prefetch_stop.set()
             raise
 
-    def _queue_get(self, channel):
-        deadline = time.monotonic() + _POLL_SECONDS
-        while not self._prefetch_stop.is_set():
-            if self._prefetch_error is not None:
-                raise self._prefetch_error
-            self._signals.check()
-            try:
-                item = channel.get(timeout=0.01)
-                if self._cancel_requested.is_set():
-                    raise RuntimeError("replica prefetch stopped")
-                return item
-            except queue.Empty:
-                if self._parent is None and time.monotonic() >= deadline:
-                    raise TimeoutError("replica prefetch queue timed out")
-        raise RuntimeError("replica prefetch stopped")
-
-    def _queue_put(self, value):
-        self._signals.check()
+    def _admit_background_entity(self, physical):
         if self._prefetch_stop.is_set():
-            raise RuntimeError("replica prefetch stopped")
-        self._ready_entities.put(value)
-
-    def _admit_background_entity(self, physical, phase="read"):
+            return False
         if self._background_allowed is None:
-            return
-        while not self._prefetch_stop.is_set():
-            self._check_read_failure()
-            token = self._background_allowed()
-            if token is not None and token != self._background_token:
-                self._background_token = token
+            return True
+        token = self._background_allowed()
+        if token is None:
+            return False
+        self._background_token = token
+        return True
+
+    def _new_entity(self, plan, physical):
+        members = tuple(self._store._replica_groups[physical])
+        if members not in self._owned_indices:
+            self._owned_indices[members] = shard_indices(
+                self._prefetch_keys, len(members))[members.index(self._rank)]
+        requests = []
+        for index in self._owned_indices[members]:
+            key, blocks = self._prefetch_keys[index], self._prefetch_tables[index]
+            entry = plan.entry_for(key)
+            self._validate_plan_entry(entry)
+            for ordinal, block in enumerate(blocks):
+                requests.extend(super()._page_requests(physical, block, ordinal, entry, plan))
+        return dict(physical=physical, members=members, phase="submit",
+                    submit=_ReplicaSubmit(self._store, requests, self._io_direction),
+                    deadline=time.monotonic() + _POLL_SECONDS)
+
+    def _own_completion(self, handles):
+        completion = _TuttiCompletion(self._store._runtime, handles, lambda ok: None,
+                                      auto_watch=False, direction="read", retain_observation_errors=True)
+        self._owned_work.append((completion, None))
+        self._store._track_completion(completion, self._prefetch_keys)
+        return completion
+
+    def _capture_submissions(self, state):
+        parts = state.setdefault("parts", [])
+        handles = state["submit"].handles
+        for handle in handles[len(parts):]:
+            parts.append(self._own_completion((handle,)))
+        state["submit"].completions = parts
+        return parts
+
+    def _batch_completion(self, parts):
+        if len(parts) == 1:
+            return parts[0]
+        return _ReplicaBatchCompletion(self._store._runtime, parts)
+
+    def _advance_submit(self, state):
+        import torch
+        physical, members = state["physical"], state["members"]
+        if time.monotonic() >= state["deadline"]:
+            raise TimeoutError("replica submit capacity timed out; backing retained")
+        with self._read_event_lock, self._store.stream_context(self._io_direction), nvtx_range(
+                f"tutti.replica.read_owned|layer={physical}|rank={self._rank}|op={self._io_direction}|mode=direct_pages"):
+            count = len(state.get("parts", ()))
+            try:
+                finished = state["submit"].advance()
+            finally:
+                parts = self._capture_submissions(state)
+            from .store import _ASYNC_COMPLETION
+            if _ASYNC_COMPLETION:
+                self._store.enqueue_compute_wait(parts[count:])
+            if not finished:
                 return
-            self._prefetch_stop.wait(0.001)
-        raise RuntimeError("replica background read stopped")
+            completion = self._batch_completion(parts)
+            state["completion"] = completion
+            done = torch.cuda.Event(interprocess=len(members) > 1)
+            self._ipc_events.append(done)
+            state["io_done"] = done
+            if parts:
+                self._owned_work[-1] = (parts[-1], done)
+            done.record(self._store._stream_for(self._io_direction)[1])
+            if len(members) == 1:
+                completion.fence_event = done
+                self._local_completions[physical] = completion
+        if len(members) > 1:
+            self._signals.ready(physical, done.ipc_handle())
+        state["phase"] = "ready"
+        state["deadline"] = time.monotonic() + _POLL_SECONDS
 
-    @contextmanager
-    def _before_background_submit(self, handles):
-        if self._background_allowed is None:
-            yield
+    def _advance_owned(self, state):
+        if state.get("cq_done"):
             return
-        paused_at = None
-        while not self._prefetch_stop.is_set():
-            self._check_read_failure()
-            with self._cancel_lock, self._background_scope() as allowed:
-                if allowed and self._background_allowed() is not None and not self._prefetch_stop.is_set():
-                    if paused_at is not None:
-                        self._submit_deadline = getattr(self, "_submit_deadline", paused_at) + time.monotonic() - paused_at
-                    yield
-                    return
-            if paused_at is None:
-                paused_at = time.monotonic()
-            for handle in handles:
-                self._store._runtime.query_io(handle.handle)
-            self._prefetch_stop.wait(0.001)
-        raise RuntimeError("replica background read stopped")
+        parts = state.get("parts")
+        if parts is None:
+            parts = [state["completion"]] if "completion" in state else []
+        statuses = []
+        accounted = state.setdefault("accounted", set())
+        for index, completion in enumerate(parts):
+            status = completion.poll()
+            if completion.observation_error is not None:
+                raise completion.observation_error
+            statuses.append(status)
+            if status is None:
+                if time.monotonic() >= state["deadline"]:
+                    raise TimeoutError("replica owned IO timed out; backing retained")
+                continue
+            outcome = completion.wait_result(0)
+            if index not in accounted:
+                self._stats["read_bytes"] += sum(r.confirmed_bytes for r in outcome.results)
+                accounted.add(index)
+            if not outcome.ok:
+                raise RuntimeError(str(outcome))
+        if state["phase"] != "submit" and all(status is True for status in statuses):
+            state["cq_done"] = True
 
-    def _produce_owned(self, plan):
-        import torch
-        try:
-            torch.cuda.set_device(self.geometry.accel_id)
-            for key in self._prefetch_keys:
-                self._validate_plan_entry(plan.entry_for(key))
-            for physical in self._entity_sequence:
-                self._signals.check()
-                if self._prefetch_stop.is_set():
-                    return
-                members = tuple(self._store._replica_groups[physical])
-                if members not in self._owned_indices:
-                    self._owned_indices[members] = shard_indices(
-                        self._prefetch_keys, len(members))[members.index(self._rank)]
-                self._admit_background_entity(physical)
-                requests = []
-                with self._read_event_lock, self._store.stream_context(self._io_direction), nvtx_range(
-                        f"tutti.replica.read_owned|layer={physical}|rank={self._rank}|op={self._io_direction}|mode=direct_pages"):
-                    for index in self._owned_indices[members]:
-                        key, blocks = self._prefetch_keys[index], self._prefetch_tables[index]
-                        entry = plan.entry_for(key)
-                        self._validate_plan_entry(entry)
-                        for ordinal, block in enumerate(blocks):
-                            requests.extend(super()._page_requests(physical, block, ordinal, entry, plan))
-                    self._submit_deadline = time.monotonic() + _POLL_SECONDS
-                    handles = self._store._submit_retry(requests, "read", stream_direction=self._io_direction,
-                                                        on_backpressure=self._wait_submit_capacity,
-                                                        before_submit=self._before_background_submit)
-                    completion = _TuttiCompletion(self._store._runtime, handles, lambda ok: None,
-                                                  auto_watch=False, direction="read",
-                                                  retain_observation_errors=self._parent is not None)
-                    self._owned_work.append((completion, None))
-                    self._store._track_completion(completion, self._prefetch_keys)
-                    from .store import _ASYNC_COMPLETION
-                    if _ASYNC_COMPLETION:
-                        self._store.enqueue_compute_wait((completion,))
-                    done = torch.cuda.Event(interprocess=len(members) > 1)
-                    self._ipc_events.append(done)
-                    if len(members) == 1:
-                        completion.fence_event = done
-                        self._local_completions[physical] = completion
-                    self._owned_work[-1] = (completion, done)
-                    done.record(self._store._stream_for(self._io_direction)[1])
-                if len(members) > 1:
-                    self._signals.ready(physical, done.ipc_handle())
-                self._queue_put((physical, done, None))
-                self._submitted_entities.put((physical, completion, done))
-                if self._parent is not None:
-                    while not self._prefetch_stop.is_set():
-                        with self._read_event_lock:
-                            ready = self._entity_fences.get(physical)
-                        if ready is not None:
-                            self._wait_event(ready)
-                            outcome = completion.wait_result()
-                            if not outcome.ok:
-                                raise RuntimeError(str(outcome))
-                            break
-                        self._check_read_failure()
-                        self._prefetch_stop.wait(0.001)
-        except Exception as exc:
-            retained = tuple(getattr(exc, "tutti_submitted_completions", ()))
-            for completion in retained:
-                self._owned_work.append((completion, None))
-            self._store._deferred_completions[:] = [
-                completion for completion in self._store._deferred_completions
-                if completion not in retained]
-            self._fail(exc)
-        finally:
-            self._submitted_entities.put(None)
+    def _peer_phase_ready(self, state, phase):
+        keys = [f"{self._epoch}/{phase}/{state['physical']}/{rank}" for rank in state["members"]]
+        if self._signals.store.check(keys):
+            return True
+        if time.monotonic() >= state["deadline"]:
+            raise TimeoutError(f"replica notification timed out: {keys}")
+        return False
 
-    def _wait_submit_capacity(self, handles):
-        with nvtx_range(f"tutti.replica.capacity_wait|rank={self._rank}"):
-            self._signals.check()
-            if self._prefetch_stop.is_set():
-                raise RuntimeError("replica prefetch stopped")
-            if time.monotonic() >= self._submit_deadline:
-                raise TimeoutError("replica submit capacity timed out; backing retained")
-            if handles:
-                self._store._runtime.query_io(handles[-1].handle)
-            with self._store._inflight_lock:
-                active = {item for pending in self._store._inflight_by_chunk.values()
-                          for item in pending}
-            for completion in active:
-                completion.poll()
-            self._prefetch_stop.wait(0.0001)
-
-    def _complete_owned(self):
-        import torch
-        try:
-            torch.cuda.set_device(self.geometry.accel_id)
-            while True:
-                item = self._queue_get(self._submitted_entities)
-                if item is None:
-                    return
-                physical, completion, done = item
-                with nvtx_range(f"tutti.replica.owned_complete|layer={physical}|rank={self._rank}"):
-                    self._wait_event(done)
-                    deadline = time.monotonic() + _POLL_SECONDS
-                    while completion.poll() is None:
-                        self._signals.check()
-                        if self._prefetch_stop.wait(0.0001):
-                            return
-                        if time.monotonic() >= deadline:
-                            raise TimeoutError("replica owned IO timed out; backing retained")
-                    outcome = completion.wait_result()
-                    self._stats["read_bytes"] += sum(r.confirmed_bytes for r in outcome.results)
-                    if not outcome.ok:
-                        raise RuntimeError(str(outcome))
-        except Exception as exc:
-            self._fail(exc)
-
-    def _drive_scatter(self):
-        """Restore every cache entity ahead of the consumer.
-
-        The per-entity cross-rank notifications (peer readiness and the source
-        page release) used to run on the forward thread once per layer.  They
-        now run here: compute only waits for the fence of a layer that this
-        thread has already restored, so the read no longer advances at the
-        pace of the forward thread.
-        """
-        import torch
-        try:
-            torch.cuda.set_device(self.geometry.accel_id)
-            while self._next_entity < len(self._entity_sequence):
-                self._signals.check()
-                if self._prefetch_stop.is_set():
-                    return
-                physical = self._entity_sequence[self._next_entity]
-                members = tuple(self._store._replica_groups[physical])
-                page = self._layer_pages[physical]
-                label = f"layer={physical}|rank={self._rank}"
-                with nvtx_range(f"tutti.replica.owned_wait|{label}"):
-                    item = self._queue_get(self._ready_entities)
-                if item is None:
-                    return
-                if item[0] != physical:
-                    raise RuntimeError("replica prefetch entity order differs")
-                _, io_done, error = item
-                if error is not None:
-                    raise error
-                if len(members) == 1:
-                    with self._read_event_lock:
-                        self._entity_fences[physical] = io_done
-                    self._next_entity += 1
-                    self._recovered_entities.put((physical, io_done))
-                    continue
-                with nvtx_range(f"tutti.replica.peer_wait|{label}"):
-                    self._signals.wait_ready(physical, members, self._prefetch_stop)
-                self._admit_background_entity(physical, "scatter")
-                scatter_plan = self._scatter_plans[physical]
-                self._retained.append(scatter_plan)
-                with self._read_event_lock, self._store.stream_context(self._read_direction):
-                    if io_done is not None:
-                        self._store._stream_for(self._read_direction)[1].wait_event(io_done)
-                    self._wait_peer_events(physical, members, "ready")
-                    with self._before_background_submit(()), nvtx_range(
-                            f"tutti.replica.scatter|{label}|op={self._read_direction}|mode=direct_pages"):
-                        scatter_plan.launch()
-                    free = self._retain_device_work(scatter_plan)
-                self._signals.ack(physical, free.ipc_handle())
-                with nvtx_range(f"tutti.replica.source_release|{label}"):
-                    self._signals.wait_acks(physical, self._prefetch_stop, members)
+    def _advance_scatter(self, state):
+        physical, members = state["physical"], state["members"]
+        if physical != self._entity_sequence[self._next_entity]:
+            raise RuntimeError("replica prefetch entity order differs")
+        if len(members) == 1:
+            ready = state["io_done"]
+        else:
+            if state["phase"] == "ready":
+                with self._cancel_lock, self._background_scope() as allowed:
+                    if not allowed or not self._admit_background_entity(physical):
+                        return
+                    if not self._peer_phase_ready(state, "ready"):
+                        return
+                    scatter_plan = self._scatter_plans[physical]
+                    self._retained.append(scatter_plan)
                     with self._read_event_lock, self._store.stream_context(self._read_direction):
-                        self._wait_peer_events(physical, members, "ack")
-                        record = (self._store.record_read_async_event if self._parent is not None
-                                  else self._store.record_read_event)
-                        ready = record()
-                        self._entity_fences[physical] = ready
-                self._stats["gather_bytes"] += sum(
-                    owner_index(key, len(members)) != members.index(self._rank)
-                    for key in self._prefetch_keys
-                ) * self.geometry.blocks_per_chunk * page.page_bytes
-                self._next_entity += 1
-                self._recovered_entities.put((physical, ready))
-        except Exception as exc:
-            self._fail(exc)
-        finally:
-            self._recovered_entities.put(None)
+                        self._store._stream_for(self._read_direction)[1].wait_event(state["io_done"])
+                        self._wait_peer_events(physical, members, "ready")
+                        with nvtx_range(f"tutti.replica.scatter|layer={physical}|rank={self._rank}|op={self._read_direction}|mode=direct_pages"):
+                            scatter_plan.launch()
+                        free = self._retain_device_work(scatter_plan)
+                    self._signals.ack(physical, free.ipc_handle())
+                    state["phase"] = "ack"
+                    state["deadline"] = time.monotonic() + _POLL_SECONDS
+            if not self._peer_phase_ready(state, "ack"):
+                return
+            with self._read_event_lock, self._store.stream_context(self._read_direction):
+                self._wait_peer_events(physical, members, "ack")
+                record = (self._store.record_read_async_event if self._parent is not None
+                          else self._store.record_read_event)
+                ready = record()
+            self._stats["gather_bytes"] += sum(
+                owner_index(key, len(members)) != members.index(self._rank)
+                for key in self._prefetch_keys
+            ) * self.geometry.blocks_per_chunk * self._layer_pages[physical].page_bytes
+        state["ready"] = ready
+        state["phase"] = "fence"
+        with self._read_event_lock:
+            self._entity_fences[physical] = ready
+        self._next_entity += 1
 
     def join_prefetch(self):
-        for name in ("_prefetch_thread", "_scatter_thread"):
-            thread = getattr(self, name)
-            if thread is not None:
-                thread.join(timeout=_POLL_SECONDS)
-                if thread.is_alive():
-                    raise TimeoutError("replica prefetch did not stop; backing retained")
+        if self._prefetch_job is not None:
+            self._prefetch_job.join(timeout=_POLL_SECONDS)
+            if self._prefetch_job.is_alive():
+                raise TimeoutError("replica prefetch did not stop; backing retained")
         if self._prefetch_error is not None:
             raise self._prefetch_error
 
     def stop_prefetch(self):
-        if (not self._poisoned and self._active_token is not None
-                and self._next_entity != len(self._entity_sequence)):
+        if (not self._poisoned and not self._cancel_requested.is_set()
+                and self._active_token is not None and self._next_entity != len(self._entity_sequence)):
             self._fail(RuntimeError("replica request aborted"))
         self._prefetch_stop.set()
-        for name in ("_prefetch_thread", "_scatter_thread", "_completion_thread"):
-            thread = getattr(self, name)
-            if thread is not None:
-                thread.join(timeout=_POLL_SECONDS)
-                if thread.is_alive():
-                    raise TimeoutError("replica prefetch did not stop; backing retained")
-                setattr(self, name, None)
+        service = getattr(self._store, "_read_service", None)
+        if service is not None:
+            service.wake()
+        if self._prefetch_job is not None:
+            self._prefetch_job.join(timeout=_POLL_SECONDS)
+            if self._prefetch_job.is_alive():
+                raise TimeoutError("replica prefetch did not stop; backing retained")
+            self._prefetch_job = None
 
     def _quiesce(self):
         if self._quiesced:
@@ -868,11 +919,10 @@ class TuttiReplicaDirectBackend(TuttiLayerwiseDirectBackend):
         started_poisoned = self._poisoned
         if (self._active_token is not None and not self._poisoned
                 and self._next_entity == len(self._entity_sequence)):
-            self.join_prefetch()
-            if self._completion_thread is not None:
-                self._completion_thread.join(timeout=_POLL_SECONDS)
-                if self._completion_thread.is_alive():
-                    raise TimeoutError("replica completion did not stop; backing retained")
+            try:
+                self.join_prefetch()
+            except Exception as exc:
+                self._fail(exc)
         self.stop_prefetch()
         if not self._recover_lock.acquire(timeout=_POLL_SECONDS):
             raise TimeoutError("replica recovery still active; backing retained")
@@ -914,8 +964,7 @@ class TuttiReplicaDirectBackend(TuttiLayerwiseDirectBackend):
             self._owned_work.clear()
             self._peer_events.clear()
             self._ipc_events.clear()
-            while not self._submitted_entities.empty():
-                self._submitted_entities.get_nowait()
+            self._prefetch_task = None
             self._quiesced = True
             if not started_poisoned and self._prefetch_error is not None:
                 raise self._prefetch_error
@@ -934,15 +983,30 @@ class TuttiReplicaDirectBackend(TuttiLayerwiseDirectBackend):
         super().end_target_plan(direction)
 
     def get_paged_batch(self, keys, layer_idx, block_tables, target_plan=None):
+        deadline = time.monotonic() + _POLL_SECONDS
+        while True:
+            completion = self.try_get_paged_batch(keys, layer_idx, block_tables, target_plan)
+            if completion is not None:
+                return completion
+            if time.monotonic() >= deadline:
+                error = TimeoutError("replica restore fence timed out")
+                self._fail(error)
+                raise error
+            time.sleep(0.0001)
+
+    def try_get_paged_batch(self, keys, layer_idx, block_tables, target_plan=None):
         if target_plan is not None and target_plan.plan_token in self._detached_readers:
-            return self._detached_readers[target_plan.plan_token].get_paged_batch(
+            return self._detached_readers[target_plan.plan_token].try_get_paged_batch(
                 keys, layer_idx, block_tables, target_plan)
-        with self._recover_lock:
-            try:
-                return self._recover_batch(keys, layer_idx, block_tables, target_plan)
-            except Exception as exc:
-                self._fail(exc)
-                raise
+        if not self._recover_lock.acquire(blocking=False):
+            return None
+        try:
+            return self._recover_batch(keys, layer_idx, block_tables, target_plan)
+        except Exception as exc:
+            self._fail(exc)
+            raise
+        finally:
+            self._recover_lock.release()
 
     def _recover_batch(self, keys, layer_idx, block_tables, target_plan=None):
         from tutti.index.chunk_index import derive_io_key
@@ -958,27 +1022,31 @@ class TuttiReplicaDirectBackend(TuttiLayerwiseDirectBackend):
         if plan is None:
             plan = self.begin_target_plan(keys, "read")
         self._validate_target_plan(plan)
-        if self._prefetch_thread is None or plan.plan_token != self._active_token:
+        if self._prefetch_job is None or plan.plan_token != self._active_token:
             raise RuntimeError("replica recovery requires its active prefetch plan")
         if self._closing:
             raise RuntimeError("replica backend is closing")
         self._signals.check()
         if tuple(keys) != self._prefetch_keys or tuple(map(tuple, block_tables)) != self._prefetch_tables:
             raise RuntimeError("replica recovery differs from its prefetch plan")
-        start = time.perf_counter()
-        label = f"layer={layer_idx}|rank={self._rank}"
-        with nvtx_range(f"tutti.replica.prefetch_wait|{label}"):
-            item = self._queue_get(self._recovered_entities)
-        if item is None:
-            raise self._prefetch_error or RuntimeError("replica restore stopped before this layer")
-        physical, ready = item
-        if physical != layer_idx:
+        if (self._callback_entity >= len(self._entity_sequence)
+                or self._entity_sequence[self._callback_entity] != layer_idx):
             raise RuntimeError("replica recovery callback is duplicated or out of order")
+        if self._prefetch_error is not None:
+            raise self._prefetch_error
+        with self._read_event_lock:
+            ready = self._entity_fences.get(layer_idx)
+        if ready is None:
+            if self._prefetch_stop.is_set():
+                raise RuntimeError("replica restore stopped before this layer")
+            return None
+        self._callback_entity += 1
         self._stats["read_layers"] += 1
-        self._stats["read_seconds"] += time.perf_counter() - start
         if layer_idx in self._local_completions:
             return self._local_completions[layer_idx]
-        return _ScatterCompletion(self._store._runtime, ready, self._check_read_failure)
+        owned = next(state["completion"] for state in self._prefetch_task.states
+                     if state["physical"] == layer_idx)
+        return _ScatterCompletion(self._store._runtime, ready, self._check_read_failure, owned, self._fail)
 
     def close(self):
         if self._closed:

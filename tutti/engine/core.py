@@ -182,6 +182,115 @@ def _bind_thread_cuda_device(store) -> None:
                    exc_info=True)
 
 
+class _QueuedWrite:
+    def __init__(self, engine, keys, layer, tables, compute_done):
+        self.engine = engine
+        self.keys, self.layer = tuple(keys), layer
+        self.tables = tuple(tuple(table) for table in tables)
+        self.compute_done = compute_done
+        self.front = engine._active_read_plan
+        self.backend = engine._transfer._backend
+        self.service = engine._get_read_service()
+        self.completion = None
+        self.error = None
+        self.cleanup = None
+        self.stopped = False
+        self.fenced = False
+        self.job = self.service.submit(self, priority=1)
+
+    @property
+    def _submitted(self):
+        return getattr(self.completion, "_submitted", ())
+
+    @property
+    def drain_stats(self):
+        return getattr(self.completion, "drain_stats", {"direction": "write", "failed": self.error is not None})
+
+    def _allowed(self):
+        if self.stopped:
+            return False
+        if getattr(self.engine, "_foreground_read_submit_pending", 0):
+            return False
+        current = self.engine._active_read_plan
+        for plan in (self.front, current):
+            if plan is None:
+                continue
+            if plan.failed is not None:
+                raise plan.failed
+            if not plan.all_io_done():
+                return False
+        return True
+
+    def fail(self, error):
+        if self.error is None:
+            self.error = error
+        self.stopped = True
+        self.service.wake()
+
+    def cancel(self):
+        self.fail(RuntimeError("queued write cancelled before settlement"))
+
+    def advance(self):
+        if self.cleanup is not None:
+            return self.cleanup.done.is_set()
+        if self.error is not None:
+            self.cleanup = self.service.submit_cleanup(
+                lambda: self.backend.drain_write_layer(self.layer))
+            return False
+        try:
+            self.backend.poll_write_plan(layer_idx=self.layer)
+            if self.completion is not None:
+                status = self.completion.poll()
+                if status is None:
+                    return False
+                if status is False:
+                    self.error = RuntimeError(str(self.completion.wait_result(0)))
+                return True
+            with self.engine._direct_submit_lock:
+                if not self._allowed():
+                    return False
+                if not self.fenced:
+                    self.engine._store.wait_write_event(self.compute_done)
+                    self.fenced = True
+                with nvtx_range(f"tutti.queued.write|layer={self.layer}|chunks={len(self.keys)}"):
+                    self.completion = self.engine._transfer.try_store_layer(
+                        self.keys, self.layer, self.tables)
+            if self.completion is not None:
+                self.service.wake()
+            return False
+        except Exception as exc:
+            self.fail(exc)
+            return False
+
+    def needs_poll(self):
+        # CUDA event completion does not notify the service condition, so keep
+        # observing this task while its foreground-read gate is still closed.
+        return True
+
+    def poll(self):
+        if self.job.is_alive():
+            return None
+        if self.cleanup is not None and self.cleanup.error is not None:
+            return None
+        return self.error is None and self.job.error is None
+
+    def wait(self, timeout=None):
+        self.job.join(timeout)
+        if self.job.is_alive():
+            raise TimeoutError("queued write has not safely settled")
+        if self.cleanup is not None and self.cleanup.error is not None:
+            raise self.cleanup.error
+        if self.error is not None:
+            raise self.error
+        if self.job.error is not None:
+            raise self.job.error
+
+    def abort(self):
+        if self.job.is_alive():
+            self.cancel()
+        self.wait()
+
+
 class _AsyncReadPlan:
     """异步加载的全层读计划：在读流上跑，**不进入任何步的同步点**。
 
@@ -230,26 +339,18 @@ class _AsyncReadPlan:
             if self._managed:
                 backend.prepare_detached_read(
                     self._target_plan, self.keys, self.block_tables, self.physical_layers,
-                    lambda: None if self._stop.is_set() else engine._background_read_token(),
-                    engine._background_submit_scope,
+                    lambda: None if self._stop.is_set() else engine._background_read_token(detached=True),
+                    lambda: engine._background_submit_scope(detached=True),
                 )
-            self._feeder = threading.Thread(
-                target=self._run, name="tutti-async-read-feeder", daemon=True
-            )
+            self._service = engine._get_read_service()
+            self._cleanup_job = None
+            self._started = False
             engine._async_read_plans.add(self)
-            self._feeder.start()
-        except Exception as exc:
-            if self._managed:
-                self.failure = exc
-                self._stop.set()
-                engine._async_read_plans.add(self)
-                self._feeder = threading.Thread(target=self._finish_managed,
-                    name="tutti-async-read-cleanup", daemon=True)
-                self._feeder.start()
-            else:
-                engine._async_read_plans.discard(self)
-                self._backend.end_detached_read_plan(self._target_plan)
-                raise
+            self._feeder = self._service.submit(self, priority=1)
+        except Exception:
+            engine._async_read_plans.discard(self)
+            self._backend.end_detached_read_plan(self._target_plan)
+            raise
 
     @staticmethod
     def _timing_event():
@@ -267,118 +368,138 @@ class _AsyncReadPlan:
         with self._lock:
             return tuple(self._submitted_layers)
 
-    def _run(self) -> None:
-        engine = self.engine
-        _bind_thread_cuda_device(engine._store)
-        try:
-            if self._managed:
-                self._backend.start_detached_read(self._target_plan)
-            last_token = None
-            for physical in self.physical_layers:
-                completion = None
-                while not self._stop.is_set():
-                    if self._managed:
-                        completion = engine._transfer.load_layer(
-                            self.keys, physical, self.block_tables, target_plan=self._target_plan)
-                        break
-                    with engine._direct_submit_lock:
-                        if self._stop.is_set():
-                            break
-                        token = engine._background_read_token()
-                        if token is not None and token != last_token:
-                            with engine._background_submit_scope() as allowed:
-                                if allowed:
-                                    last_token = token
-                                    with nvtx_range(f"tutti.async.layer_submit|physical={physical}|chunks={len(self.keys)}|feeder={token}"):
-                                        completion = engine._transfer.load_layer(
-                                            self.keys, physical, self.block_tables,
-                                            target_plan=self._target_plan,
-                                        )
-                            if completion is not None:
-                                break
-                    self._stop.wait(0.001)
-                if completion is None:
-                    break
-                with self._lock:
-                    self._completions.append(completion)
-                    self._submitted_layers.append(physical)
-                while not self._stop.is_set():
-                    state = completion.poll()
-                    observation_error = getattr(completion, "observation_error", None)
-                    if state is None and observation_error is not None:
-                        raise observation_error
-                    if state is not None:
-                        if state is False:
-                            raise RuntimeError(f"async direct layer {physical} read failed")
-                        break
-                    self._stop.wait(0.001)
-            last = self._timing_event()
-            record = getattr(engine._store, "record_read_async_event", None)
-            if last is not None and callable(record):
-                self._last = record(last)
-        except Exception as exc:  # 提交失败：已提交的照常结算后再报失败
-            self._stop.set()
-            retained = tuple(getattr(exc, "tutti_submitted_completions", ()))
-            if retained:
-                with self._lock:
-                    self._completions.extend(retained)
-                deferred = getattr(engine._store, "_deferred_completions", None)
-                if deferred is not None:
-                    deferred[:] = [completion for completion in deferred if completion not in retained]
-            if self.failure is None:
-                self.failure = exc
-            _LOG.error("ASYNC_READ_SUBMIT_FAILED chunks=%d: %s", len(self.keys), exc)
-        finally:
-            if self._managed:
-                try:
-                    self._end()
-                except Exception as exc:
-                    if self.failure is None:
-                        self.failure = exc
-            self._feeder_done.set()
-
-    def poll(self) -> bool | None:
-        """None = 未完成；True = 全部层成功；False = 失败（已提交 IO 均已结算）。"""
-        if self._ended:
-            return self.failure is None
-        if self._managed:
-            if self._feeder_done.is_set():
-                self._feeder_done.clear()
-                self._feeder = threading.Thread(target=self._finish_managed,
-                    name="tutti-async-read-cleanup", daemon=True)
-                self._feeder.start()
-            return None
+    def _poll_completions(self) -> bool:
+        poll_partial = getattr(self._backend, "poll_read_plan", None)
+        if not self._managed and callable(poll_partial):
+            poll_partial(self._target_plan)
         while True:
             with self._lock:
                 if self._polled >= len(self._completions):
-                    break
+                    return True
                 completion = self._completions[self._polled]
-            try:
-                state = completion.poll()
-            except Exception as exc:
-                if self.failure is None:
-                    self.failure = exc
-                self._stop.set()
-                return None
+            state = completion.poll()
             if state is None:
-                observation_error = getattr(completion, "observation_error", None)
-                if observation_error is not None:
-                    if self.failure is None:
-                        self.failure = observation_error
-                    self._stop.set()
-                return None
+                error = getattr(completion, "observation_error", None)
+                if error is not None:
+                    raise error
+                return False
             if state is False:
-                if self.failure is None:
-                    self.failure = RuntimeError("async direct read failed")
-                self._stop.set()
-            self._polled += 1
-        if not self._feeder_done.is_set():
-            return None
-        with self._lock:
-            if self._polled < len(self._completions):
-                return None
-        self._end()
-        return self.failure is None
+                self.fail(RuntimeError("async direct read failed"))
+            elif not self._managed:
+                fence = getattr(completion, "fence_event", None)
+                if fence is not None and not fence.query():
+                    return False
+            with self._lock:
+                self._polled += 1
+
+    def advance(self) -> bool:
+        if self._ended:
+            self._feeder_done.set()
+            return True
+        try:
+            if self._cleanup_job is not None:
+                if not self._cleanup_job.done.is_set():
+                    return False
+                if self._cleanup_job.error is not None and self.failure is None:
+                    self.failure = self._cleanup_job.error
+                self._feeder_done.set()
+                return True
+            if not self._service.acquire_background(self._target_plan):
+                if self._stop.is_set():
+                    return self._finish_submission()
+                return False
+            if self._stop.is_set():
+                return self._finish_submission()
+            if not self._poll_completions():
+                return False
+            if self._stop.is_set() or len(self._submitted_layers) == len(self.physical_layers):
+                return self._finish_submission()
+            engine = self.engine
+            if not self._started:
+                if not engine._background_read_allowed(detached=True):
+                    return False
+                if self._managed:
+                    self._backend.start_detached_read(self._target_plan)
+                self._started = True
+            physical = self.physical_layers[len(self._submitted_layers)]
+            if self._managed:
+                completion = self._backend.try_get_paged_batch(
+                    self.keys, physical, self.block_tables, target_plan=self._target_plan)
+            else:
+                with engine._direct_submit_lock:
+                    with engine._background_submit_scope(detached=True) as allowed:
+                        if not allowed or self._stop.is_set():
+                            return False
+                        with nvtx_range(f"tutti.async.layer_submit|physical={physical}|chunks={len(self.keys)}"):
+                            method = (engine._transfer.try_load_layer
+                                      if callable(getattr(self._backend, "try_get_paged_batch", None))
+                                      else engine._transfer.load_layer)
+                            completion = method(
+                                self.keys, physical, self.block_tables, target_plan=self._target_plan)
+            if completion is None:
+                return False
+            with self._lock:
+                self._completions.append(completion)
+                self._submitted_layers.append(physical)
+            self._service.wake()
+            return False
+        except Exception as exc:
+            self.fail(exc)
+            return self._finish_submission()
+
+    def fail(self, exc) -> None:
+        self._stop.set()
+        retained = tuple(getattr(exc, "tutti_submitted_completions", ()))
+        if retained:
+            with self._lock:
+                self._completions.extend(retained)
+            deferred = getattr(self.engine._store, "_deferred_completions", None)
+            if deferred is not None:
+                deferred[:] = [completion for completion in deferred if completion not in retained]
+        if self.failure is None:
+            self.failure = exc
+        cancel = getattr(self._backend, "cancel_detached_read", None)
+        if self._managed and callable(cancel):
+            cancel(self._target_plan)
+        _LOG.error("ASYNC_READ_SUBMIT_FAILED chunks=%d: %s", len(self.keys), exc)
+
+    def _finish_submission(self) -> bool:
+        if self._cleanup_job is None:
+            self._cleanup_job = self._service.submit_cleanup(self._end)
+        return False
+
+    def needs_poll(self) -> bool:
+        if self._cleanup_job is not None or self._stop.is_set():
+            return True
+        if self._polled < len(self._completions):
+            return True
+        pending_io = getattr(self._backend, "has_pending_read_io", None)
+        if not self._managed and callable(pending_io) and pending_io(self._target_plan):
+            return True
+        if not self._service.acquire_background(self._target_plan):
+            return False
+        engine = self.engine
+        if engine._background_read_allowed(detached=True):
+            return True
+        if not getattr(engine, "_prefill_feeder_open", False):
+            return False
+        compute_done = getattr(engine, "_prefill_compute_done", None)
+        if compute_done is not None:
+            try:
+                if compute_done.query():
+                    return False
+            except Exception:
+                return False
+        plan = getattr(engine, "_active_read_plan", None)
+        done = getattr(plan, "all_io_done", None)
+        return bool(plan is not None and getattr(plan, "failed", None) is None
+                    and callable(done) and not done())
+
+    def poll(self) -> bool | None:
+        """只观察完成；前向线程不提交任何读取或阻塞排空。"""
+        if self._ended:
+            return self.failure is None
+        return None
 
     def read_ms(self) -> float | None:
         """读流上从计划起点到末层完成的 GPU 时长（不可得时 None）。"""
@@ -392,23 +513,25 @@ class _AsyncReadPlan:
         except Exception:
             return None
 
-    def _finish_managed(self):
-        try:
-            self._end()
-        except Exception as exc:
-            if self.failure is None:
-                self.failure = exc
-        finally:
-            self._feeder_done.set()
+    def cancel(self) -> None:
+        """停止新 IO；已接受的 DMA 仍由服务及完成观察安全收尾。"""
+        self._stop.set()
+        cancel = getattr(self._backend, "cancel_detached_read", None)
+        if self._managed and callable(cancel):
+            cancel(self._target_plan)
+        self._service.wake()
 
     def abort(self) -> None:
         """停止提交并阻塞等待已提交 IO 结算（只用于关闭/中止）。"""
-        self._stop.set()
-        if self._managed:
-            self._backend.cancel_detached_read(self._target_plan)
+        self.cancel()
         self._feeder.join()
         if self._managed:
             self._end()
+            return
+        self._end()
+
+    def _end(self) -> None:
+        if self._ended:
             return
         with self._lock:
             pending = self._completions[self._polled:]
@@ -418,14 +541,11 @@ class _AsyncReadPlan:
             except Exception as exc:
                 if self.failure is None:
                     self.failure = exc
-                if not bool(getattr(completion, "io_terminal", False)):
+                io_done = getattr(completion, "io_done", None)
+                terminal = bool(getattr(completion, "io_terminal", False))
+                if not terminal and not (callable(io_done) and io_done()):
                     raise
-        self._polled = len(self._completions)
-        self._end()
-
-    def _end(self) -> None:
-        if self._ended:
-            return
+            self._polled += 1
         end = getattr(self._backend, "end_detached_read_plan", None)
         if callable(end):
             try:
@@ -436,8 +556,13 @@ class _AsyncReadPlan:
                 if self.failure is None:
                     self.failure = exc
                 raise
+        last = self._timing_event()
+        record = getattr(self.engine._store, "record_read_async_event", None)
+        if last is not None and callable(record):
+            self._last = record(last)
         self._ended = True
         self.finished_ns = time.perf_counter_ns()
+        self._service.release_background(self._target_plan)
         plans = getattr(self.engine, "_async_read_plans", None)
         if plans is not None:
             plans.discard(self)
@@ -469,10 +594,9 @@ class _CompletedReadPlan:
 class _DirectAllLayerReadPlan:
     """Direct-only all-layer read plan.
 
-    Layer zero is submitted synchronously so ``start_load_kv`` can return
-    without waiting for the complete plan. Remaining layers are submitted by
-    an independent host feeder that starts as soon as the plan is constructed.
-    The callback never invokes Runtime I/O itself.
+    The persistent read service advances one layer per step. Managed backends
+    use nonblocking readiness checks; the ordinary direct fallback submits
+    layer zero synchronously. Compute callbacks only wait for recorded fences.
     """
 
     def __init__(self, engine, keys, block_tables, physical_layers,
@@ -486,6 +610,8 @@ class _DirectAllLayerReadPlan:
         self._all_io_complete = False
         self.next_read_to_submit = 0
         self.waited_callbacks = set()
+        self.read_pending_callbacks = set()
+        self.compute_wait_events = {}
         self.advanced_callbacks = set()
         self.terminal_failure = None
         self.on_failure = on_failure
@@ -501,8 +627,10 @@ class _DirectAllLayerReadPlan:
         self._feeder_stop = threading.Event()
         self._feeder_done = threading.Event()
         self._feeder_thread = None
+        self._all_io_event = None
         backend = getattr(getattr(engine, "_transfer", None), "_backend", None)
-        self._ordered_collectives = bool(getattr(backend, "requires_ordered_collectives", False))
+        self._try_read = callable(getattr(backend, "try_get_paged_batch", None))
+        self._feeder_started_ns = time.perf_counter_ns()
         # 读窗口计时：原点 event 在提交任何读之前记于 compute stream，作为
         # "该步计算开始"的近似锚点；最后一层读的 fence 兼作收尾计时点。
         # 两者相减即读窗口的 GPU 时长（见 _capture_read_tail 的判据）。
@@ -524,21 +652,13 @@ class _DirectAllLayerReadPlan:
         try:
             if self._prefetch_backend is not None:
                 self._prefetch_backend.begin_prefetch(self.keys, self.block_tables, self.physical_layers)
-            self._submit_layer(0)
+            if not self._try_read:
+                self._submit_layer(0)
+            self._feeder_thread = engine._get_read_service().submit(self, priority=0)
         except Exception:
             if self._prefetch_backend is not None:
                 self._prefetch_backend.stop_prefetch()
             raise
-        if self.layer_count > 1 and not self._ordered_collectives:
-            # feeder 立即起跑：余下层不等首个 compute 回调。提前提交让读尽早占满
-            # 盘侧带宽，并把"某层尚未提交"的窗口压到最小；并发由 in-flight 配额
-            # 约束，不需要靠 compute 节奏限流。
-            self._feeder_thread = threading.Thread(
-                target=self._run_feeder,
-                name="tutti-direct-read-feeder",
-                daemon=True,
-            )
-            self._feeder_thread.start()
 
     @property
     def layer_count(self):
@@ -562,8 +682,10 @@ class _DirectAllLayerReadPlan:
         if any(event is None for event in events):
             return False
         try:
+            gate = getattr(self, "_all_io_event", None)
+            observed = (gate,) if gate is not None else events
             if not all(callable(getattr(event, "query", None)) and event.query()
-                       for event in events):
+                       for event in observed):
                 return False
         except Exception as exc:
             self._record_failure(exc)
@@ -573,10 +695,6 @@ class _DirectAllLayerReadPlan:
 
     def wait_layer(self, callback, physical=None):
         self._validate_callback(callback, physical)
-        if self._ordered_collectives and callback not in self.read_ready_events:
-            if callback != len(self.waited_callbacks):
-                raise RuntimeError("out-of-order replica collective callback")
-            self._submit_layer(callback)
         event = self._await_ready_event(callback)
         if callback in self.waited_callbacks:
             return event
@@ -590,6 +708,28 @@ class _DirectAllLayerReadPlan:
             raise error
         self.waited_callbacks.add(callback)
         return event
+
+    def observe_compute_callback(self, callback: int, read_pending: bool) -> None:
+        """Record whether a layer's read fence was pending at its compute callback."""
+        if read_pending:
+            self.read_pending_callbacks.add(callback)
+
+    def record_compute_wait(self, callback: int, start_event, end_event) -> None:
+        self.compute_wait_events[callback] = (start_event, end_event)
+
+    def compute_wait_profile(self):
+        """Return (pending-layer ratio, exposed wait ms) when timing events settle."""
+        if not self.compute_wait_events:
+            return len(self.read_pending_callbacks) / max(1, self.layer_count), None
+        total_ms = 0.0
+        for start, end in self.compute_wait_events.values():
+            try:
+                if not end.query():
+                    return None
+                total_ms += float(start.elapsed_time(end))
+            except Exception:
+                return None
+        return len(self.read_pending_callbacks) / max(1, self.layer_count), total_ms
 
     def _await_ready_event(self, callback: int):
         """等到 feeder 为 callback 层登记 fence event，再返回该 event。
@@ -606,12 +746,12 @@ class _DirectAllLayerReadPlan:
         event = None
         with self._ready_cond:
             while True:
-                event = self.read_ready_events.get(callback)
-                if event is not None:
-                    break
                 failure = self.terminal_failure
                 if failure is not None:
                     error = failure
+                    break
+                event = self.read_ready_events.get(callback)
+                if event is not None:
                     break
                 if self._feeder_stop.is_set():
                     error = RuntimeError(
@@ -710,11 +850,14 @@ class _DirectAllLayerReadPlan:
                         self.block_tables,
                         fence_event=fence_event,
                         bridge_compute=False,
+                        try_read=self._try_read,
                     )
+                if handle is None:
+                    return
         except Exception as exc:
             self._record_failure(exc)
             self._feeder_stop.set()
-            if callback == 0:
+            if callback == 0 and not self._try_read:
                 self._abort_submitted()
                 raise
             return
@@ -742,7 +885,14 @@ class _DirectAllLayerReadPlan:
                 self._first_read_submit_completed_ns = completed_ns
         with self._ready_cond:
             self.read_ready_events[callback] = fence_event
+            if len(self.read_ready_events) == self.layer_count:
+                try:
+                    self._all_io_event = self.engine._get_read_service().join_events(
+                        tuple(self.read_ready_events[index] for index in range(self.layer_count)))
+                except Exception as exc:
+                    self._record_failure(exc)
             self._ready_cond.notify_all()
+        self.engine._wake_read_service()
         # 正常路径的逐层时间线诊断：debug（每层一条，warning 会淹没真实告警）。
         _LOG.debug(
             "DIRECT_READ_LAYER_SUBMIT layer=%d physical=%d "
@@ -755,32 +905,30 @@ class _DirectAllLayerReadPlan:
         if callable(add_terminal):
             add_terminal(self._completion_callback(callback))
 
-    def _run_feeder(self) -> None:
-        _bind_thread_cuda_device(getattr(self.engine, "_store", None))
-        started_ns = time.perf_counter_ns()
-        try:
-            for callback in range(1, self.layer_count):
-                if self._feeder_stop.is_set() or self.terminal_failure is not None:
-                    break
-                self._submit_layer(callback)
-        except Exception as exc:
-            self._record_failure(exc)
-            self._feeder_stop.set()
-        finally:
-            self._submit_all_total_ms = (
-                time.perf_counter_ns() - started_ns
-            ) / 1_000_000
-            max_layer_ms = max(self._layer_submit_ms.values(), default=0.0)
-            _LOG.warning(
-                "DIRECT_READ_PLAN_READY layers=%d total_ms=%.3f "
-                "max_layer_ms=%.3f first_read_submit_completed_ns=%s",
-                self.layer_count,
-                self._submit_all_total_ms,
-                max_layer_ms,
-                self._first_read_submit_completed_ns,
-            )
-            self._publish_ready()
-            self._feeder_done.set()
+    def advance(self) -> bool:
+        if not self._feeder_stop.is_set() and self.terminal_failure is None:
+            if self.next_read_to_submit < self.layer_count:
+                self._submit_layer(self.next_read_to_submit)
+            if self.next_read_to_submit < self.layer_count and self.terminal_failure is None:
+                return False
+        self._submit_all_total_ms = (
+            time.perf_counter_ns() - self._feeder_started_ns
+        ) / 1_000_000
+        _LOG.warning(
+            "DIRECT_READ_PLAN_READY layers=%d total_ms=%.3f "
+            "max_layer_ms=%.3f first_read_submit_completed_ns=%s",
+            self.layer_count, self._submit_all_total_ms,
+            max(self._layer_submit_ms.values(), default=0.0),
+            self._first_read_submit_completed_ns,
+        )
+        self._publish_ready()
+        self._feeder_done.set()
+        return True
+
+    def fail(self, exc) -> None:
+        self._record_failure(exc)
+        self._feeder_stop.set()
+        self._feeder_done.set()
 
     def _publish_ready(self) -> None:
         """唤醒等待 fence 的 compute 回调（登记新层 / 失败 / feeder 结束）。"""
@@ -840,10 +988,22 @@ class _DirectAllLayerReadPlan:
             verdict = "OVERLAPPED"
         self._read_tail_ms = read_tail_ms
         self._read_tail_waited = waited
-        _LOG.warning(
-            "DIRECT_READ_TAIL read_tail_ms=%.3f waited_layers=%d/%d "
-            "verdict=%s chunks=%d",
-            read_tail_ms, waited, total, verdict, len(self.keys),
+        segment_bytes = getattr(self.engine, "_segment_bytes", None)
+        io_bytes = (
+            len(self.keys) * total * int(segment_bytes)
+            if isinstance(segment_bytes, int) and segment_bytes > 0 else 0
+        )
+        io_gbps = (
+            io_bytes / (read_tail_ms * 1_000_000.0)
+            if io_bytes and read_tail_ms > 0 else 0.0
+        )
+        _LOG.info(
+            "DIRECT_READ_TAIL read_stream_ms=%.3f callbacks_reached_at_tail=%d/%d "
+            "pending_fence_layers_at_tail=%d/%d verdict_at_tail=%s "
+            "chunks=%d bytes=%d read_stream_gbps=%.3f",
+            read_tail_ms, waited, total, len(self.read_pending_callbacks), total,
+            verdict, len(self.keys),
+            io_bytes, io_gbps,
         )
 
     def _on_completion(self, result) -> None:
@@ -1527,6 +1687,7 @@ class KVEngine:
         self._read_staging_buffer_id = None
         self._write_staging_buffer_id = None
         self._deferred_restore()
+        self._get_read_service()
         return True
 
     def validate_direct_block_tables(self, block_tables) -> None:
@@ -1698,7 +1859,7 @@ class KVEngine:
 
     def load_layer(self, keys, layer_idx: int, dst_first_blocks, *,
                    fence_event=None, reuse_event=None, async_reuse=False,
-                   bridge_compute=True):
+                   bridge_compute=True, try_read=False):
         """发起一批读取：一层 × N chunk，持久化 → staging 槽 → 目的侧。
 
         返回聚合完成句柄；wait 返回即全部波次的源侧搬运（scatter）
@@ -1712,9 +1873,14 @@ class KVEngine:
                          else "_direct_submit_lock")
             direct_lock = getattr(self, lock_name, None)
             with (direct_lock if direct_lock is not None else nullcontext()):
-                completion = self._transfer.load_layer(
-                    keys, layer_idx, dst_first_blocks
-                )
+                if try_read:
+                    completion = self._transfer.try_load_layer(keys, layer_idx, dst_first_blocks)
+                    if completion is None:
+                        return None
+                else:
+                    completion = self._transfer.load_layer(
+                        keys, layer_idx, dst_first_blocks
+                    )
                 record_read = getattr(self._store, "record_read_event", None)
                 ready = getattr(completion, "fence_event", None)
                 if ready is not None:
@@ -1843,35 +2009,87 @@ class KVEngine:
             ))
         )
 
+    def _get_read_service(self):
+        service = getattr(self._store, "_read_service", None)
+        if service is None:
+            from tutti.engine.read_service import ReadService
+            service = ReadService(self._store)
+            self._store._read_service = service
+        return service
+
+    def _wake_read_service(self) -> None:
+        service = getattr(getattr(self, "_store", None), "_read_service", None)
+        if service is not None:
+            service.wake()
+
     def begin_prefill_feeder(self, enabled: bool) -> None:
         if not hasattr(self, "_prefill_submit_lock"):
             self._prefill_submit_lock = threading.RLock()
         with self._prefill_submit_lock:
             self._prefill_feeder_epoch = getattr(self, "_prefill_feeder_epoch", 0) + 1
-            self._prefill_feeder_callback = -1
             self._prefill_feeder_open = bool(enabled)
+            self._prefill_feeder_callback = -1
+            self._prefill_compute_done = None
+            self._prefill_compute_recorded = False
+        self._wake_read_service()
 
     def advance_prefill_feeder(self, callback: int) -> None:
         with self._prefill_submit_lock:
             if self._prefill_feeder_open:
                 self._prefill_feeder_callback = max(self._prefill_feeder_callback, callback)
+        self._wake_read_service()
+
+    def finish_prefill_feeder(self) -> None:
+        if not hasattr(self, "_prefill_submit_lock"):
+            return
+        with self._prefill_submit_lock:
+            if self._prefill_feeder_open and not self._prefill_compute_recorded:
+                record = getattr(self._store, "record_compute_event", None)
+                self._prefill_compute_done = record() if callable(record) else None
+                self._prefill_compute_recorded = True
+                if self._prefill_compute_done is None:
+                    self._prefill_feeder_open = False
+        self._wake_read_service()
 
     def end_prefill_feeder(self) -> None:
         if not hasattr(self, "_prefill_submit_lock"):
             self._prefill_submit_lock = threading.RLock()
         with self._prefill_submit_lock:
             self._prefill_feeder_open = False
+        self._wake_read_service()
 
     @contextmanager
-    def _background_submit_scope(self):
+    def _background_submit_scope(self, *, detached: bool = False):
         with self._prefill_submit_lock:
-            yield self._background_read_allowed()
+            yield self._background_read_allowed(detached=detached)
 
-    def _background_read_allowed(self) -> bool:
+    def _background_read_allowed(self, *, detached: bool = False) -> bool:
+        """Whether the read service may submit background work.
+
+        Detached request prefetch has its own feeder and may overlap a stale
+        foreground plan from the previous scheduler step.  It still obeys
+        the feeder/compute fence and foreground-submit exclusion, but must not
+        wait on ``_active_read_plan``; that pointer describes the foreground
+        layerwise path only and can remain published until its next step.
+        """
         if not getattr(self, "_prefill_feeder_open", False):
             return False
         if getattr(self, "_prefill_feeder_callback", -1) < 0:
             return False
+        # A detached request has its own feeder epoch and must not inherit the
+        # completed compute fence from the previous foreground step.
+        if detached:
+            if getattr(self, "_foreground_read_submit_pending", 0):
+                return False
+            return True
+        compute_done = getattr(self, "_prefill_compute_done", None)
+        if compute_done is not None:
+            try:
+                query = getattr(compute_done, "query", None)
+                if not callable(query) or query():
+                    return False
+            except Exception:
+                return False
         if getattr(self, "_foreground_read_submit_pending", 0):
             return False
         plan = self._active_read_plan
@@ -1882,10 +2100,10 @@ class KVEngine:
         done = getattr(plan, "all_io_done", None)
         return callable(done) and bool(done())
 
-    def _background_read_token(self):
-        if not self._background_read_allowed():
+    def _background_read_token(self, *, detached: bool = False):
+        if not self._background_read_allowed(detached=detached):
             return None
-        return self._prefill_feeder_epoch, self._prefill_feeder_callback
+        return self._prefill_feeder_epoch
 
     def start_read_plan(self, keys, block_tables, physical_layers, depth,
                         on_failure=None):
@@ -2044,6 +2262,10 @@ class KVEngine:
                 )
                 if compute_done is None:
                     raise RuntimeError("direct compute fence was not recorded")
+                if callable(getattr(backend, "try_put_paged_batch", None)):
+                    completion = _QueuedWrite(self, keys, layer_idx, src_first_blocks, compute_done)
+                    self._inflight.append(completion)
+                    return completion
                 wait_write(compute_done)
                 completion = self._transfer.store_layer(
                     keys, layer_idx, src_first_blocks
@@ -2205,6 +2427,59 @@ class KVEngine:
         if first_error is not None:
             raise first_error
 
+    def wait_reads_idle(self) -> None:
+        """结算前台读以便 TP 失败共识先行，不等待排队写入。"""
+        if not self.direct:
+            return self.wait_idle()
+        active_plan = getattr(self, "_active_read_plan", None)
+        if active_plan is not None:
+            active_plan.join_feeder()
+        writes, reads = [], []
+        for completion in self._inflight:
+            is_write = isinstance(completion, _QueuedWrite) or getattr(
+                completion, "drain_stats", {}).get("direction") == "write"
+            (writes if is_write else reads).append(completion)
+        self._inflight = writes
+        first_error = None
+        enqueue_wait = getattr(self._store, "enqueue_compute_wait", None)
+        if reads and callable(enqueue_wait):
+            try:
+                enqueue_wait(reads)
+            except Exception as exc:
+                first_error = exc
+        retained_reads = []
+        for completion in reads:
+            try:
+                completion.wait()
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+                retained_reads.append(completion)
+        self._inflight.extend(retained_reads)
+        read_window = getattr(self, "_read_window", None)
+        if read_window is not None:
+            try:
+                read_window.drain()
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+        drain_deferred = getattr(self._store, "drain_deferred_completions", None)
+        if callable(drain_deferred):
+            try:
+                drain_deferred(direction="read")
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+        end_plan = getattr(getattr(self._transfer, "_backend", None), "end_target_plan", None)
+        if callable(end_plan):
+            try:
+                end_plan("read")
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
+
     def abort(self, timeout=None) -> None:
         """安全中间态 abort：不取消底层 DMA，drain 两边后再返回。
 
@@ -2212,6 +2487,9 @@ class KVEngine:
         本步；整体关闭（close）时才逐个等待（见 _abort_async_read_plans）。
         """
         self.end_prefill_feeder()
+        for completion in self._inflight:
+            if isinstance(completion, _QueuedWrite):
+                completion.cancel()
         active_plan = getattr(self, "_active_read_plan", None)
         if active_plan is not None:
             active_plan.abort()
@@ -2274,6 +2552,9 @@ class KVEngine:
             if first_error is None:
                 first_error = exc
         self._active_read_plan = None
+        service = getattr(self._store, "_read_service", None)
+        if service is not None:
+            service.close()
         if isinstance(self._transfer, DirectTransfer):
             try:
                 self._transfer.close()

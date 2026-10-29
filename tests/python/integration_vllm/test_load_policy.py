@@ -1,4 +1,4 @@
-"""同步/异步加载判定（load_policy）：默认同步，三道门槛 + 在线测量。"""
+"""同步/异步加载判定（load_policy）：默认异步，可显式切回门控模式。"""
 
 from __future__ import annotations
 
@@ -98,13 +98,17 @@ def test_read_measurement_follows_drift():
 
 
 def test_forced_modes_bypass_gates():
-    assert _decide(_calibrated(mode="async"), others=0, free=None).is_async
+    d = _decide(_calibrated(mode="async"), others=0, free=None)
+    assert not d.is_async and d.reason == "alone"
+    d = _decide(_calibrated(mode="async"), others=1, free=None)
+    assert not d.is_async and d.reason == "memory"
+    assert _decide(_calibrated(mode="async"), others=1, free=100_000).is_async
     assert not _decide(_calibrated(mode="sync"), chunks=10_000).is_async
 
 
 def test_resolve_load_mode(monkeypatch):
     monkeypatch.delenv("TUTTI_LOAD_MODE", raising=False)
-    assert resolve_load_mode({}) == "auto"
+    assert resolve_load_mode({}) == "async"
     assert resolve_load_mode({"load_mode": "sync"}) == "sync"
     monkeypatch.setenv("TUTTI_LOAD_MODE", "async")
     assert resolve_load_mode({"load_mode": "sync"}) == "async"

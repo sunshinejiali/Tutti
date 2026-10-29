@@ -3,6 +3,7 @@
 import importlib.util
 import json
 import os
+import shlex
 from pathlib import Path
 import subprocess
 import sys
@@ -63,6 +64,23 @@ def test_serve_preview_has_real_connector_config(launch_env):
     assert options["preset"]["device_groups"] == [[0, 1]]
     assert options["preset"]["type"] == "raid0"
     assert "--load-format auto" in result.stdout
+
+
+@pytest.mark.parametrize("eager", ["0", "1"])
+def test_serve_preview_compute_mode(launch_env, eager):
+    result = preview({**launch_env, "ENFORCE_EAGER": eager})
+    assert result.returncode == 0, result.stderr
+    command = next(line for line in result.stdout.splitlines()
+                   if line.startswith("[serve] command:"))
+    args = shlex.split(command.split(":", 1)[1])
+    if eager == "1":
+        assert "--enforce-eager" in args
+        assert "--compilation-config" not in args
+    else:
+        assert "--enforce-eager" not in args
+        assert json.loads(args[args.index("--compilation-config") + 1]) == {
+            "mode": 3, "cudagraph_mode": "PIECEWISE",
+        }
 
 
 @pytest.mark.parametrize("overrides, message", [
@@ -368,6 +386,17 @@ def test_offline_driver_keeps_defaults_and_deterministic_sampling(offline_driver
     extra = options["kv_transfer_config"]["kv_connector_extra_config"]
     assert "replica_io" not in extra
     assert captured["sampling"] == {"temperature": 0.0, "max_tokens": 8, "ignore_eos": True}
+
+
+@pytest.mark.parametrize("flag", ["--enable-compile", "--enable-compiler"])
+@pytest.mark.parametrize("graph_mode", ["NONE", "PIECEWISE"])
+def test_offline_driver_compile_graph_mode(offline_driver, monkeypatch, flag, graph_mode):
+    _, run, captured = offline_driver
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "1")
+    assert run(["--capacity", "8 GiB", flag, "--cudagraph-mode", graph_mode]) == 0
+    assert captured["llm"]["enforce_eager"] is False
+    assert captured["llm"]["compilation_config"] == {"mode": 3, "cudagraph_mode": graph_mode}
+    assert os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] == "0"
 
 
 @pytest.mark.parametrize("baseline", [False, True])

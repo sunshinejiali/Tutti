@@ -39,6 +39,13 @@ block128、`LOAD_FORMAT=auto`和eager，权重MXFP8不代表KV FP8；具体支�
 模型 block/context/KV dtype/parser 的选择和 SSE 验收在操作手册中。启动前必须先
 `serve-8gpu-striped.sh --dry-run` 检查，脚本不会自动准备驱动或接管 RAID。
 
+Hy3 的逐层 KV 回调可以与 Inductor + PIECEWISE CUDA Graph 共存：attention 和
+KV cache update 留在图段边界，逐层 wait/save 回调在每次前向时执行。在线 wrapper
+设置 `ENFORCE_EAGER=0` 启用 `mode=3,cudagraph_mode=PIECEWISE`，默认 `1` 保持
+eager。离线 driver 使用 `--enable-compile --cudagraph-mode PIECEWISE`；只传
+`--enable-compile` 默认不捕获图。该验证不扩展 MiniMax M3 的支持范围。线上长测
+用累计计数和 CUDA event，不启用 nsys；kernel 数、驻留和精确 overlap 用离线 nsys。
+
 ## 日志和测试纪律
 
 - 临时文件、缓存、报告放 `TUTTI_PROFILE_ROOT`，不使用根盘 `/tmp`。

@@ -279,6 +279,16 @@ void test_partial_file_resumes_without_overwriting_prefix() {
     REQUIRE(materialise_segment_file(path, 3 * page).ok());
     REQUIRE(segment_file_is_ready(path, 3 * page, &ready).ok());
     CHECK(ready);
+    // A missing marker is not permission to zero a valid segment: recovery
+    // republishes the inode without losing the existing byte prefix.
+    {
+        std::vector<char> head(page, 0);
+        fd = ::open(path.c_str(), O_RDONLY);
+        REQUIRE(fd >= 0);
+        CHECK(::read(fd, head.data(), head.size()) == static_cast<ssize_t>(page));
+        CHECK(::close(fd) == 0);
+        CHECK(head.front() == 'X' && head.back() == 'X');
+    }
     const std::string replacement = root + "/replacement.seg";
     fd = ::open(replacement.c_str(), O_CREAT | O_WRONLY, 0644);
     REQUIRE(fd >= 0);

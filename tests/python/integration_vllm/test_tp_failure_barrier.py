@@ -50,6 +50,10 @@ class _Engine:
 
     def wait_idle(self):
         self.wait_idle_count += 1
+        self.order.append("write_drain")
+
+    def wait_reads_idle(self):
+        self.order.append("read_drain")
 
     def abort_rank_commit(self, keys, generations=None):
         self.rank_abort_calls.append((tuple(keys), tuple(generations or ())))
@@ -111,13 +115,63 @@ def test_nonfailed_rank_collects_before_it_drains_or_enters_next_step():
 
     coordinator = OrderedCoordinator(consensus)
     worker = WorkerImpl(engine, failure_coordinator=coordinator)
+    engine.direct = True
     worker._external_load_step = True
     worker._load_generation = 8
+    worker._load_keys = [b"read"]
+    worker._read_plan = type(
+        "ReadPlan", (), {
+            "require_complete": lambda self: None,
+            "abort": lambda self: None,
+        }
+    )()
     worker._load_block_tables = [[20, 21]]
     worker._load_request_spans = [_LoadRequestSpan(0, "r0", 0, 0, 1)]
     worker._metadata = type("Meta", (), {"requests": [object()]})()
     worker.wait_for_save()
-    assert order == ["collective", ("abort", 30.0), "drain_barrier"]
+    assert order == ["read_drain", "collective", ("abort", 30.0), "drain_barrier"]
+    assert engine.wait_idle_count == 0
+
+
+def test_direct_read_drain_failure_is_reported_before_tp_consensus():
+    order = []
+    consensus = _FailureConsensus(
+        True, 81, True, (_LogicalFailure(0, 0, 1),), 0.1
+    )
+
+    class OrderedCoordinator(_Coordinator):
+        def coordinate(self, *args):
+            order.append("collective")
+            return super().coordinate(*args)
+
+        def drain_barrier(self, *args):
+            order.append("drain_barrier")
+            return super().drain_barrier(*args)
+
+    class FailedReadEngine(_Engine):
+        direct = True
+
+        def wait_reads_idle(self):
+            order.append("read_drain")
+            raise RuntimeError("read CQ failed")
+
+    coordinator = OrderedCoordinator(consensus)
+    engine = FailedReadEngine(order=order)
+    worker = WorkerImpl(engine, failure_coordinator=coordinator)
+    worker._external_load_step = True
+    worker._load_generation = 81
+    worker._load_keys = [b"read"]
+    worker._read_plan = type(
+        "ReadPlan", (), {
+            "require_complete": lambda self: None,
+            "abort": lambda self: None,
+        }
+    )()
+    worker._load_block_tables = [[20]]
+    worker._load_request_spans = [_LoadRequestSpan(0, "r0", 0, 0, 1)]
+    worker._metadata = type("Meta", (), {"requests": [object()]})()
+    worker.wait_for_save()
+    assert order == ["read_drain", "collective", ("abort", 30.0), "drain_barrier"]
 
 
 def test_multiple_rank_failures_merge_conservatively():
@@ -151,6 +205,35 @@ def test_normal_external_load_uses_one_collective_and_no_abort():
     assert [call[0] for call in coordinator.calls] == ["coordinate"]
     assert engine.abort_count == 0
     assert engine.wait_idle_count == 1
+
+
+def test_successful_direct_load_collects_between_read_and_write_drains():
+    order = []
+    consensus = _FailureConsensus(False, 80, True, (), 0.1)
+    engine = _Engine(order=order)
+    engine.direct = True
+
+    class OrderedCoordinator(_Coordinator):
+        def coordinate(self, *args):
+            order.append("collective")
+            return super().coordinate(*args)
+
+    coordinator = OrderedCoordinator(consensus)
+    worker = WorkerImpl(engine, failure_coordinator=coordinator)
+    worker._external_load_step = True
+    worker._load_generation = 80
+    worker._load_keys = [b"read"]
+    worker._read_plan = type(
+        "ReadPlan", (), {
+            "require_complete": lambda self: None,
+            "abort": lambda self: None,
+        }
+    )()
+    worker._load_block_tables = [[20]]
+    worker._load_request_spans = [_LoadRequestSpan(0, "r0", 0, 0, 1)]
+    worker._metadata = type("Meta", (), {"requests": [object()]})()
+    worker.wait_for_save()
+    assert order == ["read_drain", "collective", "write_drain"]
 
 
 def test_abort_drain_timeout_fails_closed_after_collective():

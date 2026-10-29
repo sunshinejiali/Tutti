@@ -252,7 +252,7 @@ def main() -> int:
     parser.add_argument("--tokens", type=int, default=65528)
     parser.add_argument("--reuse-pct", type=int, default=80)
     parser.add_argument("--max-tokens", type=int, default=8)
-    parser.add_argument("--kv-load-mode", choices=("sync", "async", "auto"), default="auto",
+    parser.add_argument("--kv-load-mode", choices=("sync", "async", "auto"), default="async",
                         help="Tutti request loading policy; sync forces external-hit validation")
     parser.add_argument(
         "--rounds",
@@ -299,15 +299,16 @@ def main() -> int:
         help="vLLM policy after the connector reports invalid block IDs",
     )
     parser.add_argument(
-        "--enable-compile",
+        "--enable-compile", "--enable-compiler",
         action="store_true",
         help=(
-            "leave eager mode (enforce_eager=False) so vLLM's compilation "
-            "path runs; this activates fuse_allreduce_rms (all-reduce + "
-            "RMSNorm fused into one kernel, one cross-rank sync per layer "
-            "instead of two) and CUDA graph capture. Default stays eager "
-            "for clean, comparable NVTX timelines."
+            "enable Inductor compilation; CUDA graph capture is selected with "
+            "--cudagraph-mode (default NONE). Default stays eager."
         ),
+    )
+    parser.add_argument(
+        "--cudagraph-mode", choices=("NONE", "PIECEWISE"), default="NONE",
+        help="CUDA graph mode with --enable-compile; PIECEWISE keeps KV callbacks outside captured segments",
     )
     parser.add_argument(
         "--expect-b-failure", action="store_true",
@@ -383,6 +384,8 @@ def main() -> int:
         ),
     )
     args = parser.parse_args()
+    if args.cudagraph_mode != "NONE" and not args.enable_compile:
+        parser.error("--cudagraph-mode PIECEWISE requires --enable-compile")
     if not 1 <= args.reuse_pct < 100:
         parser.error("--reuse-pct must be in [1, 99]")
     if args.shared_tokens is not None and not 0 < args.shared_tokens < args.tokens:
@@ -492,6 +495,9 @@ def main() -> int:
         model_options["max_num_batched_tokens"] = args.max_num_batched_tokens
     if args.language_model_only:
         model_options["language_model_only"] = True
+    if args.enable_compile:
+        os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] = "0"
+        model_options["compilation_config"] = {"mode": 3, "cudagraph_mode": args.cudagraph_mode}
     llm = LLM(
         model=args.model,
         tensor_parallel_size=args.tensor_parallel_size,

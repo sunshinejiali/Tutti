@@ -2,6 +2,18 @@
 import os
 
 
+def validate_layerwise_execution(vllm_config):
+    if getattr(vllm_config.model_config, "enforce_eager", False):
+        return
+    compilation = getattr(vllm_config, "compilation_config", None)
+    graph = getattr(compilation, "cudagraph_mode", None)
+    mode = getattr(compilation, "mode", None)
+    if getattr(graph, "name", graph) != "NONE" or mode != 3:
+        raise ValueError("独立KV实体支持 enforce_eager=True 或 mode=3、cudagraph_mode=NONE；CUDA graph回调尚未支持")
+    if os.environ.get("VLLM_USE_BREAKABLE_CUDAGRAPH") == "1":
+        raise ValueError("独立KV实体编译要求 VLLM_USE_BREAKABLE_CUDAGRAPH=0")
+
+
 def validate_replica_io(vllm_config, extra):
     enabled = extra.get("replica_io", False)
     if not isinstance(enabled, bool):
@@ -23,8 +35,7 @@ def validate_replica_io(vllm_config, extra):
             getattr(text, "num_key_value_heads", None) != 4 or
             getattr(text, "head_dim", None) != 128):
         raise ValueError("replica_io initially supports MiniMax M3 with 4 KV heads, head_dim=128")
-    if not getattr(model, "enforce_eager", False):
-        raise ValueError("replica_io requires eager execution")
+    validate_layerwise_execution(vllm_config)
     if os.environ.get("TUTTI_ASYNC_COMPLETION") == "1":
         raise ValueError("replica_io requires synchronous NVMe completion")
     if extra.get("store", {}).get("type") != "tutti_nvme":

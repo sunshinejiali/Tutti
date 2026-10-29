@@ -144,11 +144,38 @@ def test_any_rank_failure_fails_closed(scheduler):
 
 def test_worker_meta_aggregate_merges_ranks():
     """跨 rank 聚合：计数相加、失败取并。"""
-    a = TuttiWorkerMetadata(committed={b"k1": 1, b"k2": 1}, failed=set())
-    b = TuttiWorkerMetadata(committed={b"k1": 1}, failed={b"k3"})
+    a = TuttiWorkerMetadata(
+        committed={b"k1": 1, b"k2": 1}, failed=set(),
+        profile_samples=[(1, 2, 80, 160, 10.0, 20.0, 3.0, 100, -1.0, -1.0)],
+        prefetch_stats=(1, 1, 1, 0), prefetch_wait_ms=[21.0],
+    )
+    b = TuttiWorkerMetadata(
+        committed={b"k1": 1}, failed={b"k3"},
+        profile_samples=[(0, 1, 80, 80, 5.0, 8.0, 0.0, 50, 0.25, 4.0)],
+        prefetch_stats=(0, 0, 0, 1), prefetch_wait_ms=[15.0],
+    )
     merged = a.aggregate(b)
     assert merged.committed == {b"k1": 2, b"k2": 1}
     assert merged.failed == {b"k3"}
+    assert len(merged.profile_samples) == 2
+    assert merged.prefetch_stats == (1, 1, 1, 1)
+    assert merged.prefetch_wait_ms == [21.0, 15.0]
+
+
+def test_io_profile_reports_aggregate_bandwidth_and_overlap(caplog, scheduler):
+    sample = (0, 10, 80, 800, 100.0, 200.0, 0.0,
+              1_000_000_000, 0.5, 10.0)
+    scheduler._profile_samples.extend([sample] * TP_SIZE)
+    scheduler._profile_window_bytes = TP_SIZE * 1_000_000_000
+    scheduler._profile_window_ops = TP_SIZE * 800
+    scheduler._health_last_ns = 9_000_000_000
+    scheduler._log_io_profile(10_000_000_000)
+    line = next(record.message for record in caplog.records
+                if "[tutti] io-profile" in record.message)
+    assert "effective_gbps=4.000" in line
+    assert "overlap_plan_rate=1.000" in line
+    assert "overlap_layer_ratio=0.500" in line
+    assert "exposed_wait_ms_p50=10.0" in line
 
 
 def test_unknown_worker_meta_is_ignored(scheduler):

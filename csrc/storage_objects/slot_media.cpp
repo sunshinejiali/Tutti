@@ -208,6 +208,74 @@ Status verify_segment_extents(int fd, const std::string& path,
     return {};
 }
 
+Status preallocate_segment(int fd, const std::string& path,
+                           std::uint64_t offset, std::uint64_t bytes) {
+    // Reserve before writing so ext4 can place the complete range together.
+    // These extents are still UNWRITTEN: every byte must subsequently be
+    // written and FIEMAP-verified before publishing a ready marker.
+    const int error = ::posix_fallocate(fd, static_cast<off_t>(offset),
+                                       static_cast<off_t>(bytes));
+    if (error == 0 || error == EOPNOTSUPP || error == ENOSYS) return {};
+    return Status(error == ENOSPC ? StatusCode::RESOURCE_EXHAUSTED : StatusCode::INTERNAL,
+                  "preallocate segment file (" + path + "): " + std::strerror(error));
+}
+
+Status rebuild_unpublished_segment(int source, const std::string& path,
+                                   const struct stat& source_stat,
+                                   std::uint64_t file_bytes) {
+    // Missing ready metadata alone does not prove that the file is empty.
+    // Preserve all bytes, and keep the old inode until the replacement passes
+    // the same FIEMAP checks as a normal materialisation. The mount lock held
+    // by the caller serialises cooperative publishers throughout the repair.
+    struct statvfs fs{};
+    if (::fstatvfs(source, &fs) != 0) return errno_status("statvfs segment rebuild", path);
+    if (static_cast<std::uint64_t>(fs.f_bavail) * fs.f_frsize < file_bytes)
+        return Status(StatusCode::RESOURCE_EXHAUSTED,
+                      "insufficient free space to rebuild segment file: " + path);
+    std::string pattern = path + ".rebuild.XXXXXX";
+    std::vector<char> name(pattern.begin(), pattern.end());
+    name.push_back('\0');
+    const Fd replacement(::mkostemp(name.data(), O_DIRECT | O_CLOEXEC));
+    if (!replacement.valid()) return errno_status("create segment rebuild", path);
+    struct RemovePending {
+        const char* path;
+        ~RemovePending() { ::unlink(path); }
+    } pending{name.data()};
+    if (::fchmod(replacement.get(), source_stat.st_mode & 0777) != 0)
+        return errno_status("chmod segment rebuild", name.data());
+    const Status allocated = preallocate_segment(replacement.get(), name.data(), 0, file_bytes);
+    if (!allocated.ok()) return allocated;
+    AlignedBuffer buffer(kZeroChunkBytes);
+    if (!buffer.valid()) return Status(StatusCode::INTERNAL, "could not allocate segment copy buffer");
+    for (std::uint64_t offset = 0; offset < file_bytes;) {
+        const std::size_t bytes = static_cast<std::size_t>(
+            std::min<std::uint64_t>(kZeroChunkBytes, file_bytes - offset));
+        ssize_t read;
+        do { read = ::pread(source, buffer.data(), bytes, static_cast<off_t>(offset)); }
+        while (read < 0 && errno == EINTR);
+        if (read < 0) return errno_status("read segment rebuild", path);
+        if (read != static_cast<ssize_t>(bytes))
+            return Status(StatusCode::DATA_LOSS, "short read during segment rebuild: " + path);
+        ssize_t written;
+        do { written = ::pwrite(replacement.get(), buffer.data(), bytes,
+                               static_cast<off_t>(offset)); }
+        while (written < 0 && errno == EINTR);
+        if (written < 0) return errno_status("write segment rebuild", name.data());
+        if (written != static_cast<ssize_t>(bytes))
+            return Status(StatusCode::DATA_LOSS, "short write during segment rebuild: " + path);
+        offset += bytes;
+    }
+    if (::fsync(replacement.get()) != 0) return errno_status("fsync segment rebuild", name.data());
+    const Status verified = verify_segment_extents(replacement.get(), name.data(), file_bytes);
+    if (!verified.ok()) return verified;
+    struct stat rebuilt{};
+    if (::fstat(replacement.get(), &rebuilt) != 0)
+        return errno_status("fstat segment rebuild", name.data());
+    if (::rename(name.data(), path.c_str()) != 0)
+        return errno_status("replace unpublished segment", path);
+    return publish_segment_ready(path, rebuilt, file_bytes);
+}
+
 } // namespace
 
 // -------------------------------------------------------------------------
@@ -348,6 +416,8 @@ Status materialise_segment_file(const std::string& path, std::uint64_t file_byte
             return Status(StatusCode::RESOURCE_EXHAUSTED,
                           "insufficient free space to materialise segment file: " + path);
         }
+        const Status allocated = preallocate_segment(fd.get(), path, old_size, remaining);
+        if (!allocated.ok()) return allocated;
         // FIEMAP-backed DMA rejects unwritten/hole extents. Materialise the
         // newly appended range, not just the requested slot, so one shared
         // file is valid for every slot as soon as it is exposed to resolver.
@@ -357,7 +427,12 @@ Status materialise_segment_file(const std::string& path, std::uint64_t file_byte
     }
     if (::fsync(fd.get()) != 0) return errno_status("fsync segment file", path);
     const Status verified = verify_segment_extents(fd.get(), path, file_bytes);
-    if (!verified.ok()) return verified;
+    if (!verified.ok()) {
+        if (verified.code() == StatusCode::RESOURCE_EXHAUSTED ||
+            verified.code() == StatusCode::DATA_LOSS)
+            return rebuild_unpublished_segment(fd.get(), path, st, file_bytes);
+        return verified;
+    }
     return publish_segment_ready(path, st, file_bytes);
 }
 

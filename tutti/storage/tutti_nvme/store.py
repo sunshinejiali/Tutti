@@ -218,6 +218,8 @@ class TuttiDirectBackend:
         # 异步加载的读计划不占"read"方向槽位（那是本步同步读的），按 token
         # 单独登记：同一 rank 上它可以跨多步与同步读计划并存，失效通知同样覆盖。
         self._detached_plans: dict[int, DirectTargetPlan] = {}
+        self._read_batches: dict[tuple[int, int], dict] = {}
+        self._write_batches: dict[tuple[int, int], dict] = {}
         # Target-cache invalidation is the generation-change signal used by
         # layer submit. It avoids filesystem/object-pool queries on that path.
         self._store._direct_backend = self
@@ -491,10 +493,179 @@ class TuttiDirectBackend:
             )
 
     def get_paged_batch(self, keys, layer_idx: int, block_tables, target_plan=None):
+        plan = target_plan if target_plan is not None else self._target_plans.get("read")
+        if plan is not None and (plan.plan_token, int(layer_idx)) in self._read_batches:
+            raise RuntimeError("direct read is already owned by nonblocking submission")
         return self._submit(keys, layer_idx, block_tables, "read",
                             target_plan=target_plan)
 
+    def _wake_read_service(self) -> None:
+        service = getattr(self._store, "_read_service", None)
+        if service is not None:
+            service.wake()
+
+    def _poll_read_state(self, state) -> None:
+        try:
+            if state["error"] is not None:
+                raise state["error"]
+            for part in state["parts"]:
+                settled = part._settled
+                status = part.poll()
+                if not settled and part._settled:
+                    self._wake_read_service()
+                if part.observation_error is not None:
+                    raise part.observation_error
+                if status is False:
+                    raise RuntimeError(str(part.wait_result(0)))
+        except Exception as exc:
+            state["error"] = exc
+            if state["parts"]:
+                exc.tutti_submitted_completions = tuple(state["parts"])
+            raise
+
+    def poll_read_plan(self, plan: DirectTargetPlan) -> None:
+        """Reap accepted read parts even when new submissions are paused."""
+        for (token, _), state in tuple(self._read_batches.items()):
+            if token == plan.plan_token:
+                self._poll_read_state(state)
+
+    def has_pending_read_io(self, plan: DirectTargetPlan) -> bool:
+        return any(not part._settled
+                   for (token, _), state in tuple(self._read_batches.items())
+                   if token == plan.plan_token for part in state["parts"])
+
+    def try_get_paged_batch(self, keys, layer_idx: int, block_tables, target_plan=None):
+        return self._try_paged_batch(keys, layer_idx, block_tables, "read", target_plan)
+
+    def try_put_paged_batch(self, keys, layer_idx: int, block_tables, target_plan=None):
+        return self._try_paged_batch(keys, layer_idx, block_tables, "write", target_plan)
+
+    def _write_states(self, layer_idx, plan):
+        plan = plan if plan is not None else self._target_plans.get("write")
+        if plan is None:
+            return ()
+        if layer_idx is not None:
+            state = self._write_batches.get((plan.plan_token, int(layer_idx)))
+            return (state,) if state is not None else ()
+        return tuple(state for (token, _), state in tuple(self._write_batches.items())
+                     if token == plan.plan_token)
+
+    def poll_write_plan(self, layer_idx: int | None = None,
+                        plan: DirectTargetPlan | None = None) -> None:
+        """Reap only this layer's accepted writes, without submitting more work."""
+        for state in self._write_states(layer_idx, plan):
+            self._poll_read_state(state)
+            if state["completion"] is not None:
+                state["completion"].poll()
+
+    def has_pending_write_io(self, layer_idx: int | None = None,
+                             plan: DirectTargetPlan | None = None) -> bool:
+        return any(not part._settled for state in self._write_states(layer_idx, plan)
+                   for part in state["parts"])
+
+    def drain_write_layer(self, layer_idx: int) -> None:
+        """Drain accepted IO for one queued layer without submitting retries."""
+        for state in self._write_states(layer_idx, None):
+            first_error = None
+            for part in state["parts"]:
+                try:
+                    part.wait_result()
+                except Exception as exc:
+                    if not part.io_terminal and first_error is None:
+                        first_error = exc
+            if first_error is not None:
+                raise first_error
+            if state["completion"] is not None and state["error"] is None:
+                state["completion"].wait_result()
+
+    def _try_paged_batch(self, keys, layer_idx, block_tables, direction, target_plan):
+        """Advance one cell without host waits or more than one submit."""
+        if self._closed:
+            raise RuntimeError("direct backend is closed")
+        keys = tuple(bytes(key) for key in keys)
+        tables = tuple(tuple(table) for table in block_tables)
+        layer_idx = int(layer_idx)
+        plan = target_plan if target_plan is not None else self._target_plans.get(direction)
+        batches = self._write_batches if direction == "write" else self._read_batches
+        state = batches.get((plan.plan_token, layer_idx)) if plan is not None else None
+        try:
+            if target_plan is not None and not (
+                    (direction == "read" and self._detached_plans.get(plan.plan_token) is plan)
+                    or self._target_plans.get(direction) is plan):
+                raise RuntimeError(f"direct {direction} target plan is no longer active")
+            if state is None:
+                prepared = self._prepare_requests(keys, layer_idx, tables, direction, plan)
+                _, _, io_keys, plan, requests = prepared
+                stream_direction = "read_async" if plan.plan_token in self._detached_plans else direction
+                state = dict(keys=keys, tables=tables, io_keys=io_keys, plan=plan, parts=[],
+                             submit=_SubmitStep(self._store, requests, stream_direction),
+                             completion=None, error=None)
+                batches[plan.plan_token, layer_idx] = state
+            elif (state["keys"] != keys or state["tables"] != tables or state["plan"] != plan):
+                raise RuntimeError(f"direct {direction} retry changed keys, block tables or target plan")
+            if state["error"] is not None:
+                raise state["error"]
+            self._validate_target_plan(plan)
+            if plan.direction != direction:
+                raise ValueError(f"direct {direction} requires a {direction} target plan")
+            for key in keys:
+                self._validate_plan_entry(plan.entry_for(decode_io_key(derive_io_key(key, layer_idx))[0]))
+            if state["completion"] is not None:
+                return state["completion"]
+            parts = state["parts"]
+            self._poll_read_state(state)
+            step = state["submit"]
+            with self._store.stream_context(step.direction), nvtx_range(
+                    f"tutti.direct.runtime_submit|op={step.direction}|layer={layer_idx}"):
+                count = len(parts)
+                progress = (len(step.handles), tuple(map(len, step.segments)))
+                try:
+                    finished = step.advance()
+                finally:
+                    for handle in step.handles[len(parts):]:
+                        part = _TuttiCompletion(self._store._runtime, [handle], lambda ok: None,
+                                                auto_watch=False, direction=direction,
+                                                retain_observation_errors=True)
+                        parts.append(part)
+                        self._store._track_completion(part, keys)
+                    step.completions = parts
+                    if progress != (len(step.handles), tuple(map(len, step.segments))):
+                        self._wake_read_service()
+                if _ASYNC_COMPLETION:
+                    self._store.enqueue_compute_wait(parts[count:])
+                if not finished:
+                    return None
+                if direction == "write":
+                    def settled(ok):
+                        direct_settle = getattr(self._store, "_on_direct_put_settled", None)
+                        if callable(direct_settle):
+                            direct_settle(ok, state["io_keys"], state["completion"])
+                        else:
+                            self._store._on_put_settled(ok, state["io_keys"])
+                    completion = _BatchCompletion(self._store._runtime, parts,
+                                                  settle=settled, direction="write")
+                else:
+                    completion = (parts[0] if len(parts) == 1 else
+                                  _ReadBatchCompletion(self._store._runtime, parts))
+                completion.fence_event = self._store._record_event(step.direction)
+                state["completion"] = completion
+                if direction == "write":
+                    self._store._track_completion(completion, keys)
+                    record_write_result = getattr(self, "_record_write_result", None)
+                    if callable(record_write_result):
+                        completion.add_done_callback(record_write_result)
+                return completion
+        except Exception as exc:
+            if state is not None:
+                state["error"] = exc
+                if state["parts"]:
+                    exc.tutti_submitted_completions = tuple(state["parts"])
+            raise
+
     def put_paged_batch(self, keys, layer_idx: int, block_tables):
+        plan = self._target_plans.get("write")
+        if plan is not None and (plan.plan_token, int(layer_idx)) in self._write_batches:
+            raise RuntimeError("direct write is already owned by nonblocking submission")
         return self._submit(keys, layer_idx, block_tables, "write")
 
     @staticmethod
@@ -661,13 +832,41 @@ class TuttiDirectBackend:
     def supports_async_read(self) -> bool:
         return self._store._read_async_stream is not None
 
+    def _drain_read_batches(self, plan_token: int) -> None:
+        cells = [(batches, cell, state)
+                 for batches in (self._read_batches, self._write_batches)
+                 for cell, state in tuple(batches.items()) if cell[0] == plan_token]
+        first_error = None
+        for _, _, state in cells:
+            for part in state["parts"]:
+                try:
+                    part.wait_result()
+                except Exception as exc:
+                    if not part.io_terminal and first_error is None:
+                        first_error = exc
+            if (state["plan"].direction == "write" and
+                    state["completion"] is not None and state["error"] is None):
+                try:
+                    state["completion"].wait_result()
+                except Exception as exc:
+                    if first_error is None:
+                        first_error = exc
+        if first_error is not None:
+            raise first_error
+        for batches, cell, _ in cells:
+            batches.pop(cell)
+
     def end_detached_read_plan(self, plan: DirectTargetPlan) -> None:
-        if self._detached_plans.pop(plan.plan_token, None) is not None:
+        if plan.plan_token in self._detached_plans:
+            self._drain_read_batches(plan.plan_token)
+            self._detached_plans.pop(plan.plan_token)
             self._invalid_plan_tokens.discard(plan.plan_token)
 
     def end_target_plan(self, direction: str) -> None:
-        plan = self._target_plans.pop(direction, None)
+        plan = self._target_plans.get(direction)
         if plan is not None:
+            self._drain_read_batches(plan.plan_token)
+            self._target_plans.pop(direction)
             self._invalid_plan_tokens.discard(plan.plan_token)
         if direction == "write":
             self._prepared_write_chunks = None
@@ -775,11 +974,10 @@ class TuttiDirectBackend:
             )
         return validated_tables
 
-    def _submit(self, keys, layer_idx: int, block_tables, direction: str,
-                target_plan: DirectTargetPlan | None = None):
+    def _prepare_requests(self, keys, layer_idx: int, block_tables, direction: str,
+                          target_plan: DirectTargetPlan | None = None):
         store = self._store
         geometry = self.geometry
-        started_ns = time.perf_counter_ns()
         keys = [bytes(key) for key in keys]
         block_tables = [list(table) for table in block_tables]
         if len(keys) != len(block_tables):
@@ -815,6 +1013,14 @@ class TuttiDirectBackend:
                 for block_ordinal, block_id in enumerate(table):
                     requests.extend(self._page_requests(
                         int(layer_idx), block_id, block_ordinal, plan_entry, plan))
+        return keys, validated_tables, io_keys, plan, requests
+
+    def _submit(self, keys, layer_idx: int, block_tables, direction: str,
+                target_plan: DirectTargetPlan | None = None):
+        store = self._store
+        started_ns = time.perf_counter_ns()
+        keys, _, io_keys, plan, requests = self._prepare_requests(
+            keys, layer_idx, block_tables, direction, target_plan)
         submit_started_ns = time.perf_counter_ns()
         stream_direction = (
             "read_async"
@@ -883,6 +1089,8 @@ class TuttiDirectBackend:
                 first_error = exc
         for direction in tuple(self._target_plans):
             self.end_target_plan(direction)
+        for plan in tuple(self._detached_plans.values()):
+            self.end_detached_read_plan(plan)
         finalize_failures = getattr(
             self._store, "finalize_direct_failures", None
         )
@@ -1153,6 +1361,8 @@ class _TuttiCompletion:
             if self._terminal is not None:
                 return
             self._terminal = ok
+            if self._direction == "write":
+                self._observation_error = None
             if message:
                 self._failure_message = message
             self._ready.set()
@@ -1247,6 +1457,133 @@ class _TuttiCompletion:
         completion = cls(runtime, [], on_settled, auto_watch=False)
         completion._settle(ok)
         return completion
+
+
+class _SubmitStep:
+    """One submit per service turn; accepted handles keep a single owner."""
+
+    def __init__(self, store, requests, direction):
+        self.store, self.direction = store, direction
+        indexed = list(enumerate(requests))
+        width = store._batch_width_limit() if indexed else None
+        self.segments = ([indexed[i:i + width] for i in range(0, len(indexed), width)][::-1]
+                         if width else ([indexed] if indexed else []))
+        self.handles = []
+        self.rejected_rounds = 0
+
+    def advance(self):
+        if not self.segments:
+            return True
+        pending = self.segments[-1]
+        result = self.store._runtime.submit(
+            [request for _, request in pending], accel_id=self.store._accel_id,
+            stream=self.store._stream_for(self.direction)[0], execution=self.store._execution)
+        rejected = list(result.rejected or [])
+        if result.io_handle is not None:
+            accepted = tuple(pending[i][0] for i, ok in enumerate(result.initial_states or []) if ok)
+            self.handles.append(_SubmittedHandle(result.io_handle, accepted))
+        elif len(rejected) != len(pending):
+            raise RuntimeError(f"tutti submit partial acceptance without handle: {result.status_msg}")
+        if not rejected:
+            if result.io_handle is None or not result.status_ok:
+                raise RuntimeError(f"tutti submit failed: {result.status_msg}")
+            self.segments.pop()
+            self.rejected_rounds = 0
+        elif len(rejected) == len(pending):
+            if len(pending) > 1 and _is_batch_width_rejection(result.status_msg):
+                mid = len(pending) // 2
+                self.segments[-1] = pending[:mid]
+                self.segments.append(pending[mid:])
+            elif "in-flight operation capacity exhausted" in result.status_msg:
+                for index, handle in enumerate(self.handles):
+                    parts = getattr(self, "completions", ())
+                    if index >= len(parts) or not parts[index]._settled:
+                        self.store._runtime.query_io(handle.handle)
+                lock = getattr(self.store, "_inflight_lock", None)
+                if lock is not None:
+                    with lock:
+                        active = {item for items in self.store._inflight_by_chunk.values() for item in items}
+                    for completion in active:
+                        completion.poll()
+            else:
+                self.rejected_rounds += 1
+                if self.rejected_rounds >= 2:
+                    raise RuntimeError(f"partial-commit consecutive zero acceptance: {result.status_msg}")
+        else:
+            self.rejected_rounds = 0
+            self.segments[-1] = [pending[i] for i in rejected]
+        return not self.segments
+
+
+class _BatchCompletion(_TuttiCompletion):
+    """Released segment outcomes remain observable until the entity settles."""
+
+    def __init__(self, runtime, parts, *, settle=lambda ok: None, direction="read"):
+        super().__init__(runtime, [], settle, auto_watch=False, direction=direction)
+        self._defer_target_close = direction == "write"
+        self.parts = tuple(parts)
+        self._handles = [handle for part in self.parts if not part._settled for handle in part._handles]
+        self._handles_released = True
+        self._early_failure = None
+        for part in self.parts:
+            part.add_terminal_callback(self._part_terminal)
+
+    def _part_terminal(self, result):
+        if result.ok:
+            return
+        with self._terminal_lock:
+            if self._early_failure is not None or self._terminal is not None:
+                return
+            self._early_failure = result
+            callbacks = self._terminal_callbacks
+            self._terminal_callbacks = []
+        for callback in callbacks:
+            callback(result)
+
+    def add_terminal_callback(self, callback):
+        with self._terminal_lock:
+            result = self._early_failure
+            if result is None:
+                if self._terminal is None:
+                    self._terminal_callbacks.append(callback)
+                    return
+                result = self._build_batch_result()
+        callback(result)
+
+    @property
+    def io_terminal(self):
+        return all(part.io_terminal for part in self.parts)
+
+    def poll(self):
+        statuses = [part.poll() for part in self.parts]
+        self._observation_error = next((part.observation_error for part in self.parts
+                                        if part.observation_error is not None), None)
+        if self._observation_error is not None or any(status is None for status in statuses):
+            return None
+        if not self._settled:
+            outcomes = [part.wait_result(0) for part in self.parts]
+            results = tuple(result for outcome in outcomes for result in outcome.results)
+            with self._terminal_lock:
+                self._submitted = [_SubmittedHandle(result.handle, result.batch_indices) for result in results]
+                self._terminal_results = {result.handle: result for result in results}
+            failure = next((outcome for outcome in outcomes if not outcome.ok), None)
+            self._mark_terminal(failure is None, str(failure) if failure is not None else None)
+        return self._finish()
+
+    def query(self):
+        return self.poll() is True
+
+    def wait_result(self, timeout=None):
+        deadline = time.monotonic() + timeout if timeout is not None else None
+        for part in self.parts:
+            part.wait_result(None if deadline is None else max(0.0, deadline - time.monotonic()))
+        self.poll()
+        if self.observation_error is not None:
+            raise self.observation_error
+        return self._batch_result
+
+
+_ReadBatchCompletion = _BatchCompletion
 
 
 class TuttiKVStore:
@@ -1795,15 +2132,22 @@ class TuttiKVStore:
         """Make the write stream wait for a worker gather fence."""
         self._wait_event("write", event)
 
-    def drain_deferred_completions(self) -> None:
+    def drain_deferred_completions(self, direction=None) -> None:
         """Drain submit-error handles during engine-level abort/final drain."""
-        pending = self._deferred_completions
-        self._deferred_completions = []
+        pending = []
+        retained = []
+        for completion in self._deferred_completions:
+            if direction is None or completion._direction == direction:
+                pending.append(completion)
+            else:
+                retained.append(completion)
+        self._deferred_completions = retained
         first_error = None
         for completion in pending:
             try:
                 completion.wait_result()
             except Exception as exc:
+                self._deferred_completions.append(completion)
                 if first_error is None:
                     first_error = exc
         if first_error is not None:
@@ -2313,7 +2657,7 @@ class TuttiKVStore:
             decode_io_key(io_key)[0] for io_key in io_keys
         ))
         self._direct_failed_chunks.update(chunk_ids)
-        if completion is None:
+        if completion is None or getattr(completion, "_defer_target_close", False):
             return
         with self._inflight_lock:
             active = {

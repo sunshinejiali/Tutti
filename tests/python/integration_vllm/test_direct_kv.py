@@ -539,6 +539,64 @@ def test_async_layer_list_pauses_between_prefills_without_host_sync(monkeypatch)
         plan.abort()
 
 
+def test_same_prefill_advances_one_batch_at_a_time_until_compute_event_finishes(monkeypatch):
+    from types import SimpleNamespace as NS
+    from tutti.engine.core import _AsyncReadPlan
+    engine, calls, completed, ended = _async_layer_engine(monkeypatch)
+    compute = NS(done=False)
+    records = []
+    engine._store.record_compute_event = lambda: records.append(compute) or NS(query=lambda: compute.done)
+    plan = _AsyncReadPlan(engine, [b"queued"], [[7]], (0, 1, 2))
+    try:
+        _wait_until(lambda: len(calls) == 1)
+        engine.finish_prefill_feeder()
+        engine.finish_prefill_feeder()
+        assert len(records) == 1
+        completed[0].done = True
+        _wait_until(lambda: len(calls) == 2)
+        assert not completed[1].done
+        compute.done = True
+        completed[1].done = True
+        engine._wake_read_service()
+        assert not plan._feeder_done.wait(.03)
+        assert len(calls) == 2 and not engine._background_read_allowed()
+        engine.begin_prefill_feeder(True)
+        assert not engine._background_read_allowed()
+        engine.advance_prefill_feeder(0)
+        _wait_until(lambda: len(calls) == 3)
+        completed[2].done = True
+        plan._feeder.join(2)
+        assert plan.poll() is True
+    finally:
+        plan.abort()
+        engine._get_read_service().close()
+
+
+def test_queued_request_starts_after_fifo_head_finishes_without_scheduler_poll(monkeypatch):
+    from tutti.engine.core import _AsyncReadPlan
+    engine, calls, completed, ended = _async_layer_engine(monkeypatch, layers=1)
+    first = _AsyncReadPlan(engine, [b"first"], [[7]], (0,))
+    _wait_until(lambda: len(calls) == 1)
+    first_io = completed[0]
+    second = _AsyncReadPlan(engine, [b"second"], [[8]], (0,))
+    try:
+        assert not second._feeder_done.wait(.03)
+        assert len(calls) == 1
+        first_io.done = True
+        _wait_until(lambda: len(calls) == 2)
+        assert calls[0][1] == (b"first",) and calls[1][1] == (b"second",)
+        assert len(ended) == 1
+        completed[0].done = True
+        second._feeder.join(2)
+        first._feeder.join(2)
+        assert first.poll() is True and second.poll() is True
+        assert len(ended) == 2
+    finally:
+        first.abort()
+        second.abort()
+        engine._get_read_service().close()
+
+
 @pytest.mark.parametrize("main_done,index_done", [(False, False), (True, False), (False, True), (True, True)])
 def test_all_io_done_checks_both_frontend_streams(main_done, index_done):
     plan = object.__new__(_DirectAllLayerReadPlan)
@@ -575,7 +633,24 @@ def test_all_io_done_query_error_fails_closed():
     assert plan.failed is error
 
 
-def test_background_waits_for_front_read_tail_and_stays_closed_after_prefill(monkeypatch):
+def test_compute_wait_profile_reports_pending_layer_fraction_and_exposed_wait():
+    plan = object.__new__(_DirectAllLayerReadPlan)
+    plan.physical_layers = (0, 1, 2, 3)
+    plan.read_pending_callbacks = {1, 3}
+    class End:
+        def query(self):
+            return True
+    class Start:
+        def elapsed_time(self, _end):
+            return 2.5
+    plan.compute_wait_events = {1: (Start(), End()), 3: (Start(), End())}
+    assert plan.compute_wait_profile() == (0.5, 5.0)
+
+    plan.compute_wait_events[3][1].query = lambda: False
+    assert plan.compute_wait_profile() is None
+
+
+def test_detached_background_does_not_wait_for_front_read_tail(monkeypatch):
     from tutti.engine.core import _AsyncReadPlan
     engine, calls, completed, ended = _async_layer_engine(monkeypatch, layers=1)
     plan = object.__new__(_DirectAllLayerReadPlan)
@@ -588,10 +663,8 @@ def test_background_waits_for_front_read_tail_and_stays_closed_after_prefill(mon
     engine._active_read_plan = plan
     background = _AsyncReadPlan(engine, [b"queued"], [[7]], (0,))
     try:
-        assert not background._feeder_done.wait(.05)
-        assert calls == [], "main tail alone cannot permit background reads"
-        state[0] = True
         _wait_until(lambda: len(calls) == 1)
+        assert calls == [(0, (b"queued",), ((7,),))]
         completed[0].done = True
         assert background._feeder_done.wait(2)
         assert background.poll() is True
@@ -652,9 +725,10 @@ def test_managed_async_cleanup_never_blocks_poll_or_releases_early(monkeypatch, 
     backend.start_detached_read = lambda *args: None
     def load(*args, **kwargs):
         return type("Ready", (), {"poll": lambda self: True})()
-    engine._transfer.load_layer = load
+    backend.try_get_paged_batch = load
     def cleanup(target):
-        assert threading.get_ident() != owner
+        if not ended:
+            assert threading.get_ident() != owner
         cleanup_entered.set()
         assert release.wait(3)
         if late_failure and not ended:
@@ -673,7 +747,11 @@ def test_managed_async_cleanup_never_blocks_poll_or_releases_early(monkeypatch, 
     if late_failure:
         assert plan.failure is not None
         assert plan.poll() is None
-        plan._feeder.join(3)
+        assert plan in engine._async_read_plans and not plan._ended
+        assert plan._cleanup_job.done.is_set()
+        plan.poll()
+        assert plan.poll() is None
+        plan.abort()
         assert plan.poll() is False
     else:
         assert plan.poll() is True
@@ -686,7 +764,7 @@ def test_managed_async_cleanup_returned_error_stays_failed(monkeypatch):
     backend.manages_background_reads = True
     backend.prepare_detached_read = lambda *args: None
     backend.start_detached_read = lambda *args: None
-    engine._transfer.load_layer = lambda *args, **kwargs: type(
+    backend.try_get_paged_batch = lambda *args, **kwargs: type(
         "Ready", (), {"poll": lambda self: True})()
     error = RuntimeError("sticky owned IO failure")
     backend.end_detached_read_plan = lambda target: error
@@ -728,8 +806,12 @@ def test_async_partial_submit_failure_does_not_release_blocks_before_accepted_io
     from tutti.engine.core import _AsyncReadPlan
     engine, calls, completed, ended = _async_layer_engine(monkeypatch)
     accepted_done = threading.Event()
+    waiting = threading.Event()
+    def wait():
+        waiting.set()
+        assert accepted_done.wait(3)
     completion = NS(poll=lambda: True if accepted_done.is_set() else None,
-                    wait=lambda: accepted_done.set())
+                    wait=wait)
     engine._store._deferred_completions = [completion]
     def load(*args, **kwargs):
         error = RuntimeError("partial read submit failed")
@@ -737,10 +819,12 @@ def test_async_partial_submit_failure_does_not_release_blocks_before_accepted_io
         raise error
     engine._transfer.load_layer = load
     plan = _AsyncReadPlan(engine, [b"queued"], [[7]], (0, 1, 2))
-    assert plan._feeder_done.wait(2)
+    assert waiting.wait(2)
     assert engine._store._deferred_completions == []
     assert plan.poll() is None and ended == []
+    assert plan in engine._async_read_plans
     accepted_done.set()
+    plan._feeder.join(3)
     assert plan.poll() is False and len(ended) == 1
     assert str(plan.failure) == "partial read submit failed"
 
@@ -754,9 +838,10 @@ def test_background_failure_stops_before_next_entity_and_optional_timing_does_no
         raise RuntimeError("device read failed")
     completed[0].poll = failed
     assert plan._feeder_done.wait(2)
-    assert plan.poll() is None and ended == []
+    plan._feeder.join(3)
+    assert plan.poll() is False and len(ended) == 1
     assert [c[0] for c in calls] == [0]
-    completed[0].poll = lambda: True
+    assert completed[0].done
     assert plan.poll() is False and len(ended) == 1
     assert str(plan.failure) == "device read failed"
 
@@ -1647,7 +1732,7 @@ def test_direct_all_layer_constructor_submits_complete_order(monkeypatch):
     assert set(plan.read_ready_events) == {0, 1, 2}
 
 
-def test_replica_collectives_submit_only_on_ordered_main_thread_callbacks(monkeypatch):
+def test_replica_collectives_use_persistent_service_and_callbacks_only_wait(monkeypatch):
     log = []
     engine = _direct_engine(log)
     engine._transfer._backend.requires_ordered_collectives = True
@@ -1656,8 +1741,11 @@ def test_replica_collectives_submit_only_on_ordered_main_thread_callbacks(monkey
     plan = _DirectAllLayerReadPlan(
         engine, [b"replica" * 4], [[2, 7]], (0, 1, 2)
     )
-    assert plan._feeder_thread is None
-    assert [item for item in log if item[0] == "read_submit"] == [("read_submit", 0)]
+    assert plan._feeder_thread is not None
+    plan._feeder_thread.join(3)
+    assert [item for item in log if item[0] == "read_submit"] == [
+        ("read_submit", 0), ("read_submit", 1), ("read_submit", 2)
+    ]
     plan.wait_layer(0, 0)
     plan.wait_layer(1, 1)
     before = list(log)
@@ -1686,6 +1774,325 @@ def test_owned_prefetch_starts_before_first_collective_and_abort_stops_it(monkey
     assert ("stop_prefetch",) in log
     assert ("join_prefetch",) in log
     assert not any(item == ("read_submit", 1) for item in log)
+
+
+def test_ordinary_nonblocking_foreground_first_layer_runs_on_persistent_service(monkeypatch):
+    from types import SimpleNamespace as NS
+    log = []
+    engine = _direct_engine(log)
+    backend = engine._transfer._backend
+    caller = threading.get_ident()
+    attempts = []
+    release = threading.Event()
+    def step(keys, layer, tables):
+        attempts.append((layer, threading.get_ident()))
+        if not release.is_set():
+            return None
+        completion = backend.get_paged_batch(keys, layer, tables)
+        completion.fence_event = NS(query=lambda: True)
+        return completion
+    monkeypatch.setattr(backend, "try_get_paged_batch", step, raising=False)
+    monkeypatch.setattr("torch.cuda.is_available", lambda: False)
+    plan = _DirectAllLayerReadPlan(engine, [b"ordinary" * 2], [[2, 7]], (0, 1, 2))
+    try:
+        _wait_until(lambda: bool(attempts))
+        assert all(tid != caller for _, tid in attempts)
+        release.set()
+        engine._get_read_service().wake()
+        plan.join_feeder()
+        assert plan.failed is None
+        assert [item[1] for item in log if item[0] == "read_submit"] == [0, 1, 2]
+    finally:
+        release.set()
+        plan.abort()
+        engine._get_read_service().close()
+
+
+def test_ordinary_async_capacity_retry_yields_and_waits_for_gpu_batch_fence(monkeypatch):
+    from types import SimpleNamespace as NS
+    from tutti.engine.core import _AsyncReadPlan
+    engine, calls, completed, ended = _async_layer_engine(monkeypatch, layers=2)
+    backend = engine._transfer._backend
+    original = engine._transfer.load_layer
+    capacity = threading.Event()
+    cq = NS(active=False)
+    polls = []
+    fence = NS(done=False)
+    def step(keys, layer, tables, target_plan=None):
+        if layer == 0 and not capacity.is_set():
+            cq.active = True
+            return None
+        result = original(keys, layer, tables, target_plan)
+        result.fence_event = NS(query=lambda: fence.done)
+        return result
+    def partial(plan):
+        polls.append(plan)
+        cq.active = False
+    backend.try_get_paged_batch = step
+    backend.poll_read_plan = partial
+    backend.has_pending_read_io = lambda plan: cq.active
+    engine._transfer.try_load_layer = step
+    plan = _AsyncReadPlan(engine, [b"queued"], [[7]], (0, 1))
+    ran = threading.Event()
+    class Foreground:
+        def advance(self):
+            ran.set()
+            return True
+    try:
+        _wait_until(lambda: cq.active)
+        job = engine._get_read_service().submit(Foreground(), priority=0)
+        assert ran.wait(2)
+        engine.end_prefill_feeder()
+        engine._get_read_service().wake()
+        _wait_until(lambda: bool(polls) and not cq.active)
+        assert calls == []
+        capacity.set()
+        engine.begin_prefill_feeder(True)
+        engine.advance_prefill_feeder(0)
+        _wait_until(lambda: len(calls) == 1)
+        completed[0].done = True
+        assert not plan._feeder_done.wait(.03)
+        assert len(calls) == 1
+        fence.done = True
+        engine._get_read_service().wake()
+        _wait_until(lambda: len(calls) == 2)
+        completed[1].done = True
+        plan._feeder.join(2)
+        assert plan.poll() is True
+    finally:
+        plan.abort()
+        engine._get_read_service().close()
+
+
+def _queued_write_engine(monkeypatch):
+    from types import SimpleNamespace as NS
+    engine = _direct_engine([])
+    backend = engine._transfer._backend
+    submitted, records, waits = [], [], []
+    ready = NS(front=False, write=False)
+    front = NS(failed=None, all_io_done=lambda: ready.front)
+    engine._active_read_plan = front
+    compute = object()
+    engine._store.record_compute_event = lambda: records.append(threading.get_ident()) or compute
+    engine._store.wait_write_event = lambda event: waits.append((event, threading.get_ident()))
+    class Completion:
+        def poll(self):
+            return True if ready.write else None
+    def submit(keys, layer, tables):
+        submitted.append((layer, tuple(keys), tuple(tuple(t) for t in tables), threading.get_ident()))
+        return Completion()
+    backend.try_put_paged_batch = submit
+    backend.poll_write_plan = lambda layer_idx=None: None
+    backend.has_pending_write_io = lambda layer_idx=None: False
+    backend.drain_write_layer = lambda layer: None
+    return NS(engine=engine, backend=backend, submitted=submitted, records=records,
+              waits=waits, ready=ready, front=front, compute=compute)
+
+
+def test_high_priority_reads_finish_before_writes_but_low_priority_reads_can_mix(monkeypatch):
+    cell = _queued_write_engine(monkeypatch)
+    main = threading.get_ident()
+    keys, tables = [b"write" * 4], [[2, 7]]
+    handle = cell.engine.store_layer(keys, 0, tables)
+    keys[0] = b"changed"
+    tables[0][0] = 99
+    low_started = threading.Event()
+    low_release = threading.Event()
+    class LowRead:
+        def advance(self):
+            low_started.set()
+            return low_release.is_set()
+    low_job = cell.engine._get_read_service().submit(LowRead(), priority=1)
+    try:
+        assert low_started.wait(2)
+        assert cell.records == [main]
+        assert cell.submitted == [] and cell.waits == []
+        assert handle.poll() is None
+        cell.ready.front = True
+        _wait_until(lambda: bool(cell.submitted))
+        assert low_job.is_alive(), "write must not wait for low priority read to finish"
+        assert cell.submitted[0][:3] == (0, (b"write" * 4,), ((2, 7),))
+        assert cell.submitted[0][3] != main
+        assert cell.waits == [(cell.compute, cell.submitted[0][3])]
+        cell.ready.write = True
+        handle.wait(2)
+        assert handle.poll() is True
+    finally:
+        low_release.set()
+        cell.ready.front = cell.ready.write = True
+        cell.engine._get_read_service().wake()
+        handle.wait(2)
+        low_job.join(2)
+        cell.engine._get_read_service().close()
+
+
+def test_wait_reads_idle_settles_reads_without_waiting_for_queued_writes(monkeypatch):
+    cell = _queued_write_engine(monkeypatch)
+    read_waited = threading.Event()
+    class ReadCompletion:
+        def wait(self):
+            read_waited.set()
+    cell.front.join_feeder = lambda: None
+    cell.engine._read_window = None
+    handle = cell.engine.store_layer([b"queued" * 3], 0, [[2, 7]])
+    cell.engine._inflight.insert(0, ReadCompletion())
+    try:
+        cell.engine.wait_reads_idle()
+        assert read_waited.is_set()
+        assert cell.engine._inflight == [handle]
+        assert handle.job.is_alive()
+        assert cell.submitted == []
+        cell.ready.front = True
+        _wait_until(lambda: bool(cell.submitted))
+        cell.ready.write = True
+        handle.wait(2)
+    finally:
+        cell.ready.front = cell.ready.write = True
+        cell.engine._get_read_service().wake()
+        handle.wait(2)
+        cell.engine._get_read_service().close()
+
+
+def test_wait_reads_idle_preserves_direct_writes_and_reports_partial_read_failure(monkeypatch):
+    cell = _queued_write_engine(monkeypatch)
+    calls = []
+    write = SimpleNamespace(drain_stats={"direction": "write"},
+                            wait=lambda: pytest.fail("write drain must follow consensus"))
+    error = RuntimeError("partial read CQ failed")
+    def fail_read():
+        calls.append("read")
+        raise error
+    read = SimpleNamespace(wait=fail_read)
+    cell.front.join_feeder = lambda: None
+    cell.engine._read_window = None
+    cell.engine._inflight = [read, write]
+    cell.engine._store.drain_deferred_completions = lambda direction: calls.append(direction)
+    cell.backend.end_target_plan = lambda direction: calls.append(("end", direction))
+    with pytest.raises(RuntimeError, match="partial read CQ failed"):
+        cell.engine.wait_reads_idle()
+    assert calls == ["read", "read", ("end", "read")]
+    assert cell.engine._inflight == [write, read]
+
+
+def test_wait_idle_does_not_hold_submission_lock_while_queued_writes_finish(monkeypatch):
+    cell = _queued_write_engine(monkeypatch)
+    joined = threading.Event()
+    errors = []
+    cell.front.join_feeder = lambda: joined.set()
+    cell.engine._read_window = cell.engine._write_window = None
+    cell.engine.store_layer([b"queued" * 3], 0, [[2, 7]])
+    def drain():
+        try:
+            cell.engine.wait_idle()
+        except Exception as exc:
+            errors.append(exc)
+    thread = threading.Thread(target=drain, daemon=True)
+    thread.start()
+    try:
+        assert joined.wait(2)
+        assert cell.submitted == []
+        cell.ready.front = cell.ready.write = True
+        cell.engine._get_read_service().wake()
+        thread.join(2)
+        assert not thread.is_alive() and errors == []
+        assert len(cell.submitted) == 1 and cell.engine._inflight == []
+    finally:
+        cell.ready.front = cell.ready.write = True
+        cell.engine._get_read_service().wake()
+        thread.join(2)
+        cell.engine._get_read_service().close()
+
+
+def test_write_capacity_retry_yields_and_each_retry_obeys_foreground_gate(monkeypatch):
+    cell = _queued_write_engine(monkeypatch)
+    capacity = threading.Event()
+    attempts = []
+    original = cell.backend.try_put_paged_batch
+    def submit(keys, layer, tables):
+        attempts.append(layer)
+        return original(keys, layer, tables) if capacity.is_set() else None
+    cell.backend.try_put_paged_batch = submit
+    cell.ready.front = True
+    handle = cell.engine.store_layer([b"queued" * 3], 1, [[2, 7]])
+    foreground_ran = threading.Event()
+    class Foreground:
+        def advance(self):
+            foreground_ran.set()
+            return True
+    try:
+        _wait_until(lambda: bool(attempts))
+        cell.ready.front = False
+        job = cell.engine._get_read_service().submit(Foreground(), priority=0)
+        assert foreground_ran.wait(2)
+        count = len(attempts)
+        handle.job.join(.03)
+        assert len(attempts) == count and cell.submitted == []
+        capacity.set()
+        cell.ready.front = True
+        cell.engine._get_read_service().wake()
+        _wait_until(lambda: bool(cell.submitted))
+        cell.ready.write = True
+        handle.wait(2)
+        assert len(cell.waits) == 1
+    finally:
+        cell.ready.front = cell.ready.write = True
+        capacity.set()
+        cell.engine._get_read_service().wake()
+        handle.wait(2)
+        cell.engine._get_read_service().close()
+
+
+def test_read_failure_cancels_unsubmitted_write_and_cleanup_never_blocks_feeder(monkeypatch):
+    cell = _queued_write_engine(monkeypatch)
+    entered, release, foreground_ran = threading.Event(), threading.Event(), threading.Event()
+    def drain(layer):
+        entered.set()
+        assert release.wait(2)
+    cell.backend.drain_write_layer = drain
+    handle = cell.engine.store_layer([b"failed" * 3], 0, [[2, 7]])
+    class Foreground:
+        def advance(self):
+            foreground_ran.set()
+            return True
+    try:
+        cell.front.failed = RuntimeError("front IO failed")
+        cell.engine._get_read_service().wake()
+        assert entered.wait(2)
+        cell.engine._get_read_service().submit(Foreground(), priority=0)
+        assert foreground_ran.wait(2)
+        assert handle.poll() is None and cell.submitted == []
+        release.set()
+        with pytest.raises(RuntimeError, match="front IO failed"):
+            handle.wait(2)
+        assert handle.poll() is False
+    finally:
+        release.set()
+        handle.job.join(2)
+        cell.engine._get_read_service().close()
+
+
+def test_direct_foreground_gate_joins_every_exact_layer_event(monkeypatch):
+    from types import SimpleNamespace as NS
+    log = []
+    engine = _direct_engine(log)
+    service = engine._get_read_service()
+    joined = []
+    done = NS(ready=False, queries=0)
+    def query():
+        done.queries += 1
+        return done.ready
+    done.query = query
+    monkeypatch.setattr(service, "join_events", lambda events: joined.append(events) or done)
+    monkeypatch.setattr("torch.cuda.is_available", lambda: True)
+    monkeypatch.setattr("torch.cuda.Event", lambda enable_timing=False: object())
+    plan = _DirectAllLayerReadPlan(engine, [b"gate" * 4], [[2, 7]], (0, 1, 2))
+    plan.join_feeder()
+    assert joined == [tuple(plan.read_ready_events[index] for index in range(3))]
+    assert not plan.all_io_done() and done.queries == 1
+    done.ready = True
+    assert plan.all_io_done() and done.queries == 2
+    assert plan.all_io_done() and done.queries == 2
+    plan.abort()
 
 
 def test_direct_feeder_submits_without_kick_and_join_is_idempotent(monkeypatch):
@@ -1940,6 +2347,8 @@ def test_direct_all_layer_read_failure_marks_whole_plan_without_host_wait(
     assert plan.failed.whole_operation
     assert plan.failed.invalid_block_ids == (3, 1)
     assert all(handle.wait_count == 0 for handle in plan.handles.values())
+    with pytest.raises(RuntimeError, match="direct read failed"):
+        plan.wait_layer(0, 0)
     plan.abort()
 
 

@@ -55,6 +55,10 @@ POOL_TAG="${POOL_TAG:-online1}"
 # prompt 上限多 16（vLLM 惯例），但不得超过模型上限（264144 会直接启动失败）。
 MODEL_MAX_LEN="${MODEL_MAX_LEN:-262144}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-$(( MAX_PROMPT_TOKENS + 16 < MODEL_MAX_LEN ? MAX_PROMPT_TOKENS + 16 : MODEL_MAX_LEN ))}"
+# Keep the online scheduler budget aligned with the Phoenix comparison unless
+# a benchmark explicitly overrides it.
+MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8192}"
+FLASHINFER_AUTOTUNE="${FLASHINFER_AUTOTUNE:-1}"
 
 # HBM KV 池上限（单位：block）。默认**不传**：用 vLLM 自然池。
 # FP8 的可用 token 总量约 2.46M；512-token block 的块数由 vLLM 实测决定。
@@ -86,10 +90,15 @@ DEVICE_GROUPS="${DEVICE_GROUPS:-0,1,2,3;4,5,6,7}"
 KV_MOUNT="${KV_MOUNT:-/mnt/tutti_md0}"
 NUM_QUEUES="${NUM_QUEUES:-8}"
 if ! [[ "$NUM_QUEUES" =~ ^[1-9][0-9]*$ && "$TP_SIZE" =~ ^[1-9][0-9]*$ && "$CHUNK_TOKENS" =~ ^[1-9][0-9]*$ &&
-        "$BLOCK_SIZE" =~ ^[1-9][0-9]*$ ]]; then
-    echo "NUM_QUEUES, TP_SIZE, CHUNK_TOKENS, BLOCK_SIZE must be positive integers" >&2
+        "$BLOCK_SIZE" =~ ^[1-9][0-9]*$ && "$MAX_NUM_BATCHED_TOKENS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "NUM_QUEUES, TP_SIZE, CHUNK_TOKENS, BLOCK_SIZE, MAX_NUM_BATCHED_TOKENS must be positive integers" >&2
     exit 2
 fi
+case "$FLASHINFER_AUTOTUNE" in
+1) FLASHINFER_ARGS=(--enable-flashinfer-autotune) ;;
+0) FLASHINFER_ARGS=(--no-enable-flashinfer-autotune) ;;
+*) echo 'FLASHINFER_AUTOTUNE must be 0 or 1' >&2; exit 2 ;;
+esac
 if (( CHUNK_TOKENS % BLOCK_SIZE != 0 )); then
     echo "CHUNK_TOKENS must be divisible by BLOCK_SIZE" >&2
     exit 2
@@ -196,6 +205,20 @@ if [ -n "$NUM_GPU_BLOCKS_OVERRIDE" ]; then
     HBM_ARGS+=(--num-gpu-blocks-override "$NUM_GPU_BLOCKS_OVERRIDE")
 fi
 
+# Piecewise compilation keeps the connector's attention callbacks eager
+# between captured graph segments. ENFORCE_EAGER=0 opts into this path.
+COMPUTE_ARGS=()
+case "${ENFORCE_EAGER:-1}" in
+1)
+    COMPUTE_ARGS+=(--enforce-eager)
+    ;;
+0)
+    export VLLM_USE_BREAKABLE_CUDAGRAPH=0
+    COMPUTE_ARGS+=(--compilation-config '{"mode":3,"cudagraph_mode":"PIECEWISE"}')
+    ;;
+*) echo 'ENFORCE_EAGER must be 0 or 1' >&2; exit 2 ;;
+esac
+
 read -r -a SERVED_NAMES <<< "$SERVED_NAME"
 COMMAND=(
     "$PYTHON" -m vllm.entrypoints.openai.api_server
@@ -205,7 +228,7 @@ COMMAND=(
     --tensor-parallel-size "$TP_SIZE"
     --block-size "$BLOCK_SIZE"
     --kv-cache-dtype "$KV_CACHE_DTYPE"
-    --enforce-eager
+    "${COMPUTE_ARGS[@]}"
     --max-model-len "$MAX_MODEL_LEN"
     --load-format "$LOAD_FORMAT"
     --enable-prefix-caching
@@ -213,7 +236,8 @@ COMMAND=(
     --enable-auto-tool-choice
     --tool-call-parser "$TOOL_CALL_PARSER"
     --port "$PORT"
-    --no-enable-flashinfer-autotune
+    "${FLASHINFER_ARGS[@]}"
+    --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS"
     --kv-transfer-config "$KV_CONFIG"
 )
 if (( DRY_RUN )); then

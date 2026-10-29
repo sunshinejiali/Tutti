@@ -10,6 +10,7 @@ import logging
 import os
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, TYPE_CHECKING
 
@@ -167,8 +168,9 @@ class TuttiConnectorV1(KVConnectorBase_V1):
         self._vllm_config = vllm_config
         self._layerwise_kv = "kv_layer_page_bytes" in extra
         self._cache_hook_handles = ()
-        if self._layerwise_kv and not getattr(vllm_config.model_config, "enforce_eager", False):
-            raise ValueError("独立KV实体目前要求 enforce_eager=True；CUDA graph回调尚未支持")
+        if self._layerwise_kv:
+            from .replica_layout import validate_layerwise_execution
+            validate_layerwise_execution(vllm_config)
         dcp = getattr(
             getattr(vllm_config, "parallel_config", None),
             "decode_context_parallel_size",
@@ -222,6 +224,15 @@ class TuttiConnectorV1(KVConnectorBase_V1):
         self._load_async: dict[str, bool] = {}
         self._async_pending: dict[str, _ReqMeta] = {}
         self._async_outstanding: dict[str, int] = {}
+        self._async_started_ns: dict[str, int] = {}
+        self._async_ready_ns: dict[str, int] = {}
+        self._prefetch_e2e_ms = deque(maxlen=512)
+        self._prefetch_worker_ms = deque(maxlen=512)
+        self._prefetch_resume_ms = deque(maxlen=512)
+        self._prefetch_counters = [0, 0, 0, 0]
+        self._profile_samples = deque(maxlen=1024)
+        self._profile_window_bytes = 0
+        self._profile_window_ops = 0
         # 显存门槛的分母：HBM KV 池总块数（单 KV 组）；未知时异步一律不放行。
         self._total_blocks = getattr(kv_cache_config, "num_blocks", None)
         self._policy: LoadModePolicy | None = None
@@ -395,6 +406,11 @@ class TuttiConnectorV1(KVConnectorBase_V1):
         if self._max_tokens_per_load:
             new = min(new, self._max_tokens_per_load)
         req_id = request.request_id
+        ready_ns = self._async_ready_ns.pop(req_id, None)
+        if ready_ns is not None:
+            self._prefetch_resume_ms.append(
+                max(0.0, (time.perf_counter_ns() - ready_ns) / 1e6)
+            )
         if new <= 0:
             self._load_async.pop(req_id, None)
             return new, False
@@ -455,6 +471,7 @@ class TuttiConnectorV1(KVConnectorBase_V1):
                 load_start_token=start,
                 load_async=True,
             )
+            self._async_started_ns[req_id] = time.perf_counter_ns()
             return
         self._pending_loads[req_id] = num_external_tokens
         self._load_starts[req_id] = start
@@ -539,6 +556,7 @@ class TuttiConnectorV1(KVConnectorBase_V1):
                 _fmt(p["read_ms_per_chunk"], 3), _fmt(p["compute_ms_per_token"], 4),
                 _fmt(p["step_ms"], 1),
             )
+        self._log_io_profile(now)
         self._health_last_ns = now
         self._health_last = {
             "steps": self._steps_total,
@@ -546,6 +564,64 @@ class TuttiConnectorV1(KVConnectorBase_V1):
             "hit_requests": self._hit_requests_total,
             "evicted": self._evicted_total,
         }
+
+    @staticmethod
+    def _percentile(values, fraction):
+        if not values:
+            return None
+        ordered = sorted(values)
+        return ordered[min(len(ordered) - 1, int((len(ordered) - 1) * fraction))]
+
+    def _log_io_profile(self, now_ns: int) -> None:
+        samples = list(self._profile_samples)
+        read = [sample for sample in samples if sample[4] > 0]
+        read_stream_ms = [sample[4] for sample in read]
+        wall_ms = [sample[5] for sample in read]
+        queue_ms = [sample[6] for sample in read]
+        sync = [sample for sample in read if sample[0] == 0]
+        overlap = [sample[8] for sample in sync if sample[8] >= 0]
+        exposed_wait = [sample[9] for sample in sync if sample[9] >= 0]
+        ranks = max(1, self._tp_size)
+        duration_s = max(0.0, (now_ns - self._health_last_ns) / 1e9)
+        effective_gbps = (
+            self._profile_window_bytes / (duration_s * 1e9)
+            if duration_s > 0 else 0.0
+        )
+        logger.info(
+            "[tutti] io-profile window_s=%.1f samples=%d sync_plans=%d "
+            "prefetch_plans=%d logical_io_ops=%d bytes=%d "
+            "effective_gbps=%.3f read_stream_ms_p50=%s read_stream_ms_p95=%s "
+            "plan_wall_ms_p50=%s prefetch_queue_ms_p50=%s "
+            "prefetch_queue_ms_p95=%s overlap_plan_rate=%s "
+            "overlap_layer_ratio=%s exposed_wait_ms_p50=%s "
+            "exposed_wait_ms_p95=%s prefetch_request_totals=%s "
+            "prefetch_worker_ms_p50=%s prefetch_worker_ms_p95=%s "
+            "prefetch_e2e_ms_p50=%s prefetch_e2e_ms_p95=%s "
+            "resume_delay_ms_p50=%s io_kernel_time=nsys_required",
+            duration_s, len(read) / ranks, len(sync) / ranks,
+            sum(s[0] == 1 for s in read) / ranks,
+            self._profile_window_ops, self._profile_window_bytes,
+            effective_gbps,
+            _fmt(self._percentile(read_stream_ms, .50), 1),
+            _fmt(self._percentile(read_stream_ms, .95), 1),
+            _fmt(self._percentile(wall_ms, .50), 1),
+            _fmt(self._percentile(queue_ms, .50), 1),
+            _fmt(self._percentile(queue_ms, .95), 1),
+            _fmt(sum(value > 0 for value in overlap) / len(overlap), 3)
+            if overlap else "n/a",
+            _fmt(sum(overlap) / len(overlap), 3) if overlap else "n/a",
+            _fmt(self._percentile(exposed_wait, .50), 1),
+            _fmt(self._percentile(exposed_wait, .95), 1),
+            tuple(round(value / ranks, 3) for value in self._prefetch_counters),
+            _fmt(self._percentile(list(self._prefetch_worker_ms), .50), 1),
+            _fmt(self._percentile(list(self._prefetch_worker_ms), .95), 1),
+            _fmt(self._percentile(list(self._prefetch_e2e_ms), .50), 1),
+            _fmt(self._percentile(list(self._prefetch_e2e_ms), .95), 1),
+            _fmt(self._percentile(list(self._prefetch_resume_ms), .50), 1),
+        )
+        self._profile_samples.clear()
+        self._profile_window_bytes = 0
+        self._profile_window_ops = 0
 
     def build_connector_meta(self, scheduler_output) -> TuttiConnectorMetadata:
         """把本步调度结果折叠为传输计划；调用即重置调度侧记账。"""
@@ -679,6 +755,12 @@ class TuttiConnectorV1(KVConnectorBase_V1):
         """
         for req_id in getattr(connector_output, "finished_recving", None) or ():
             self._async_outstanding.pop(req_id, None)
+            req_id = str(req_id)
+            now = time.perf_counter_ns()
+            self._async_ready_ns[req_id] = now
+            started = self._async_started_ns.pop(req_id, None)
+            if started is not None:
+                self._prefetch_e2e_ms.append(max(0.0, (now - started) / 1e6))
         meta = getattr(connector_output, "kv_connector_worker_meta", None)
         if meta is None:
             return
@@ -702,6 +784,19 @@ class TuttiConnectorV1(KVConnectorBase_V1):
                      getattr(meta, "step_samples", None) or () if t > 0 and ms > 0]
             if steps:
                 self._policy.observe_step(*max(steps, key=lambda s: s[1]))
+        for sample in getattr(meta, "profile_samples", None) or ():
+            if len(sample) != 10:
+                continue
+            self._profile_samples.append(tuple(sample))
+            self._profile_window_bytes += int(sample[7])
+            self._profile_window_ops += int(sample[3])
+        stats = getattr(meta, "prefetch_stats", (0, 0, 0, 0))
+        for i, value in enumerate(stats):
+            self._prefetch_counters[i] += int(value)
+        self._prefetch_worker_ms.extend(
+            float(value) for value in getattr(meta, "prefetch_wait_ms", None) or ()
+            if float(value) >= 0
+        )
         apply_commits = getattr(self._index, "apply_worker_commits", None)
         if not callable(apply_commits):
             return
@@ -727,12 +822,18 @@ class TuttiConnectorV1(KVConnectorBase_V1):
         failed = raw.get("failed") or ()
         forgotten = raw.get("forgotten") or ()
         evicted = raw.get("evicted") or ()
+        profile_samples = raw.get("profile_samples") or ()
+        prefetch_stats = raw.get("prefetch_stats") or (0, 0, 0, 0)
+        prefetch_wait_ms = raw.get("prefetch_wait_ms") or ()
         try:
             rebuilt = TuttiWorkerMetadata(
                 committed={bytes(k): int(v) for k, v in dict(committed).items()},
                 failed={bytes(k) for k in failed},
                 forgotten={bytes(k) for k in forgotten},
                 evicted={bytes(k) for k in evicted},
+                profile_samples=[tuple(item) for item in profile_samples],
+                prefetch_stats=tuple(int(item) for item in prefetch_stats),
+                prefetch_wait_ms=[float(item) for item in prefetch_wait_ms],
             )
         except Exception:
             return None
@@ -758,6 +859,8 @@ class TuttiConnectorV1(KVConnectorBase_V1):
         self._load_starts.pop(request.request_id, None)
         self._match_starts.pop(request.request_id, None)
         self._load_async.pop(request.request_id, None)
+        self._async_started_ns.pop(request.request_id, None)
+        self._async_ready_ns.pop(request.request_id, None)
         # _async_pending / _async_outstanding 不清：读仍要完成并回报
         # finished_recving，vLLM 才会释放这些块（见 build_connector_meta）。
         return False, None

@@ -279,6 +279,52 @@ def test_nonowner_empty_submit_does_not_touch_runtime():
     assert TuttiKVStore._submit_retry(store, [], "write") == []
 
 
+@pytest.mark.parametrize("owner", [False, True])
+def test_replica_nonblocking_write_inherits_owner_filter_without_scatter(monkeypatch, owner):
+    from contextlib import nullcontext
+    from types import SimpleNamespace as NS
+    from tutti.storage.tutti_nvme.layerwise_direct import LayerPageGeometry
+    from tutti.storage.tutti_nvme.replica_direct import TuttiReplicaDirectBackend
+    from tutti.storage.tutti_nvme.store import DirectPoolGeometry, DirectTargetPlan, DirectTargetPlanEntry, TuttiDirectBackend
+    assert TuttiReplicaDirectBackend.try_put_paged_batch is TuttiDirectBackend.try_put_paged_batch
+    items = (int(owner).to_bytes(8, "little") + b"k" * 8,)
+    submissions, releases, settled = [], [], []
+    def submit(requests, **kwargs):
+        submissions.append(tuple(requests))
+        return NS(io_handle=17, initial_states=(True,), rejected=(), status_ok=True, status_msg="")
+    runtime = NS(caps=lambda: {}, submit=submit, query_io=lambda handle: "COMPLETED",
+                 wait=lambda handle, timeout: ("OK", "COMPLETED"), release_io=releases.append)
+    store = NS(_replica_groups=((0, 1),), _runtime=runtime,
+               _stream_for=lambda direction: (123, None), stream_context=lambda direction: nullcontext(),
+               _record_event=lambda direction: NS(query=lambda: True), _batch_width_limit=lambda: None,
+               _targets={"file://cell": NS(ticket=7)}, _layout=NS(target_generation=lambda key: 1),
+               _track_completion=lambda *args: None, _accel_id=0, _execution="device",
+               _on_put_settled=lambda ok, keys: settled.append((ok, tuple(keys))))
+    backend = TuttiReplicaDirectBackend(store)
+    backend._rank = 1
+    backend._geometry = DirectPoolGeometry(65536, 32768, 4096, 4096, 4096, 8, 1, 1, 1, 4096, 0)
+    backend._memory_ticket = 3
+    backend._layer_pages = (LayerPageGeometry(4096, 4096, 8),)
+    backend._layer_tickets = [3]
+    entry = DirectTargetPlanEntry(items[0], 7, "file://cell", 4096, 1, 0)
+    plan = DirectTargetPlan("write", 3, 1, (entry,))
+    backend._target_plans["write"] = plan
+    import tutti.storage.tutti_nvme.store as module
+    monkeypatch.setattr(module, "_ASYNC_COMPLETION", False)
+    completion = backend.try_put_paged_batch(items, 0, ((7,),), plan)
+    assert completion._direction == "write" and not hasattr(completion, "done_event")
+    assert completion.poll() is True and len(settled) == 1
+    assert backend.try_put_paged_batch(items, 0, ((7,),), plan) is completion
+    assert len(settled) == 1 and len(submissions) == int(owner)
+    if owner:
+        assert submissions[0][0][2:] == (3, 7 * 4096, 4096, "write")
+        assert releases == [17]
+    else:
+        assert completion.wait_result(0).results == () and releases == []
+    backend.end_target_plan("write")
+    assert not backend._write_batches
+
+
 def test_scatter_completion_does_not_finish_before_gpu_event():
     from types import SimpleNamespace as NS
     from tutti.storage.tutti_nvme.replica_direct import _ScatterCompletion
@@ -289,6 +335,9 @@ def test_scatter_completion_does_not_finish_before_gpu_event():
         completion.wait_result(0)
     ready[0] = True
     assert completion.wait_result().ok
+    def repeated_query():
+        raise AssertionError("settled fence must not be queried again")
+    completion.fence_event.query = repeated_query
     assert completion.poll() is True
 
 
@@ -374,17 +423,18 @@ def test_close_releases_scatter_plans_before_mappings_exports_and_final_tickets(
     assert backend._layer_tickets == []
 
 
-def test_prefetch_queue_reports_failure_and_stop_without_waiting():
-    import queue
+def test_prefetch_task_reports_failure_and_stop_without_waiting():
     from types import SimpleNamespace as NS
-    from tutti.storage.tutti_nvme.replica_direct import TuttiReplicaDirectBackend
-    backend = TuttiReplicaDirectBackend(NS())
-    backend._prefetch_error = RuntimeError("owned IO failed")
-    with pytest.raises(RuntimeError, match="owned IO failed"):
-        backend._queue_get(queue.Queue())
+    from tutti.storage.tutti_nvme.replica_direct import _ReplicaReadTask
+    backend = _p2p_backend(NS())
+    backend._signals = signals()
+    task = _ReplicaReadTask(backend, NS())
+    task.fail(RuntimeError("owned IO failed"))
+    assert task.advance() is True
+    assert backend._poisoned
+    assert "owned IO failed" in str(backend._prefetch_error)
     backend._prefetch_stop.set()
-    with pytest.raises(RuntimeError, match="stopped"):
-        backend._queue_get(queue.Queue())
+    assert _ReplicaReadTask(backend, NS()).advance() is True
 
 
 def test_replica_backend_has_no_extra_send_or_receive_payload():
@@ -478,42 +528,29 @@ def test_detached_replica_borrows_memory_without_replacing_store_owner(monkeypat
     assert a._invalid_plan_tokens is backend._invalid_plan_tokens
     assert a._parent is backend and b._parent is backend
     assert a._read_direction == a._io_direction == "read_async"
-    assert a._prefetch_thread is None and b._prefetch_thread is None
+    assert a._prefetch_job is None and b._prefetch_job is None
     assert a._compute_prefix is event
     assert prefixes == ["detached/1/", "detached/2/"]
     a._fail(RuntimeError("detached failed"))
     assert backend._poisoned and b._prefetch_error is None
 
 
-def test_background_read_and_scatter_resume_without_cross_rank_admit_epoch(monkeypatch):
-    import threading
+def test_background_admission_checks_new_window_without_waiting():
     from types import SimpleNamespace as NS
     backend = _p2p_backend(NS())
     backend._signals = signals()
     state = [None]
     backend._background_allowed = lambda: state[0]
-    first, second = threading.Event(), threading.Event()
-    def work():
-        backend._admit_background_entity(0)
-        first.set()
-        backend._admit_background_entity(0, "scatter")
-        second.set()
-    thread = threading.Thread(target=work, daemon=True)
-    thread.start()
-    try:
-        assert not first.wait(.03)
-        state[0] = (1, 0)
-        assert first.wait(1)
-        assert not second.wait(.03)
-        state[0] = None
-        assert not second.wait(.03)
-        state[0] = (2, 0)
-        assert second.wait(1)
-        assert not any("admit" in key for key in backend._signals.store.data)
-        assert not backend._poisoned
-    finally:
-        backend._prefetch_stop.set()
-        thread.join(1)
+    assert backend._admit_background_entity(0) is False
+    state[0] = (1, 0)
+    assert backend._admit_background_entity(0) is True
+    assert backend._admit_background_entity(1) is True
+    state[0] = None
+    assert backend._admit_background_entity(1) is False
+    state[0] = (2, 0)
+    assert backend._admit_background_entity(1) is True
+    assert not any("admit" in key for key in backend._signals.store.data)
+    assert not backend._poisoned
 
 
 def test_paused_peer_ready_does_not_expire_notification_timeout(monkeypatch):
@@ -532,40 +569,35 @@ def test_paused_peer_ready_does_not_expire_notification_timeout(monkeypatch):
     assert control.error is None
 
 
-def test_background_retry_waits_for_next_prefill_without_discarding_handles():
-    import threading
+def test_partial_submit_yields_and_retries_only_rejected_request():
     from types import SimpleNamespace as NS
+    from tutti.storage.tutti_nvme.replica_direct import _ReplicaSubmit
     calls = []
-    backend = _p2p_backend(NS(_runtime=NS(query_io=lambda handle: calls.append(handle))))
-    backend._signals = signals()
-    state = [None]
-    backend._background_allowed = lambda: state[0]
-    resumed = threading.Event()
-    def submit():
-        with backend._before_background_submit((NS(handle=17),)):
-            resumed.set()
-    thread = threading.Thread(target=submit, daemon=True)
-    thread.start()
-    try:
-        assert not resumed.wait(.03)
-        assert 17 in calls
-        state[0] = (2, 0)
-        assert resumed.wait(1)
-        assert not backend._poisoned
-    finally:
-        backend._prefetch_stop.set()
-        thread.join(1)
+    def submit(batch, **kwargs):
+        calls.append(list(batch))
+        return (NS(io_handle=17, initial_states=(True, False), rejected=(1,), status_ok=False,
+                   status_msg="partial") if len(calls) == 1 else
+                NS(io_handle=18, initial_states=(True,), rejected=(), status_ok=True, status_msg=""))
+    store = NS(_runtime=NS(submit=submit), _batch_width_limit=lambda: None, _accel_id=0,
+               _execution="device", _stream_for=lambda direction: (123, None))
+    task = _ReplicaSubmit(store, [(1,), (2,)], "read_async")
+    assert task.advance() is False
+    assert calls == [[(1,), (2,)]]
+    assert task.advance() is True
+    assert calls == [[(1,), (2,)], [(2,)]]
+    assert [(h.handle, h.batch_indices) for h in task.handles] == [(17, (0,)), (18, (1,))]
 
 
-def test_open_prefill_retries_do_not_refresh_capacity_deadline():
-    from types import SimpleNamespace as NS
-    backend = _p2p_backend(NS())
-    backend._signals = signals()
-    backend._background_allowed = lambda: (1, 0)
-    backend._submit_deadline = 123.0
+def test_open_batch_capacity_retries_do_not_refresh_deadline(monkeypatch):
+    backend, plan, calls = _producer_backend(monkeypatch, count=2)
+    state = backend._new_entity(plan, 2)
+    deadline = state["deadline"]
+    backend._store._runtime.submit = lambda *a, **k: type("Result", (), dict(
+        io_handle=None, initial_states=(False, False), rejected=(0, 1), status_ok=False,
+        status_msg="in-flight operation capacity exhausted"))()
     for _ in range(3):
-        with backend._before_background_submit(()):
-            assert backend._submit_deadline == 123.0
+        backend._advance_submit(state)
+        assert state["deadline"] == deadline and state["phase"] == "submit"
 
 
 def test_ready_and_ack_publish_binary_ipc_handles_without_gpu_calls():
@@ -673,11 +705,11 @@ def test_stop_prefetch_publishes_abort_until_all_entities_recovered(alive):
     def join(timeout):
         calls.append("join")
         state[0] = False
-    backend._prefetch_thread = NS(is_alive=lambda: state[0], join=join)
+    backend._prefetch_job = NS(is_alive=lambda: state[0], join=join)
     backend.stop_prefetch()
     assert backend._poisoned
     assert "aborted" in str(backend._prefetch_error)
-    assert calls == ["join"] and backend._prefetch_thread is None
+    assert calls == ["join"] and backend._prefetch_job is None
     peer = signals(rank=1, store=store)
     with pytest.raises(RuntimeError, match="aborted"):
         peer.check()
@@ -695,7 +727,7 @@ def test_stop_prefetch_preserves_first_io_failure(alive):
     backend._fail(original)
     terminal = backend._signals.store.data["terminal"]
     state = [alive]
-    backend._prefetch_thread = NS(is_alive=lambda: state[0],
+    backend._prefetch_job = NS(is_alive=lambda: state[0],
                                   join=lambda timeout: state.__setitem__(0, False))
     backend.stop_prefetch()
     assert backend._prefetch_error is original
@@ -710,7 +742,7 @@ def test_stop_prefetch_does_not_abort_completed_recovery():
     backend._active_token = 1
     backend._entity_sequence = (2, 0)
     backend._next_entity = 2
-    backend._prefetch_thread = NS(is_alive=lambda: False, join=lambda timeout: None)
+    backend._prefetch_job = NS(is_alive=lambda: False, join=lambda timeout: None)
     backend.stop_prefetch()
     assert not backend._poisoned and backend._prefetch_error is None
     assert "terminal" not in backend._signals.store.data
@@ -769,12 +801,10 @@ def test_quiesce_drains_then_reports_observer_failure_during_join(started_poison
     late = RuntimeError("late observer IO failure")
     if started_poisoned:
         backend._fail(original)
-    backend._prefetch_thread = NS(join=lambda timeout: calls.append("producer"),
-                                  is_alive=lambda: False)
     def observer_join(timeout):
-        calls.append("observer")
+        calls.append("job")
         backend._fail(late)
-    backend._completion_thread = NS(join=observer_join, is_alive=lambda: False)
+    backend._prefetch_job = NS(join=observer_join, is_alive=lambda: False)
     backend._wait_event = lambda stream, cancellable: calls.append((stream, cancellable))
     ipc_event, peer_event, plan = object(), object(), object()
     backend._ipc_events = [ipc_event]
@@ -891,7 +921,7 @@ def _recovery_backend(monkeypatch, physical=2, members=(0, 1)):
     backend._test_events, backend._test_imports = events, imports
     backend._geometry = NS(accel_id=0, num_layers=physical + 1, blocks_per_chunk=1)
     backend._layer_pages = (NS(page_bytes=4, block_stride=4),) * (physical + 1)
-    backend._prefetch_thread = object()
+    backend._prefetch_job = object()
     backend._prefetch_keys, backend._prefetch_tables = tuple(items), tuple(tables)
     backend._target_plans["read"] = NS(plan_token=1)
     backend._active_token = 1
@@ -937,7 +967,7 @@ def test_get_paged_batch_copies_peer_pages_without_waiting_gpu_completion(monkey
         monkeypatch.setattr(type(backend._test_events[0]), "record", record)
     if mode != "pending":
         with pytest.raises(RuntimeError, match="failed"):
-            backend._drive_scatter()
+            _advance_test_scatter(backend)
             backend.get_paged_batch(items, physical, tables)
         assert calls.count("launch") == 1 and backend._poisoned
         assert not backend._signals.store.check([f"1/ack/{physical}/0"])
@@ -947,7 +977,7 @@ def test_get_paged_batch_copies_peer_pages_without_waiting_gpu_completion(monkey
         if mode == "record_failure":
             assert backend._pending_events and backend._ipc_events
         return
-    backend._drive_scatter()
+    _advance_test_scatter(backend)
     completion = backend.get_paged_batch(items, physical, tables)
     assert completion.fence_event is backend._test_events[-1]
     assert backend._raw_layers[physical][7].tolist() == [10, 11, 12, 13]
@@ -982,7 +1012,7 @@ def test_get_paged_batch_fails_closed_before_compute_handover(monkeypatch, mode)
         del backend._signals.store.data[f"1/ready/{physical}/1"]
     error = RuntimeError if mode in ("peer", "handover") else TimeoutError
     with pytest.raises(error):
-        backend._drive_scatter()
+        _advance_test_scatter(backend)
         backend.get_paged_batch(items, physical, tables)
     assert "compute_handover" not in calls
     assert backend._poisoned
@@ -1005,7 +1035,7 @@ def test_compute_handover_requires_every_peer_scatter_record_not_gpu_done(monkey
             backend._signals.store.set(f"1/ack/2/{peer}", _event_handle("ack", 2, peer))
     if missing_peer is not None:
         with pytest.raises(TimeoutError, match="notification timed out"):
-            backend._drive_scatter()
+            _advance_test_scatter(backend)
             backend.get_paged_batch(items, 2, tables)
         assert "compute_handover" not in calls
         assert backend._scatter_plans[2] in backend._retained
@@ -1013,7 +1043,7 @@ def test_compute_handover_requires_every_peer_scatter_record_not_gpu_done(monkey
         assert backend._signals.store.check(["1/ack/2/0"])
         assert backend._next_entity == 0
         return
-    backend._drive_scatter()
+    _advance_test_scatter(backend)
     completion = backend.get_paged_batch(items, 2, tables)
     assert completion.fence_event.recorded
     for peer in (1, 2):
@@ -1028,7 +1058,7 @@ def test_compute_handover_requires_every_peer_scatter_record_not_gpu_done(monkey
 def test_late_owned_failure_rejects_scatter_success_after_compute_enqueue(monkeypatch, method):
     backend, items, tables, calls = _recovery_backend(monkeypatch)
     backend._signals.store.set("1/ack/2/1", _event_handle("ack", 2, 1))
-    backend._drive_scatter()
+    _advance_test_scatter(backend)
     completion = backend.get_paged_batch(items, 2, tables)
     assert "compute_handover" in calls
     backend._fail(RuntimeError("background owned IO failed after ready"))
@@ -1042,10 +1072,10 @@ def test_peer_signal_failure_at_scatter_poll_poisoned_backend_before_safe_quiesc
     from types import SimpleNamespace as NS
     backend, items, tables, calls = _recovery_backend(monkeypatch)
     backend._signals.store.set("1/ack/2/1", _event_handle("ack", 2, 1))
-    backend._drive_scatter()
+    _advance_test_scatter(backend)
     completion = backend.get_paged_batch(items, 2, tables)
     backend._entity_sequence = (2, 0)
-    backend._prefetch_thread = NS(join=lambda timeout: calls.append("producer_join"),
+    backend._prefetch_job = NS(join=lambda timeout: calls.append("producer_join"),
                                   is_alive=lambda: False)
     backend._store._deferred_completions = []
     peer = signals(rank=1, ranks=range(8), store=backend._signals.store)
@@ -1064,7 +1094,7 @@ def test_peer_signal_failure_at_scatter_poll_poisoned_backend_before_safe_quiesc
     assert backend._prefetch_error is failed.value
     assert backend._signals.store.get("terminal") == terminal
     assert "aborted" not in str(backend._prefetch_error)
-    assert backend._prefetch_thread is None
+    assert backend._prefetch_job is None
     assert backend._ipc_events == [] and backend._peer_events == {}
     assert backend._retained == [] and backend._pending_events == []
 
@@ -1075,7 +1105,7 @@ def test_invalid_peer_event_handle_fails_closed_in_cuda_import(monkeypatch, phas
     backend._signals.store.set("1/ack/2/1", _event_handle("ack", 2, 1))
     backend._signals.store.set(f"1/{phase}/2/1", b"1")
     with pytest.raises(RuntimeError, match="invalid CUDA IPC event handle"):
-        backend._drive_scatter()
+        _advance_test_scatter(backend)
         backend.get_paged_batch(items, 2, tables)
     assert backend._poisoned and "compute_handover" not in calls
     if phase == "ready":
@@ -1109,7 +1139,7 @@ def test_entity_recovery_sequence_rejects_invalid_callbacks(monkeypatch, mode):
         backend._ready_entities.get_nowait()
         backend._ready_entities.put((1, None, None))
     with pytest.raises(RuntimeError):
-        backend._drive_scatter()
+        _advance_test_scatter(backend)
         backend.get_paged_batch(items, 2, tables)
     assert "launch" not in calls and "compute_handover" not in calls
 
@@ -1126,6 +1156,57 @@ def test_ack_is_scoped_to_entity_replica_members_not_global_world(monkeypatch):
         control.wait_acks(7, threading.Event(), (4, 6, 7))
 
 
+def _advance_test_scatter(backend):
+    from types import SimpleNamespace as NS
+    import time
+    from tutti.storage.tutti_nvme.replica_direct import _POLL_SECONDS
+    try:
+        backend._check_read_failure()
+        physical = backend._entity_sequence[backend._next_entity]
+        item = backend._ready_entities.get_nowait()
+        if item[0] != physical:
+            raise RuntimeError("replica prefetch entity order differs")
+        if item[2] is not None:
+            raise item[2]
+        completion = NS(poll=lambda: True, observation_error=None,
+                        wait_result=lambda *a: NS(ok=True, results=()))
+        state = dict(physical=physical, members=tuple(backend._store._replica_groups[physical]),
+                     phase="ready", io_done=item[1], completion=completion,
+                     submit=NS(handles=[], segments=[]),
+                     deadline=time.monotonic() + _POLL_SECONDS)
+        backend._prefetch_task = NS(states=[state])
+        backend._advance_scatter(state)
+    except IndexError as exc:
+        backend._fail(RuntimeError("replica invalid entity callback"))
+        raise backend._prefetch_error from exc
+    except Exception as exc:
+        backend._fail(exc)
+        raise
+
+
+def _produce_test_owned(backend, plan):
+    try:
+        for key in backend._prefetch_keys:
+            backend._validate_plan_entry(plan.entry_for(key))
+        backend._test_states = []
+        for physical in backend._entity_sequence:
+            state = backend._new_entity(plan, physical)
+            backend._test_states.append(state)
+            while state["phase"] == "submit":
+                backend._advance_submit(state)
+            backend._ready_entities.put((physical, state["io_done"], None))
+    except Exception as exc:
+        backend._fail(exc)
+
+
+def _complete_test_owned(backend):
+    try:
+        for state in getattr(backend, "_test_states", ()):
+            backend._advance_owned(state)
+    except Exception as exc:
+        backend._fail(exc)
+
+
 def _producer_backend(monkeypatch, count=1000, mode="ok", rank=0):
     import queue
     from contextlib import nullcontext
@@ -1140,12 +1221,14 @@ def _producer_backend(monkeypatch, count=1000, mode="ok", rank=0):
                for i, key in enumerate(items)}
     events, imports = _fake_cuda_events(monkeypatch, calls, record_label="event_record")
     monkeypatch.setattr(torch.cuda, "set_device", lambda *a: None)
-    def submit(requests, direction, stream_direction=None, **kwargs):
-        calls.append(("submit", list(requests), direction, stream_direction))
-        return [101] if requests else []
-    store = NS(_replica_groups=((0, 1),) * 3, _runtime=NS(), _deferred_completions=[],
+    def submit(requests, **kwargs):
+        calls.append(("submit", list(requests), "read", backend._io_direction))
+        return NS(io_handle=101, initial_states=(True,) * len(requests), rejected=(),
+                  status_ok=True, status_msg="")
+    store = NS(_replica_groups=((0, 1),) * 3, _runtime=NS(submit=submit), _deferred_completions=[],
                stream_context=lambda direction: nullcontext(),
-               _read_copy_stream_obj=NS(), _submit_retry=submit,
+               _read_copy_stream_obj=NS(), _batch_width_limit=lambda: None,
+               _accel_id=0, _execution="device",
                _track_completion=lambda completion, chunk_ids: calls.append("track"))
     backend = _p2p_backend(store, _rank=rank, _epoch=1)
     backend._test_events, backend._test_imports = events, imports
@@ -1158,16 +1241,17 @@ def _producer_backend(monkeypatch, count=1000, mode="ok", rank=0):
     backend._signals = signals(rank=rank)
     backend._validate_plan_entry = lambda entry: None
     class Completion:
+        observation_error = None
         def __init__(self, runtime, handles, on_settled, **kwargs):
             assert kwargs == {"auto_watch": False, "direction": "read",
-                              "retain_observation_errors": backend._parent is not None}
+                              "retain_observation_errors": True}
         def poll(self):
             calls.append("poll")
             if mode == "pending":
                 backend._prefetch_stop.set()
                 return None
             return mode != "failure"
-        def wait_result(self):
+        def wait_result(self, timeout=None):
             calls.append("outcome")
             return NS(ok=mode != "failure", results=(NS(confirmed_bytes=4096),))
     monkeypatch.setattr(module, "_TuttiCompletion", Completion)
@@ -1182,8 +1266,8 @@ def _producer_backend(monkeypatch, count=1000, mode="ok", rank=0):
 
 def test_producer_reads_whole_entity_once_into_final_tickets_without_send(monkeypatch):
     backend, plan, calls = _producer_backend(monkeypatch)
-    backend._produce_owned(plan)
-    backend._complete_owned()
+    _produce_test_owned(backend, plan)
+    _complete_test_owned(backend)
     assert not backend._poisoned
     submissions = [call for call in calls if isinstance(call, tuple)]
     assert len(submissions) == 1
@@ -1207,13 +1291,13 @@ def test_producer_reads_whole_entity_once_into_final_tickets_without_send(monkey
 @pytest.mark.parametrize("mode", ["pending", "failure"])
 def test_producer_ready_is_record_notification_and_late_io_failure_stays_sticky(monkeypatch, mode):
     backend, plan, calls = _producer_backend(monkeypatch, count=4, mode=mode)
-    backend._produce_owned(plan)
+    _produce_test_owned(backend, plan)
     assert "poll" not in calls and "outcome" not in calls
     physical, done, error = backend._ready_entities.get_nowait()
     assert physical == 2 and done.recorded and error is None
     handle = backend._signals.store.get("1/ready/2/0")
     assert handle == done.ipc_handle()
-    backend._complete_owned()
+    _complete_test_owned(backend)
     assert backend._signals.store.get("1/ready/2/0") == handle
     assert backend._ready_entities.empty()
     if mode == "failure":
@@ -1238,10 +1322,10 @@ def test_producer_failure_before_record_notification_never_publishes_ready(monke
     if stage == "preflight":
         backend._validate_plan_entry = failed
     elif stage == "submit":
-        backend._store._submit_retry = failed
+        backend._store._runtime.submit = failed
     else:
         monkeypatch.setattr(torch.cuda.Event, "record", failed)
-    backend._produce_owned(plan)
+    _produce_test_owned(backend, plan)
     assert backend._poisoned
     assert stage in str(backend._prefetch_error)
     assert not backend._signals.store.check(["1/ready/2/0"])
@@ -1257,15 +1341,16 @@ def test_producer_failure_before_record_notification_never_publishes_ready(monke
 
 def test_empty_owner_publishes_entity_metadata_without_any_read_payload(monkeypatch):
     backend, plan, calls = _producer_backend(monkeypatch, count=1, rank=1)
-    backend._produce_owned(plan)
-    backend._complete_owned()
+    _produce_test_owned(backend, plan)
+    _complete_test_owned(backend)
     assert not backend._poisoned
-    assert next(call for call in calls if isinstance(call, tuple))[1] == []
+    assert not any(isinstance(call, tuple) for call in calls)
     assert backend._signals.store.check(["1/ready/2/1"])
     assert backend._ready_entities.get_nowait()[0] == 2
 
 
-def test_begin_prefetch_fences_compute_prefix_before_owned_reads(monkeypatch):
+@pytest.mark.parametrize("detached", [False, True])
+def test_begin_prefetch_fences_forward_prefix_and_submits_one_service_job(monkeypatch, detached):
     from contextlib import nullcontext
     from types import SimpleNamespace as NS
     import torch
@@ -1275,27 +1360,30 @@ def test_begin_prefetch_fences_compute_prefix_before_owned_reads(monkeypatch):
     event = NS(record=lambda stream: calls.append(("record_prefix", stream)))
     monkeypatch.setattr(torch.cuda, "Event", lambda *a, **k: event)
     monkeypatch.setattr(torch.cuda, "current_stream", lambda *a: compute_stream)
-    class Thread:
-        def __init__(self, target, args, **kwargs):
-            self.target, self.args = target, args
-        def start(self):
-            calls.append(self.target.__name__)
-    monkeypatch.setattr(module.threading, "Thread", Thread)
-    store = NS(stream_context=lambda direction: nullcontext(),
+    monkeypatch.setattr(module.threading, "Thread", lambda *a, **k: pytest.fail("per-plan thread"))
+    job = object()
+    def submit(task, priority):
+        calls.append(("submit", priority))
+        return job
+    store = NS(stream_context=lambda direction: nullcontext(), _read_service=NS(submit=submit),
                _read_copy_stream_obj=NS(wait_event=lambda e: calls.append(("wait_prefix", e))))
     backend = _p2p_backend(store)
     backend._geometry = NS(accel_id=0, num_layers=3, blocks_per_chunk=1)
-    backend._target_plans["read"] = NS(plan_token=10)
-    backend._validate_target_plan = lambda plan: None
+    backend._target_plans["read"] = NS(plan_token=10, entry_for=lambda key: object())
+    backend._validate_target_plan = backend._validate_plan_entry = lambda plan: None
     backend.validate_block_tables = lambda tables: tables
     backend._check_plan = lambda *args: calls.append("check_plan")
     backend._build_scatter_plans = lambda layers: calls.append(("plans", layers))
+    if detached:
+        backend._parent = object()
+        backend._compute_prefix = event
     backend.begin_prefetch(keys(2), ((7,), (3,)), (2, 0))
-    assert calls == [("record_prefix", compute_stream), "check_plan", ("wait_prefix", event),
-                     ("plans", (2, 0)), "_complete_owned", "_produce_owned", "_drive_scatter"]
+    expected = [] if detached else [("record_prefix", compute_stream)]
+    assert calls == expected + ["check_plan", ("wait_prefix", event),
+                                ("plans", (2, 0)), ("submit", 1 if detached else 0)]
     assert backend._entity_sequence == (2, 0) and backend._next_entity == 0
-    assert backend._ready_entities.maxsize == 0
-    assert backend._recovered_entities.maxsize == 0
+    assert backend._prefetch_job is job
+    assert backend._prefetch_task.backend is backend
 
 
 @pytest.mark.parametrize("retry_fails", [False, True])
@@ -1396,7 +1484,7 @@ def test_main_local_read_returns_plain_completion_without_peer_signals(monkeypat
     backend._signals.ack = lambda *args: pytest.fail("main peer ACK")
     backend._signals.wait_acks = lambda *args: pytest.fail("main peer ACK wait")
     backend._scatter_plans.clear()
-    backend._drive_scatter()
+    _advance_test_scatter(backend)
     assert backend.get_paged_batch(items, 2, tables) is local
     assert not isinstance(local, _ScatterCompletion)
     assert "launch" not in calls and backend._stats["gather_bytes"] == 0
@@ -1415,19 +1503,18 @@ def test_main_owner_filter_keeps_every_rank_local_page():
             (7, 4096, 3, 8192, 4096, "write")]
 
 
-def test_cancelled_queue_sentinel_does_not_poison_parent():
+def test_cancelled_service_task_does_not_poison_parent():
     from types import SimpleNamespace as NS
+    from tutti.storage.tutti_nvme.replica_direct import _ReplicaReadTask
     backend = _p2p_backend(NS())
     parent = _p2p_backend(NS())
     backend._parent = parent
     backend._signals = signals()
-    def receive(timeout):
-        backend._cancel_requested.set()
-        backend._prefetch_stop.set()
-        return None
-    with pytest.raises(RuntimeError, match="prefetch stopped") as caught:
-        backend._queue_get(NS(get=receive))
-    backend._fail(caught.value)
+    backend._cancel_requested.set()
+    backend._prefetch_stop.set()
+    task = _ReplicaReadTask(backend, NS())
+    assert task.advance() is True
+    backend._fail(RuntimeError("replica prefetch stopped"))
     assert not backend._poisoned and not parent._poisoned
 
 
@@ -1458,7 +1545,7 @@ def test_producer_preflights_all_entries_but_builds_only_owned_requests(monkeypa
     seen = []
     lookup = plan.entry_for
     plan.entry_for = lambda key: (seen.append(key), lookup(key))[1]
-    backend._produce_owned(plan)
+    _produce_test_owned(backend, plan)
     assert not backend._poisoned
     assert len(seen) == 8 + 3 * 4
     assert backend._owned_indices[(0, 1)] == (0, 2, 4, 6)
@@ -1469,7 +1556,7 @@ def test_main_producer_reads_all_pages_and_never_publishes_peer_ready(monkeypatc
     backend, plan, calls = _producer_backend(monkeypatch, count=8)
     backend._store._replica_groups = ((0,),) * 3
     backend._signals.ready = lambda *args: pytest.fail("main must not publish peer ready")
-    backend._produce_owned(plan)
+    _produce_test_owned(backend, plan)
     assert not backend._poisoned
     batches = [call for call in calls if isinstance(call, tuple)]
     assert len(batches) == 1 and len(batches[0][1]) == 16
@@ -1481,7 +1568,7 @@ def test_main_producer_reads_all_pages_and_never_publishes_peer_ready(monkeypatc
 def test_producer_publishes_all_entity_events_before_polling_prior_completion(monkeypatch):
     backend, plan, calls = _producer_backend(monkeypatch, count=8)
     backend._entity_sequence = (2, 0, 1)
-    backend._produce_owned(plan)
+    _produce_test_owned(backend, plan)
     assert len([c for c in calls if isinstance(c, tuple)]) == 3
     assert "poll" not in calls and "outcome" not in calls
     events = backend._test_events
@@ -1494,7 +1581,7 @@ def test_producer_publishes_all_entity_events_before_polling_prior_completion(mo
         assert backend._signals.store.get(f"1/ready/{physical}/0") == event.ipc_handle()
     assert all(event.ready is None for event in events)
     assert events == backend._ipc_events
-    backend._complete_owned()
+    _complete_test_owned(backend)
     assert backend._ready_entities.empty()
     assert backend._stats["read_bytes"] == 3 * 4096
     assert calls.count("poll") == calls.count("outcome") == 3
@@ -1543,40 +1630,585 @@ def test_submit_backpressure_exception_retains_single_owner_of_accepted_handles(
     assert store._deferred_completions[0]._handles == [11]
 
 
-def test_capacity_progresses_tracked_write_after_current_handle_is_terminal():
+def test_capacity_yields_after_progressing_accepted_io_and_tracked_write():
     import threading
-    import time
     from types import SimpleNamespace as NS
+    from tutti.storage.tutti_nvme.replica_direct import _ReplicaSubmit
+    from tutti.storage.tutti_nvme.store import _SubmittedHandle
     calls = []
+    def submit(*args, **kwargs):
+        calls.append("submit")
+        return NS(io_handle=None, initial_states=(False,), rejected=(0,), status_ok=False,
+                  status_msg="in-flight operation capacity exhausted")
+    store = NS(_runtime=NS(submit=submit, query_io=lambda h: calls.append(("query", h))),
+               _batch_width_limit=lambda: None, _accel_id=0, _execution="device",
+               _stream_for=lambda direction: (123, None),
+               _inflight_lock=threading.Lock())
     class PendingWrite:
         def poll(self):
             calls.append("write_progress")
-    completion = PendingWrite()
-    store = NS(_runtime=NS(query_io=lambda handle: calls.append(("query", handle))),
-               _inflight_lock=threading.Lock(), _inflight_by_chunk={b"x": {completion}})
-    backend = _p2p_backend(store)
-    backend._signals = signals()
-    backend._submit_deadline = time.monotonic() + 1
-    backend._wait_submit_capacity((NS(handle=11),))
-    backend._wait_submit_capacity(())
-    assert calls == [("query", 11), "write_progress", "write_progress"]
+    store._inflight_by_chunk = {b"x": {PendingWrite()}}
+    task = _ReplicaSubmit(store, [(1,)], "read_copy")
+    task.handles = [_SubmittedHandle(11)]
+    assert task.advance() is False
+    task.handles.clear()
+    assert task.advance() is False
+    assert calls == ["submit", ("query", 11), "write_progress", "submit", "write_progress"]
 
 
-def test_submit_join_does_not_wait_observer_but_stop_joins_both():
+def test_join_and_stop_wait_single_service_job():
     from types import SimpleNamespace as NS
     calls = []
-    backend = _p2p_backend(NS())
+    backend = _p2p_backend(NS(_read_service=NS(wake=lambda: calls.append("wake"))))
     backend._active_token = 1
     backend._entity_sequence = (0,)
     backend._next_entity = 1
-    backend._prefetch_thread = NS(join=lambda timeout: calls.append("producer"), is_alive=lambda: False)
-    backend._completion_thread = NS(join=lambda timeout: calls.append("completion"), is_alive=lambda: False)
+    backend._prefetch_job = NS(join=lambda timeout: calls.append("job"), is_alive=lambda: False)
     backend.join_prefetch()
-    assert calls == ["producer"]
+    assert calls == ["job"]
     backend.stop_prefetch()
-    assert calls == ["producer", "producer", "completion"]
-    assert backend._prefetch_thread is backend._completion_thread is None
+    assert calls == ["job", "wake", "job"]
+    assert backend._prefetch_job is None
     assert not backend._poisoned
+
+
+def _service_task_backend(monkeypatch, background=False):
+    from types import SimpleNamespace as NS
+    from tutti.storage.tutti_nvme.replica_direct import _ReplicaReadTask
+    from tutti.index.chunk_index import derive_io_key
+    backend, plan, calls = _producer_backend(monkeypatch, count=2)
+    backend._prefetch_keys = tuple(key[:16] for key in backend._prefetch_keys)
+    lookup = plan.entry_for
+    plan.entry_for = lambda key: lookup(key + b"x" * 16)
+    backend._store._replica_groups = ((0,),) * 3
+    backend._store._read_async_stream_obj = backend._store._read_copy_stream_obj
+    backend._entity_sequence = (2, 0, 1)
+    backend._signals = signals(ranks=(0,))
+    plan.plan_token = backend._active_token = 1
+    backend._target_plans["read"] = plan
+    backend._validate_target_plan = lambda plan: None
+    backend.validate_block_tables = lambda tables: tables
+    backend._store._live = {derive_io_key(key, p) for key in backend._prefetch_keys for p in range(3)}
+    backend._prefetch_job = NS(join=lambda **k: None, is_alive=lambda: False)
+    cq_ready, window = [False], [(1, 0)]
+    own = backend._own_completion
+    def completion(handles):
+        result = own(handles)
+        result.poll = lambda: True if cq_ready[0] else None
+        return result
+    backend._own_completion = completion
+    submit = backend._advance_submit
+    def advance(state):
+        submit(state)
+        if "io_done" in state:
+            state["io_done"].ready = False
+    backend._advance_submit = advance
+    if background:
+        backend._parent = NS(_signals=signals(ranks=(0,)))
+        backend._read_direction = backend._io_direction = "read_async"
+        backend._background_allowed = lambda: window[0]
+    task = backend._prefetch_task = _ReplicaReadTask(backend, plan)
+    return backend, task, calls, cq_ready, window
+
+
+def test_foreground_task_submits_every_entity_while_owned_cq_is_pending(monkeypatch):
+    backend, task, calls, cq, window = _service_task_backend(monkeypatch)
+    assert [task.advance() for _ in range(3)] == [False, False, False]
+    assert task.produced == 3 and backend._next_entity == 3
+    assert len([item for item in calls if isinstance(item, tuple)]) == 3
+    assert all(state["phase"] == "fence" for state in task.states)
+    cq[0] = True
+    assert task.advance() is True
+    assert backend._stats["read_bytes"] == 3 * 4096
+
+
+def test_background_task_finishes_batch_cq_and_fence_before_next_window(monkeypatch):
+    backend, task, calls, cq, window = _service_task_backend(monkeypatch, background=True)
+    assert task.advance() is False
+    assert task.produced == 1
+    window[0] = None
+    assert task.advance() is False
+    assert task.produced == 1
+    cq[0] = True
+    window[0] = (2, 0)
+    assert task.advance() is False
+    assert task.produced == 1 and not task.states[0].get("finished", False)
+    task.states[0]["ready"].ready = True
+    assert task.advance() is False
+    assert task.states[0]["finished"] and task.produced == 1
+    def repeated_query():
+        raise AssertionError("finished historical batch must not be queried again")
+    task.states[0]["ready"].query = repeated_query
+    assert task.advance() is False
+    assert task.produced == 2
+    assert len([item for item in calls if isinstance(item, tuple)]) == 2
+
+
+def test_try_get_returns_none_until_fence_registered_and_does_not_consume_callback(monkeypatch):
+    backend, task, calls, cq, window = _service_task_backend(monkeypatch)
+    args = backend._prefetch_keys, 2, backend._prefetch_tables
+    assert backend.try_get_paged_batch(*args) is None
+    assert backend.try_get_paged_batch(*args) is None
+    assert backend._callback_entity == 0
+    task.advance()
+    assert backend.try_get_paged_batch(*args) is backend._local_completions[2]
+    assert backend._callback_entity == 1
+    with pytest.raises(RuntimeError, match="duplicated or out of order"):
+        backend.try_get_paged_batch(*args)
+
+
+def test_started_background_scatter_finishes_after_prefill_window_closes(monkeypatch):
+    from types import SimpleNamespace as NS
+    from tutti.storage.tutti_nvme.replica_direct import _ReplicaReadTask
+    backend, items, tables, calls = _recovery_backend(monkeypatch)
+    _advance_test_scatter(backend)
+    state = backend._prefetch_task.states[0]
+    assert state["phase"] == "ack"
+    backend._signals.store.set("1/ack/2/1", _event_handle("ack", 2, 1))
+    backend._parent = NS(_signals=signals(ranks=(0,)))
+    backend._store.record_read_async_event = backend._store.record_read_event
+    backend._background_allowed = lambda: None
+    monkeypatch.setattr(type(backend._test_events[0]), "query", lambda self: False)
+    task = backend._prefetch_task = _ReplicaReadTask(backend, backend._target_plans["read"])
+    task.states, task.produced = [state], 1
+    assert task.advance() is False
+    assert state["phase"] == "fence" and backend._next_entity == 1
+    assert calls.count("launch") == 1
+    assert backend.try_get_paged_batch(items, 2, tables).fence_event is state["ready"]
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_partial_task_failure_or_cancellation_retains_accepted_dma(monkeypatch, cancel):
+    from tutti.storage.tutti_nvme.replica_direct import _ReplicaReadTask
+    from tutti.storage.tutti_nvme.store import _SubmittedHandle
+    backend, plan, calls = _producer_backend(monkeypatch, count=2)
+    task = _ReplicaReadTask(backend, plan)
+    state = backend._new_entity(plan, 2)
+    state["submit"].handles = [_SubmittedHandle(17, (0,))]
+    task.states = [state]
+    if cancel:
+        backend._cancel_requested.set()
+        backend._prefetch_stop.set()
+        assert task.advance() is True
+        assert not backend._poisoned
+    else:
+        task.fail(RuntimeError("retry failed"))
+        assert task.advance() is True
+        assert backend._poisoned
+    assert len(backend._owned_work) == 1
+    assert state["completion"] is backend._owned_work[0][0]
+    assert state["submit"].handles[0].handle == 17
+    assert "poll" not in calls
+
+
+@pytest.mark.parametrize("status", [None, True, False, "observation_error"])
+def test_scatter_completion_confirms_owned_io_and_records_late_failure(status):
+    from types import SimpleNamespace as NS
+    from tutti.storage.tutti_nvme.replica_direct import _ScatterCompletion
+    failed = []
+    error = RuntimeError("owned observation failed") if status == "observation_error" else None
+    owned = NS(poll=lambda: None if error else status, observation_error=error,
+               wait_result=lambda *args: NS(ok=False, message="owned failed"))
+    completion = _ScatterCompletion(NS(), NS(query=lambda: True), owned_io=owned,
+                                    on_failure=failed.append)
+    if status is False or error:
+        with pytest.raises(RuntimeError):
+            completion.poll()
+        assert len(failed) == 1
+    else:
+        assert completion.poll() is status
+        assert failed == []
+
+
+def _initializing_backend():
+    from contextlib import nullcontext
+    from types import SimpleNamespace as NS
+    backend = _p2p_backend(NS(_replica_groups=((0, 1),), stream_context=lambda direction: nullcontext()))
+    backend._signals = signals(epoch=0)
+    backend._epoch = 1
+    backend._geometry.segment_bytes = 4096
+    backend._prefetch_keys = (keys(1)[0][:16],)
+    backend._prefetch_tables = ((7,),)
+    backend._entity_sequence = (0,)
+    backend._signals.wait = lambda *a, **k: pytest.fail("service must not wait notifications")
+    backend._signals.begin = lambda *a, **k: pytest.fail("service must not use blocking begin")
+    built = []
+    backend._build_scatter_plans = lambda layers: built.append(tuple(layers))
+    backend._check_plan(backend._prefetch_keys, backend._prefetch_tables, (0,), deferred=True)
+    return backend, built
+
+
+def test_detached_init_publishes_then_checks_peer_plan_and_tables_without_wait():
+    import struct
+    backend, built = _initializing_backend()
+    assert backend._initializing
+    assert backend._signals.epoch == 1
+    assert backend._advance_plan_init() is False
+    assert built == []
+    backend._signals.store.set("1/plan/1", backend._init_descriptor)
+    assert backend._advance_plan_init() is False
+    backend._signals.store.set("1/blocks/1", struct.pack("<q", 3))
+    assert backend._advance_plan_init() is True
+    assert not backend._initializing
+    assert backend._peer_tables == {0: ((7,),), 1: ((3,),)}
+    assert built == [(0,)]
+
+
+@pytest.mark.parametrize("mode", ["descriptor", "short_table", "negative_table"])
+def test_detached_init_rejects_peer_mismatch_before_scatter_or_dma(mode):
+    import struct
+    backend, built = _initializing_backend()
+    backend._signals.store.set("1/plan/1", b"different" if mode == "descriptor" else backend._init_descriptor)
+    blob = b"short" if mode == "short_table" else struct.pack("<q", -1 if mode == "negative_table" else 3)
+    backend._signals.store.set("1/blocks/1", blob)
+    with pytest.raises((ValueError, RuntimeError)):
+        backend._advance_plan_init()
+    assert built == [] and backend._owned_work == []
+
+
+def test_start_detached_read_uses_nonblocking_init_and_keeps_prepared_prefix():
+    from types import SimpleNamespace as NS
+    backend = _p2p_backend(NS())
+    calls, prefix = [], object()
+    reader = NS(_detached_args=((b"key",), ((7,),), (0,)), _compute_prefix=prefix,
+                begin_prefetch=lambda *a, **k: calls.append((a, k)))
+    plan = NS(plan_token=1)
+    backend._detached_readers[1] = reader
+    backend.start_detached_read(plan)
+    assert calls == [(reader._detached_args, {"deferred_init": True})]
+    assert reader._compute_prefix is prefix
+
+
+def test_background_same_epoch_can_admit_next_batch_after_full_completion(monkeypatch):
+    backend, task, calls, cq, window = _service_task_backend(monkeypatch, background=True)
+    cq[0] = True
+    assert task.advance() is False
+    task.states[0]["ready"].ready = True
+    assert task.advance() is False
+    assert task.states[0]["finished"]
+    assert task.advance() is False
+    assert task.produced == 2
+    assert window[0] == (1, 0)
+
+
+def test_background_ready_waits_next_window_before_launching_new_scatter(monkeypatch):
+    from types import SimpleNamespace as NS
+    backend, items, tables, calls = _recovery_backend(monkeypatch)
+    window = [None]
+    backend._parent = NS(_signals=signals(ranks=(0,)))
+    backend._background_allowed = lambda: window[0]
+    backend._store.record_read_async_event = backend._store.record_read_event
+    _advance_test_scatter(backend)
+    state = backend._prefetch_task.states[0]
+    assert state["phase"] == "ready" and "launch" not in calls
+    backend._signals.store.set("1/ready/2/1", _event_handle("ready", 2, 1))
+    backend._advance_scatter(state)
+    assert state["phase"] == "ready" and "launch" not in calls
+    window[0] = (1, 0)
+    backend._advance_scatter(state)
+    assert state["phase"] == "ack" and calls.count("launch") == 1
+    window[0] = None
+    backend._signals.store.set("1/ack/2/1", _event_handle("ack", 2, 1))
+    backend._advance_scatter(state)
+    assert state["phase"] == "fence" and calls.count("launch") == 1
+
+
+def test_background_scatter_checks_scope_even_when_token_still_visible(monkeypatch):
+    from contextlib import nullcontext
+    backend, items, tables, calls = _recovery_backend(monkeypatch)
+    backend._background_allowed = lambda: (1, 0)
+    backend._background_scope = lambda: nullcontext(False)
+    backend._signals.store.set("1/ready/2/1", _event_handle("ready", 2, 1))
+    _advance_test_scatter(backend)
+    assert backend._prefetch_task.states[0]["phase"] == "ready"
+    assert "launch" not in calls
+
+
+def _real_segment_task(monkeypatch, *, partial=False):
+    from types import SimpleNamespace as NS
+    import tutti.storage.tutti_nvme.replica_direct as module
+    from tutti.storage.tutti_nvme.store import _TuttiCompletion
+    backend, task, calls, cq, window = _service_task_backend(monkeypatch, background=True)
+    monkeypatch.setattr(module, "_TuttiCompletion", _TuttiCompletion)
+    backend._prefetch_keys = backend._prefetch_keys[:1]
+    backend._prefetch_tables = backend._prefetch_tables[:1]
+    backend._own_completion = lambda handles: module.TuttiReplicaDirectBackend._own_completion(backend, handles)
+    backend._entity_sequence = (2,)
+    if not partial:
+        backend._store._batch_width_limit = lambda: 1
+    active, submitted, released = {}, [], []
+    ready = [False]
+    serial = [10]
+    def submit(requests, **kwargs):
+        submitted.append(tuple(requests))
+        if active:
+            return NS(io_handle=None, initial_states=(False,) * len(requests),
+                      rejected=tuple(range(len(requests))), status_ok=False,
+                      status_msg="in-flight operation capacity exhausted")
+        serial[0] += 1
+        handle = serial[0]
+        active[handle] = tuple(requests[:1])
+        return NS(io_handle=handle, initial_states=(True,) + (False,) * (len(requests) - 1),
+                  rejected=tuple(range(1, len(requests))), status_ok=len(requests) == 1,
+                  status_msg="partial" if len(requests) > 1 else "")
+    def query(handle):
+        assert handle in active, "released handle was queried"
+        return "COMPLETED" if ready[0] else "IN_FLIGHT"
+    def observe(handle, timeout):
+        assert timeout == 0 and handle in active
+        return NS(observation="OK", state="COMPLETED", confirmed_bytes=4096,
+                  timeout_seen=False, failed_request_indices=(), failure_scope="NONE",
+                  failure_kind=None, first_failed_entry=None, raw_cq_status=None, message="")
+    def release(handle):
+        assert handle in active, "double release"
+        released.append(handle)
+        del active[handle]
+    backend._store._runtime = NS(submit=submit, query_io=query, wait_result=observe, release_io=release)
+    return backend, task, window, ready, submitted, released, active
+
+
+@pytest.mark.parametrize("partial", [False, True])
+def test_partial_or_segment_retry_pauses_window_and_releases_accepted_before_resume(monkeypatch, partial):
+    backend, task, window, ready, submitted, released, active = _real_segment_task(monkeypatch, partial=partial)
+    assert task.advance() is False
+    state = task.states[0]
+    assert state["phase"] == "submit" and len(state["parts"]) == 1
+    assert len(active) == 1 and task.needs_poll() is True
+    window[0] = None
+    assert task.advance() is False
+    assert len(submitted) == 1 and released == []
+    ready[0] = True
+    assert task.advance() is False
+    assert len(submitted) == 1 and released == [11] and active == {}
+    assert task.needs_poll() is False
+    window[0] = (1, 0)
+    assert task.advance() is False
+    assert state["phase"] == "fence" and released == [11, 12] and active == {}
+    state["ready"].ready = True
+    assert task.advance() is True
+    outcome = state["completion"].wait_result(0)
+    assert outcome.ok and sum(item.confirmed_bytes for item in outcome.results) == 8192
+    assert {item.batch_indices for item in outcome.results} == {(0,), (1,)}
+    assert released == [11, 12]
+    assert backend._stats["read_bytes"] == 8192
+
+
+def test_segmented_batch_with_one_terminal_slot_releases_before_next_submission(monkeypatch):
+    backend, task, window, ready, submitted, released, active = _real_segment_task(monkeypatch)
+    ready[0] = True
+    assert task.advance() is False
+    assert released == [11] and active == {}
+    assert task.advance() is False
+    assert len(submitted) == 2 and released == [11, 12] and active == {}
+    task.states[0]["ready"].ready = True
+    assert task.advance() is True
+    assert task.states[0]["completion"].poll() is True
+    assert released == [11, 12]
+
+
+def test_background_submit_scope_blocks_partial_retry_with_visible_window(monkeypatch):
+    from contextlib import nullcontext
+    backend, task, window, ready, submitted, released, active = _real_segment_task(monkeypatch, partial=True)
+    task.advance()
+    backend._background_scope = lambda: nullcontext(False)
+    ready[0] = True
+    assert task.advance() is False
+    assert len(submitted) == 1 and released == [11]
+    backend._background_scope = lambda: nullcontext(True)
+    task.advance()
+    assert len(submitted) == 2 and released == [11, 12]
+
+
+@pytest.mark.parametrize("phase", ["submit", "ready", "ack", "init"])
+def test_background_long_pause_excluded_from_timeout_budget(monkeypatch, phase):
+    from types import SimpleNamespace as NS
+    import tutti.storage.tutti_nvme.replica_direct as module
+    now = [0.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: now[0])
+    backend, task, calls, cq, window = _service_task_backend(monkeypatch, background=True)
+    state = backend._new_entity(task.plan, 2)
+    task.states = [state]
+    state["phase"] = phase
+    if phase == "init":
+        backend._initializing = True
+        backend._init_deadline = module._POLL_SECONDS
+    cq[0] = True
+    now[0] = 1.0
+    window[0] = None
+    task.needs_poll()
+    now[0] = 1000.0
+    window[0] = (1, 0)
+    task._tick_window()
+    deadline = backend._init_deadline if phase == "init" else state["deadline"]
+    assert deadline > now[0]
+    assert not backend._poisoned
+    now[0] += module._POLL_SECONDS + 1
+    task._tick_window()
+    deadline = backend._init_deadline if phase == "init" else state["deadline"]
+    assert deadline < now[0]
+
+
+def test_paused_peer_ready_without_cq_work_sleeps_but_ack_and_fence_are_polled(monkeypatch):
+    backend, task, calls, cq, window = _service_task_backend(monkeypatch, background=True)
+    window[0] = None
+    assert task.needs_poll() is False
+    state = backend._new_entity(task.plan, 2)
+    state["phase"], state["cq_done"] = "ready", True
+    task.states = [state]
+    assert task.needs_poll() is False
+    state["phase"] = "ack"
+    assert task.needs_poll() is True
+    state["phase"] = "fence"
+    assert task.needs_poll() is True
+    state["finished"] = True
+    assert task.needs_poll() is False
+
+
+def test_real_progress_wakes_service_but_inflight_poll_does_not(monkeypatch):
+    from types import SimpleNamespace as NS
+    backend, task, calls, cq, window = _service_task_backend(monkeypatch, background=True)
+    wakes = []
+    backend._store._read_service = NS(wake=lambda: wakes.append(True))
+    task.advance()
+    assert wakes == [True]
+    task.advance()
+    assert wakes == [True]
+    cq[0] = True
+    task.states[0]["ready"].ready = True
+    task.advance()
+    assert wakes == [True, True]
+
+
+def test_read_service_foreground_progresses_while_replica_background_waits_cq(monkeypatch):
+    from types import SimpleNamespace as NS
+    from tutti.engine.read_service import ReadService
+    monkeypatch.setattr(ReadService, "_bind_device", lambda self: None)
+    backend, task, calls, cq, window = _service_task_backend(monkeypatch, background=True)
+    task.advance()
+    assert task.produced == 1 and not task.states[0].get("cq_done")
+    service = ReadService(backend._store)
+    backend._store._read_service = service
+    background = service.submit(task, priority=1)
+    seen = []
+    foreground = service.submit(NS(advance=lambda: seen.append("front") or True,
+                                   fail=lambda exc: pytest.fail(str(exc))), priority=0)
+    try:
+        foreground.join(1)
+        assert not foreground.is_alive() and foreground.error is None
+        assert seen == ["front"] and background.is_alive()
+        assert task.produced == 1
+    finally:
+        backend._cancel_requested.set()
+        backend._prefetch_stop.set()
+        service.wake()
+        background.join(1)
+        service.close(timeout=1)
+    assert background.error is None and not backend._poisoned
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_cancel_retains_accepted_dma_but_real_failed_cq_still_poisons_parent(monkeypatch, failed):
+    from types import SimpleNamespace as NS
+    backend, task, window, ready, submitted, released, active = _real_segment_task(monkeypatch, partial=True)
+    parent = _p2p_backend(NS())
+    parent._signals = signals(ranks=(0,))
+    backend._parent = parent
+    task.advance()
+    part = task.states[0]["parts"][0]
+    backend._cancel_requested.set()
+    backend._prefetch_stop.set()
+    assert task.advance() is True
+    assert not backend._poisoned and len(active) == 1 and released == []
+    observe = backend._store._runtime.wait_result
+    def result(handle, timeout):
+        outcome = observe(handle, 0)
+        if failed:
+            outcome.state, outcome.failure_scope = "FAILED", "WHOLE_OPERATION"
+            outcome.failure_kind, outcome.message = "NVME_CQ", "device CQ failed"
+        return outcome
+    backend._store._runtime.wait_result = result
+    ready[0] = True
+    backend._store.record_read_async_event = lambda: None
+    backend._wait_event = lambda *a, **k: None
+    if failed:
+        with pytest.raises(RuntimeError, match="device CQ failed"):
+            backend._quiesce()
+    else:
+        backend._quiesce()
+    assert backend._poisoned is failed and parent._poisoned is failed
+    assert released == [11] and active == {}
+    if failed:
+        assert "device CQ failed" in str(backend._prefetch_error)
+    else:
+        assert part.wait_result(0).ok
+
+
+@pytest.mark.parametrize("phase", ["ready", "ack"])
+def test_peer_notification_resumes_after_long_closed_window_without_poison(monkeypatch, phase):
+    from types import SimpleNamespace as NS
+    import tutti.storage.tutti_nvme.replica_direct as module
+    now = [0.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: now[0])
+    backend, items, tables, calls = _recovery_backend(monkeypatch)
+    window = [(1, 0)]
+    backend._parent = NS(_signals=signals(ranks=(0,)))
+    backend._background_allowed = lambda: window[0]
+    backend._store.record_read_async_event = backend._store.record_read_event
+    _advance_test_scatter(backend)
+    state = backend._prefetch_task.states[0]
+    assert state["phase"] == "ack"
+    monkeypatch.setattr(type(backend._test_events[0]), "query", lambda self: False)
+    if phase == "ready":
+        state["phase"] = "ready"
+        del backend._signals.store.data["1/ready/2/1"]
+    task = module._ReplicaReadTask(backend, backend._target_plans["read"])
+    task.states, task.produced = [state], 1
+    window[0] = None
+    task.needs_poll()
+    now[0] = 1000.0
+    assert task.advance() is False
+    assert state["deadline"] > now[0] and not backend._poisoned
+    backend._signals.store.set("1/ready/2/1", _event_handle("ready", 2, 1))
+    backend._signals.store.set("1/ack/2/1", _event_handle("ack", 2, 1))
+    window[0] = (1, 0)
+    task.advance()
+    assert state["phase"] == "fence" and not backend._poisoned
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_segment_batch_preserves_terminal_and_done_callbacks_after_child_release(failed):
+    from types import SimpleNamespace as NS
+    from tutti.storage.tutti_nvme.replica_direct import _ReplicaBatchCompletion
+    from tutti.storage.tutti_nvme.store import _SubmittedHandle, _TuttiCompletion
+    second_ready, released = [False], []
+    def query(handle):
+        return "IN_FLIGHT" if handle == 12 and not second_ready[0] else "COMPLETED"
+    def observe(handle, timeout):
+        bad = failed and handle == 12
+        return NS(observation="OK", state="FAILED" if bad else "COMPLETED", confirmed_bytes=4096,
+                  timeout_seen=False, failed_request_indices=(0,) if bad else (),
+                  failure_scope="REQUEST_INDICES" if bad else "NONE",
+                  failure_kind="NVME_CQ" if bad else None, first_failed_entry=None,
+                  raw_cq_status=None, message="failed segment" if bad else "")
+    runtime = NS(query_io=query, wait_result=observe, release_io=released.append)
+    parts = [_TuttiCompletion(runtime, [_SubmittedHandle(handle, (index,))], lambda ok: None,
+                              auto_watch=False, retain_observation_errors=True)
+             for handle, index in ((11, 0), (12, 3))]
+    batch = _ReplicaBatchCompletion(runtime, parts)
+    terminal, done = [], []
+    batch.add_terminal_callback(terminal.append)
+    batch.add_done_callback(done.append)
+    assert batch.poll() is None
+    assert released == [11] and terminal == done == []
+    second_ready[0] = True
+    assert batch.poll() is (not failed)
+    assert len(terminal) == len(done) == 1
+    assert done[0].ok is (not failed)
+    assert done[0].failed_batch_indices == ((3,) if failed else ())
+    assert {result.batch_indices for result in done[0].results} == {(0,), (3,)}
+    assert batch.poll() is (not failed)
+    assert batch.wait_result(0) is done[0]
+    assert released == [11, 12] and len(terminal) == len(done) == 1
 
 
 @pytest.mark.parametrize("size", [0, -1])

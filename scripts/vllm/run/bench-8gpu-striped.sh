@@ -69,7 +69,7 @@ TP_SIZE="${TP_SIZE:-8}"
 BLOCK_SIZE="${BLOCK_SIZE:-64}"
 CHUNK_TOKENS="${CHUNK_TOKENS:-256}"
 SHARED_TOKENS=""
-KV_LOAD_MODE="${KV_LOAD_MODE:-auto}"
+KV_LOAD_MODE="${KV_LOAD_MODE:-async}"
 NUM_QUEUES="${NUM_QUEUES:-8}"
 [[ "$NUM_QUEUES" =~ ^[1-9][0-9]*$ ]] || { echo "NUM_QUEUES must be a positive integer" >&2; exit 2; }
 # 空值不传：connector按模型和请求加载模式推导in-flight；不是越大越快。

@@ -98,6 +98,7 @@ class _AsyncLoad:
     req_id: str
     keys: tuple[bytes, ...]
     block_tables: tuple[tuple[int, ...], ...]
+    enqueued_ns: int = 0
 
 
 @dataclass
@@ -557,6 +558,9 @@ class WorkerImpl:
         self._callback_by_name: dict[str, int] = {}
         self._physical_by_name: dict[str, int] = {}
         self._diag_enabled = os.environ.get("TUTTI_FEEDER_DIAGNOSTICS") == "1"
+        self._profile_enabled = os.environ.get("TUTTI_PROFILE", "0").lower() in {
+            "1", "true", "yes", "on"
+        }
         self._diag_wait_sequence: list[str] = []
         self._diag_save_sequence: list[str] = []
         self._external_load_step = False
@@ -565,14 +569,15 @@ class WorkerImpl:
         self._failure_consensus = None
         self._failure_collective_poisoned = False
         # 异步加载（scheduler 判定 load_async 的请求）：
-        #   _async_queue    已 pin、等当前计划结束后合并发起的加载
-        #   _async_active   在途计划（每 rank 至多一个：配额按 3 个整层计划
-        #                   预留，见 geometry.resolve_io_budget）
+        #   _async_queue    已 pin、尚未准备目标计划的等待请求
+        #   _async_active   FIFO 队首；常驻服务只允许该请求推进后台 IO
+        #   _async_pending  已准备、等待后台推进权的计划
         #   _async_finished 已结束、待 get_finished 回报的请求
         #   _async_error_blocks 失败请求的块，与同步读的错误块分开存放——
         #                   同步路径会整体重建 _load_error_blocks
         self._async_queue: list[_AsyncLoad] = []
         self._async_active: _AsyncBatch | None = None
+        self._async_pending: list[_AsyncBatch] = []
         self._async_finished: set[str] = set()
         self._async_error_blocks: set[int] = set()
         # 调度侧代价模型的样本（load_policy），随 worker meta 回传。
@@ -583,6 +588,9 @@ class WorkerImpl:
         self._step_samples: list[tuple[int, float]] = []
         self._step_timing: list | None = None
         self._step_timing_pending: list[list] = []
+        self._profile_samples: list[tuple] = []
+        self._prefetch_stats = [0, 0, 0, 0]
+        self._prefetch_wait_ms: list[float] = []
 
     # ---- 配置与登记 ----
 
@@ -673,6 +681,14 @@ class WorkerImpl:
 
     # ---- 读取编排 ----
 
+    def _async_prefetch_inflight(self) -> bool:
+        """Whether a detached request still owns the private feeder epoch."""
+        return bool(
+            self._async_queue
+            or self._async_active is not None
+            or self._async_pending
+        )
+
     def start_load_kv(self, forward_context=None, **kwargs) -> None:
         """组读取批并在 direct 模式连续预提交全部物理层。
 
@@ -682,7 +698,10 @@ class WorkerImpl:
         （重算兜底），key 与块表按同一 chunk 区间切片。
         """
         end_feeder = getattr(self._engine, "end_prefill_feeder", None)
-        if callable(end_feeder):
+        # Detached request prefetch crosses scheduler steps.  Closing the
+        # shared feeder here would stop its read-service job before the next
+        # step can observe completion.
+        if callable(end_feeder) and not self._async_prefetch_inflight():
             end_feeder()
         started_ns = time.perf_counter_ns()
         self._direct_start_load_started_ns = started_ns
@@ -897,6 +916,17 @@ class WorkerImpl:
             try:
                 if self._read_plan.failed is not None and not direct:
                     raise self._read_plan.failed
+                pending_before_wait = False
+                if direct:
+                    ready_before_wait = getattr(
+                        self._read_plan, "fence_event", lambda _cb: None
+                    )(callback)
+                    pending_before_wait = ready_before_wait is None
+                    if ready_before_wait is not None:
+                        try:
+                            pending_before_wait = not bool(ready_before_wait.query())
+                        except Exception:
+                            pending_before_wait = True
                 fence_event = (
                     self._read_plan.wait_layer(callback, idx)
                     if direct else self._read_plan.wait_layer(callback)
@@ -905,6 +935,18 @@ class WorkerImpl:
                     raise RuntimeError(
                         "read plan did not provide a CUDA fence event"
                     )
+                if direct:
+                    observe = getattr(self._read_plan, "observe_compute_callback", None)
+                    if callable(observe):
+                        observe(callback, pending_before_wait)
+                wait_start = wait_end = None
+                if direct and self._profile_enabled:
+                    try:
+                        wait_start = torch.cuda.Event(enable_timing=True)
+                        wait_end = torch.cuda.Event(enable_timing=True)
+                        wait_start.record()
+                    except Exception:
+                        wait_start = wait_end = None
                 store = getattr(self._engine, "_store", None)
                 wait_compute = getattr(store, "wait_compute_event", None)
                 if not callable(wait_compute):
@@ -920,6 +962,14 @@ class WorkerImpl:
                 if not (callable(enqueue_wait) and layer_completion is not None
                         and enqueue_wait([layer_completion])):
                     wait_compute(fence_event)
+                if wait_start is not None:
+                    try:
+                        wait_end.record()
+                        record_wait = getattr(self._read_plan, "record_compute_wait", None)
+                        if callable(record_wait):
+                            record_wait(callback, wait_start, wait_end)
+                    except Exception:
+                        pass
                 self._load_waited_callbacks.add(callback)
             except LoadGateError as exc:
                 self._mark_load_failure(exc)
@@ -1124,10 +1174,6 @@ class WorkerImpl:
             return
         self._ensure_bound()
         callback, idx = self._resolve_callback(layer_name)
-        if callback == len(self._callback_to_physical) - 1:
-            end_feeder = getattr(self._engine, "end_prefill_feeder", None)
-            if callable(end_feeder):
-                end_feeder()
         self._diag_callback("save", layer_name, callback, idx)
         if self._load_failed:
             return
@@ -1157,17 +1203,10 @@ class WorkerImpl:
         self._save_inflight.append(handle)
 
     def _defer_write_stream_behind_reads(self) -> None:
-        """把写流排到"最新已提交的读层"之后（设备侧等待，主机不阻塞）。
-
-        NVMe 读写混跑会互相拖慢：同一 rank 实测读 kernel +52%
-        （2.08→3.16ms）、写 +31%（0.71→0.93ms）。写批仍按原来的节奏下发，但在
-        写流上插入一次 ``wait_event(读层 fence)``——读与写的顺序由设备侧保证，
-        Python 不做任何缓冲/轮询。
-
-        feeder 会把全部读层在请求开头提交完，因此随着它推进，每层写批都比
-        "当时最新的读层"更晚开始；最后一层读提交后，这个等待就等价于
-        "写全部排在读之后"。
-        """
+        """同步兼容后端等待已知读fence；队列写由完整前台读gate放行。"""
+        backend = getattr(getattr(self._engine, "_transfer", None), "_backend", None)
+        if callable(getattr(backend, "try_put_paged_batch", None)):
+            return
         store = getattr(self._engine, "_store", None)
         if store is None or not getattr(
                 store, "defer_writes_after_reads", False):
@@ -1186,9 +1225,9 @@ class WorkerImpl:
 
     def wait_for_save(self) -> None:
         """等待全部写入完成并结算。"""
-        end_feeder = getattr(self._engine, "end_prefill_feeder", None)
-        if callable(end_feeder):
-            end_feeder()
+        finish_feeder = getattr(self._engine, "finish_prefill_feeder", None)
+        if callable(finish_feeder) and not self._async_prefetch_inflight():
+            finish_feeder()
         self._end_step_timing()
         first_error = self._save_error
         if self._save_keys and getattr(self._engine, "_config", {}).get("kv_layer_page_bytes"):
@@ -1197,14 +1236,14 @@ class WorkerImpl:
             if missing and first_error is None:
                 first_error = RuntimeError(f"layerwise KV save omitted callbacks {sorted(missing)}")
         drained = False
-        # Direct reads are fully pre-enqueued by start_load; staged
-        # reads/scatter follow their existing plan.  Drain before TP failure
-        # consensus so runtime/CQ errors cannot be mistaken for success.
+        # Settle foreground reads before TP failure consensus, but leave queued
+        # writes for the success drain or the failure abort that follows it.
         if self._load_keys:
             require_complete = getattr(
                 self._read_plan, "require_complete", None
             )
-            if bool(getattr(self._engine, "direct", False)) and callable(
+            direct = bool(getattr(self._engine, "direct", False))
+            if direct and callable(
                     require_complete):
                 try:
                     require_complete()
@@ -1216,12 +1255,38 @@ class WorkerImpl:
                     self._read_timing.append((len(self._load_keys), self._read_plan))
                     del self._read_timing[:-_SAMPLE_LIMIT]
             try:
-                self._engine.wait_idle()
-                drained = True
+                wait_reads_idle = getattr(self._engine, "wait_reads_idle", None)
+                if direct and callable(wait_reads_idle):
+                    wait_reads_idle()
+                else:
+                    self._engine.wait_idle()
+                    drained = True
             except Exception as exc:
                 first_error = exc
                 self._mark_load_failure(exc)
-                drained = True
+            if direct and self._read_plan is not None:
+                started_ns = self._direct_start_load_started_ns
+                if started_ns is not None:
+                    self._read_plan._profile_wall_ms = max(
+                        0.0, (time.perf_counter_ns() - started_ns) / 1e6
+                    )
+                capture = getattr(self._read_plan, "_capture_read_tail", None)
+                if callable(capture):
+                    capture()
+                tail_ms = getattr(self._read_plan, "_read_tail_ms", None)
+                profile = getattr(self._read_plan, "compute_wait_profile", lambda: None)()
+                if (tail_ms and profile is not None and
+                        not getattr(self._read_plan, "_profile_recorded", False)):
+                    layers = int(getattr(self._read_plan, "layer_count", self._num_layers))
+                    overlap_ratio, exposed_wait_ms = profile
+                    self._record_profile(
+                        mode=0, chunks=len(self._load_keys), layers=layers,
+                        io_ms=float(tail_ms),
+                        wall_ms=float(getattr(self._read_plan, "_profile_wall_ms", tail_ms)),
+                        queue_ms=0.0, overlap_ratio=float(overlap_ratio),
+                        exposed_wait_ms=float(exposed_wait_ms),
+                    )
+                    self._read_plan._profile_recorded = True
         consensus = self._synchronize_load_failure()
         if consensus.failed:
             self._load_failed = True
@@ -1339,11 +1404,11 @@ class WorkerImpl:
         self._failure_consensus = consensus
         if consensus.failed:
             self._install_logical_failures(consensus.logical_failures)
-        _LOG.warning(
+        log = _LOG.warning if consensus.failed else _LOG.debug
+        log(
             "TP_LOAD_FAILURE_COLLECTIVE generation=%d local_failed=%s "
             "global_failed=%s generation_consistent=%s logical_failures=%s "
-            "local_blocks=%s "
-            "latency_ms=%.3f",
+            "local_blocks=%s latency_ms=%.3f",
             self._load_generation, self._load_failed, consensus.failed,
             consensus.generation_consistent,
             consensus.logical_failures, sorted(self._load_error_blocks),
@@ -1373,13 +1438,22 @@ class WorkerImpl:
         get_block_ids_with_load_errors 里——它紧随本调用，两者同步交出。
         已终止的请求若还在排队，直接不读了：vLLM 只等它的完成回报来释放块。
         """
+        finish_feeder = getattr(self._engine, "finish_prefill_feeder", None)
+        if callable(finish_feeder) and not self._async_prefetch_inflight():
+            finish_feeder()
         finished = set(finished_req_ids or ())
+        for batch in ([self._async_active] if self._async_active is not None else []) + self._async_pending:
+            if batch.loads and all(load.req_id in finished for load in batch.loads):
+                cancel = getattr(batch.plan, "cancel", None)
+                if callable(cancel):
+                    cancel()
         if finished and self._async_queue:
             keep = []
             for load in self._async_queue:
                 if load.req_id in finished:
                     self._release_async_load(load)
                     self._async_finished.add(load.req_id)
+                    self._prefetch_stats[3] += 1
                 else:
                     keep.append(load)
             self._async_queue = keep
@@ -1413,8 +1487,14 @@ class WorkerImpl:
             self._abort_step()
         finally:
             self._engine.close()
+            for batch in ([self._async_active] if self._async_active is not None else []) + self._async_pending:
+                for load in batch.loads:
+                    self._release_async_load(load)
+            for load in self._async_queue:
+                self._release_async_load(load)
             self._async_queue = []
             self._async_active = None
+            self._async_pending = []
 
     def abort(self) -> None:
         """请求失败收尾：drain 双 bank、回滚写计划并释放读 pin。"""
@@ -1467,11 +1547,18 @@ class WorkerImpl:
 
     def build_connector_worker_meta(self):
         """交出本步索引增量（vLLM 每步调用一次，调用即清空）。"""
+        # vLLM can keep a request parked without invoking start_load_kv or
+        # get_finished again.  Poll detached plans from the per-step metadata
+        # heartbeat so a resident feeder can publish completion across those
+        # scheduler steps.
+        self._poll_async_loads()
         self._settle_unreported_plans()
         self._harvest_read_timing()
         if (not self._store_committed and not self._store_failed
                 and not self._index_forgotten and not self._index_evicted
-                and not self._read_samples and not self._step_samples):
+                and not self._read_samples and not self._step_samples
+                and not self._profile_samples and not any(self._prefetch_stats)
+                and not self._prefetch_wait_ms):
             self._committed_this_step.clear()
             return None
         meta = TuttiWorkerMetadata(
@@ -1481,6 +1568,9 @@ class WorkerImpl:
             evicted=set(self._index_evicted),
             read_samples=list(self._read_samples),
             step_samples=list(self._step_samples),
+            profile_samples=list(self._profile_samples),
+            prefetch_stats=tuple(self._prefetch_stats),
+            prefetch_wait_ms=list(self._prefetch_wait_ms),
         )
         self._store_committed = {}
         self._store_failed = set()
@@ -1489,7 +1579,28 @@ class WorkerImpl:
         self._index_evicted = set()
         self._read_samples = []
         self._step_samples = []
+        self._profile_samples = []
+        self._prefetch_stats = [0, 0, 0, 0]
+        self._prefetch_wait_ms = []
         return meta
+
+    def _record_profile(self, *, mode: int, chunks: int, layers: int,
+                        io_ms: float, wall_ms: float, queue_ms: float,
+                        overlap_ratio: float, exposed_wait_ms: float = -1.0) -> None:
+        """Store a bounded rank-local transfer sample for health aggregation."""
+        if chunks <= 0 or layers <= 0 or io_ms <= 0 or wall_ms <= 0:
+            return
+        segment = getattr(self._engine, "_segment_bytes", None)
+        if not isinstance(segment, int) or segment <= 0:
+            return
+        self._profile_samples.append((
+            int(mode), int(chunks), int(layers), int(chunks) * int(layers),
+            float(io_ms), float(wall_ms), max(0.0, float(queue_ms)),
+            int(chunks) * int(layers) * segment, float(overlap_ratio),
+            float(exposed_wait_ms),
+        ))
+        if len(self._profile_samples) > _SAMPLE_LIMIT:
+            del self._profile_samples[:-_SAMPLE_LIMIT]
 
     # ---- 异步加载 ----
 
@@ -1499,6 +1610,8 @@ class WorkerImpl:
         queued = list(self._async_queue)
         if self._async_active is not None:
             queued.extend(self._async_active.loads)
+        for batch in self._async_pending:
+            queued.extend(batch.loads)
         if req_id in self._async_finished or any(load.req_id == req_id for load in queued):
             return
         first_chunk, n_chunks = _load_chunk_span(
@@ -1526,60 +1639,138 @@ class WorkerImpl:
             req_id=req_id,
             keys=tuple(req_keys),
             block_tables=tuple(tuple(table) for table in tables),
+            enqueued_ns=time.perf_counter_ns(),
         ))
+        self._prefetch_stats[0] += 1
         _LOG.debug("ASYNC_LOAD_QUEUED req=%s chunks=%d", req_id, n_chunks)
 
     def _kick_async_loads(self) -> None:
-        """按请求FIFO开启跨步层计划，不把后来的等待请求合进超大后台批。
-
-        计划每次只保留一个后台实体在途，提交前重新检查前台IO优先条件。
-        """
-        if self._async_active is not None or not self._async_queue:
+        """预先把等待请求入队；常驻服务控制实际后台提交。"""
+        # Async loads may be the only work in a scheduler step: the request is
+        # parked in WAITING_FOR_REMOTE_KVS, so vLLM does not open the ordinary
+        # prefill feeder for this step.  Open a private feeder window for the
+        # detached read; otherwise the read service correctly (but forever)
+        # waits for a foreground compute callback that cannot arrive.
+        if self._async_queue:
+            begin_feeder = getattr(self._engine, "begin_prefill_feeder", None)
+            feeder_open = bool(getattr(self._engine, "_prefill_feeder_open", False))
+            # A previous foreground step may leave the feeder open with a
+            # completed compute fence. Reusing that epoch would make a parked
+            # detached plan wait forever, because the old fence forbids
+            # submissions after compute completion. Start a fresh detached
+            # epoch once that fence has settled; keep the current epoch while
+            # foreground compute is still in flight.
+            compute_done = getattr(self._engine, "_prefill_compute_done", None)
+            old_compute_done = False
+            if feeder_open and compute_done is not None:
+                query = getattr(compute_done, "query", None)
+                try:
+                    old_compute_done = callable(query) and bool(query())
+                except Exception:
+                    old_compute_done = False
+            if callable(begin_feeder) and (not feeder_open or old_compute_done):
+                begin_feeder(True)
+                advance_feeder = getattr(self._engine, "advance_prefill_feeder", None)
+                if callable(advance_feeder):
+                    advance_feeder(0)
+        persistent = bool(getattr(self._engine, "direct", False))
+        if not persistent and (
+                self._async_active is not None
+                or not getattr(self._engine, "_prefill_feeder_open", False)):
             return
-        if not getattr(self._engine, "_prefill_feeder_open", False):
-            return
-        loads = [self._async_queue.pop(0)]
-        keys = [key for load in loads for key in load.keys]
-        tables = [list(table) for load in loads for table in load.block_tables]
-        layers = self._callback_to_physical or tuple(range(self._num_layers))
-        queued_ns = time.perf_counter_ns()
-        try:
-            with nvtx_range(
-                f"tutti.request.load_async|requests={len(loads)}|chunks={len(keys)}"
-            ):
-                plan = self._engine.start_async_read_plan(keys, tables, layers)
-        except Exception as exc:
-            _LOG.error("ASYNC_LOAD_START_FAILED requests=%d chunks=%d: %s",
-                       len(loads), len(keys), exc)
-            self._finish_async_loads(loads, ok=False)
-            return
-        self._async_active = _AsyncBatch(
-            loads=loads, plan=plan, chunks=len(keys), queued_ns=queued_ns
-        )
+        chunk_limit = max(1, int(self._max_chunks_per_wave or 1))
+        while self._async_queue:
+            # Merge FIFO requests while keeping each detached plan within the
+            # configured direct-read wave budget. A single oversized request
+            # remains intact and gets its own plan.
+            loads = []
+            chunks = 0
+            for candidate in self._async_queue:
+                candidate_chunks = len(candidate.keys)
+                if loads and chunks + candidate_chunks > chunk_limit:
+                    break
+                loads.append(candidate)
+                chunks += candidate_chunks
+                if chunks >= chunk_limit:
+                    break
+            del self._async_queue[:len(loads)]
+            keys = [key for load in loads for key in load.keys]
+            tables = [list(table) for load in loads for table in load.block_tables]
+            layers = self._callback_to_physical or tuple(range(self._num_layers))
+            queued_ns = time.perf_counter_ns()
+            try:
+                with nvtx_range(
+                    f"tutti.request.load_async|requests={len(loads)}|chunks={len(keys)}"
+                ):
+                    plan = self._engine.start_async_read_plan(keys, tables, layers)
+            except Exception as exc:
+                _LOG.error("ASYNC_LOAD_START_FAILED requests=%d chunks=%d: %s",
+                           len(loads), len(keys), exc)
+                self._finish_async_loads(loads, ok=False)
+                continue
+            batch = _AsyncBatch(
+                loads=loads, plan=plan, chunks=len(keys), queued_ns=queued_ns
+            )
+            self._prefetch_stats[1] += len(loads)
+            if self._async_active is None:
+                self._async_active = batch
+            else:
+                self._async_pending.append(batch)
+            if not persistent:
+                break
 
     def _poll_async_loads(self) -> None:
-        """只结算已接受的 IO；新任务只能由 prefill feeder 启动。"""
-        batch = self._async_active
-        if batch is None:
-            return
-        state = batch.plan.poll()
-        if state is None:
-            return
-        self._async_active = None
-        ok = bool(state)
-        read_ms = batch.plan.read_ms()
-        wall_ms = (time.perf_counter_ns() - batch.queued_ns) / 1e6
-        if ok and read_ms:
-            self._add_sample(self._read_samples, batch.chunks, read_ms)
-        log = _LOG.info if ok else _LOG.error
-        log(
-            "DIRECT_ASYNC_READ_DONE ok=%s requests=%d chunks=%d read_ms=%s "
-            "wall_ms=%.1f error=%s",
-            ok, len(batch.loads), batch.chunks,
-            f"{read_ms:.1f}" if read_ms else "n/a", wall_ms,
-            getattr(batch.plan, "failure", None),
-        )
-        self._finish_async_loads(batch.loads, ok=ok)
+        """只交出已安全结算的计划，不在调度轮询中提交 IO。"""
+        batches = ([self._async_active] if self._async_active is not None else [])
+        batches.extend(self._async_pending)
+        remaining = []
+        for batch in batches:
+            state = batch.plan.poll()
+            if state is None:
+                remaining.append(batch)
+                continue
+            ok = bool(state)
+            read_ms = batch.plan.read_ms()
+            wall_ms = (time.perf_counter_ns() - batch.queued_ns) / 1e6
+            if ok and read_ms:
+                self._add_sample(self._read_samples, batch.chunks, read_ms)
+            layers = len(getattr(batch.plan, "physical_layers", ())) or self._num_layers
+            first_queued_ns = min(
+                (load.enqueued_ns for load in batch.loads if load.enqueued_ns),
+                default=batch.queued_ns,
+            )
+            queue_ms = max(0.0, (batch.queued_ns - first_queued_ns) / 1e6)
+            self._record_profile(
+                mode=1, chunks=batch.chunks, layers=layers,
+                io_ms=float(read_ms or 0.0), wall_ms=wall_ms,
+                queue_ms=queue_ms, overlap_ratio=-1.0,
+                exposed_wait_ms=-1.0,
+            )
+            log = _LOG.info if ok else _LOG.error
+            log(
+                "DIRECT_ASYNC_READ_DONE ok=%s requests=%d chunks=%d read_ms=%s "
+                "wall_ms=%.1f io_gbps=%s error=%s",
+                ok, len(batch.loads), batch.chunks,
+                f"{read_ms:.1f}" if read_ms else "n/a", wall_ms,
+                self._format_io_gbps(
+                    batch.chunks,
+                    len(getattr(batch.plan, "physical_layers", ())) or self._num_layers,
+                    read_ms,
+                ),
+                getattr(batch.plan, "failure", None),
+            )
+            self._finish_async_loads(batch.loads, ok=ok)
+            self._prefetch_stats[2 if ok else 3] += len(batch.loads)
+            completed_ns = time.perf_counter_ns()
+            for load in batch.loads:
+                if load.enqueued_ns:
+                    self._prefetch_wait_ms.append(
+                        max(0.0, (completed_ns - load.enqueued_ns) / 1e6)
+                    )
+            if len(self._prefetch_wait_ms) > _SAMPLE_LIMIT:
+                del self._prefetch_wait_ms[:-_SAMPLE_LIMIT]
+        self._async_active = remaining[0] if remaining else None
+        self._async_pending = remaining[1:]
 
     def _finish_async_loads(self, loads, ok: bool) -> None:
         for load in loads:
@@ -1627,7 +1818,27 @@ class WorkerImpl:
                 capture()
             tail_ms = getattr(plan, "_read_tail_ms", None)
             if tail_ms:
+                if getattr(plan, "_profile_recorded", False):
+                    continue
+                profile = getattr(plan, "compute_wait_profile", lambda: (0.0, 0.0))()
+                if profile is None:
+                    pending.append((chunks, plan))
+                    continue
+                overlap_ratio, exposed_wait_ms = profile
                 self._add_sample(self._read_samples, chunks, tail_ms)
+                layers = int(getattr(plan, "layer_count", self._num_layers))
+                self._record_profile(
+                    mode=0, chunks=chunks, layers=layers,
+                    io_ms=float(tail_ms),
+                    wall_ms=float(getattr(plan, "_profile_wall_ms", tail_ms)),
+                    queue_ms=0.0,
+                    overlap_ratio=overlap_ratio,
+                    exposed_wait_ms=(
+                        float(exposed_wait_ms)
+                        if exposed_wait_ms is not None else -1.0
+                    ),
+                )
+                plan._profile_recorded = True
             elif callable(capture):
                 pending.append((chunks, plan))
         self._read_timing = pending
@@ -1638,6 +1849,13 @@ class WorkerImpl:
             samples.append((int(x), float(ms)))
             if len(samples) > _SAMPLE_LIMIT:
                 del samples[:-_SAMPLE_LIMIT]
+
+    def _format_io_gbps(self, chunks: int, layers: int, ms: float | None) -> str:
+        """Format direct-read throughput without affecting the read path."""
+        segment = getattr(self._engine, "_segment_bytes", None)
+        if not isinstance(segment, int) or segment <= 0 or not ms or ms <= 0:
+            return "n/a"
+        return f"{chunks * layers * segment / (float(ms) * 1_000_000.0):.3f}"
 
     def _start_step_timing(self, had_sync_read: bool) -> None:
         """在计算流上记本步起点（GPU 时间），供 compute_ms(tokens) 拟合。

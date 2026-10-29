@@ -1,4 +1,4 @@
-"""Per-request choice between synchronous and asynchronous KV loads.
+"""Per-request choice between asynchronous and synchronous KV loads.
 
 Synchronous (``get_num_new_matched_tokens`` returns ``False``): the request
 computes in the same step as its read; per-layer fences let layer L's
@@ -12,7 +12,8 @@ the request is scheduled after every TP rank has reported the read done. It
 gives up its own read/compute overlap, waits for an extra scheduling round,
 and holds its blocks for the whole read without computing on them.
 
-Sync is the default. A load goes async only if all of these hold:
+Async is the default. Deployments can explicitly select ``sync`` or ``auto``
+when they need the old cost-gated behavior:
 
 1. **Other requests are computing.** Otherwise nobody gains from async.
 2. **Memory.** Blocks held by async loads (this one included) stay within
@@ -30,7 +31,8 @@ Sync is the default. A load goes async only if all of these hold:
 ``R = r * chunks``, ``C = c * tokens``, ``S``: EWMAs of measured read time
 per chunk, compute time per token (prefill-sized steps) and step time (steps
 without synchronous reads). Model, GPU, disks and TP enter only through these
-measurements. Until ``r`` and ``c`` are measured every load stays synchronous.
+measurements. In ``auto`` mode, until ``r`` and ``c`` are measured every load
+stays synchronous.
 """
 
 from __future__ import annotations
@@ -50,8 +52,8 @@ _PREFILL_SAMPLE_TOKENS = 512
 
 
 def resolve_load_mode(extra: dict) -> str:
-    """``TUTTI_LOAD_MODE`` env > ``load_mode`` extra config > ``auto``."""
-    raw = os.environ.get(MODE_ENV) or extra.get("load_mode") or "auto"
+    """``TUTTI_LOAD_MODE`` env > ``load_mode`` extra config > ``async``."""
+    raw = os.environ.get(MODE_ENV) or extra.get("load_mode") or "async"
     mode = str(raw).strip().lower()
     if mode not in MODES:
         raise ValueError(f"load_mode must be one of {MODES}, got {raw!r}")
@@ -135,8 +137,21 @@ class LoadModePolicy:
         step = self._step_ms.value or 0.0
         read_ms = r * chunks if r is not None else 0.0
         compute_ms = c * tokens if c is not None else 0.0
-        if self.mode != "auto":
-            is_async, reason = self.mode == "async", f"mode={self.mode}"
+        if self.mode == "async":
+            # A parked request cannot drive the detached feeder by itself.
+            # Keep the layerwise foreground path for the only live request;
+            # detached prefetch is enabled when another request can keep the
+            # scheduler/worker heartbeat active.  Retaining its blocks still
+            # obeys the HBM admission guard.
+            if others <= 0:
+                is_async, reason = False, "alone"
+            elif free_blocks is None or held_blocks + need_blocks > (
+                    self.free_ratio * (max(0, free_blocks) + held_blocks)):
+                is_async, reason = False, "memory"
+            else:
+                is_async, reason = True, "mode=async"
+        elif self.mode == "sync":
+            is_async, reason = False, "mode=sync"
         elif others <= 0:
             is_async, reason = False, "alone"
         elif r is None or c is None:

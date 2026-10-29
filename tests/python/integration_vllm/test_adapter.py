@@ -439,6 +439,24 @@ class TestGeometryResolution:
         with pytest.raises(ValueError, match="enforce_eager"):
             TuttiConnectorV1(cfg, KVConnectorRole.SCHEDULER, kv_cfg)
 
+    def test_layerwise_compile_without_graph_reaches_scheduler_factory(self, monkeypatch):
+        names = ["main", "index"]
+        spec = SimpleNamespace(block_size=BLOCK_SIZE, kv_cache_specs={
+            "main": SimpleNamespace(page_size_bytes=SEG), "index": SimpleNamespace(page_size_bytes=2 * SEG)})
+        kv_cfg = SimpleNamespace(kv_cache_groups=[SimpleNamespace(layer_names=names, kv_cache_spec=spec)])
+        cfg = _make_vllm_config({"chunk_tokens": 2 * BLOCK_SIZE, "num_layers": 2,
+                                "chunk_kv_bytes": 8 * SEG})
+        cfg.model_config = SimpleNamespace(enforce_eager=False)
+        cfg.compilation_config = SimpleNamespace(mode=3, cudagraph_mode=SimpleNamespace(name="NONE"))
+        monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "0")
+        marker = RuntimeError("scheduler factory reached")
+        def factory(*args):
+            raise marker
+        monkeypatch.setattr("tutti.integration.vllm.connector.scheduler_index_for", factory)
+        with pytest.raises(RuntimeError) as failure:
+            TuttiConnectorV1(cfg, KVConnectorRole.SCHEDULER, kv_cfg)
+        assert failure.value is marker
+
 
 class TestSchedulerSide:
     def test_matched_tokens_empty_store(self):
@@ -889,6 +907,13 @@ class TestLoadSemantics:
         keys = self._prefill_save(h, prompt, blocks)
 
         req2 = _fake_request("r2", prompt, num_computed_tokens=0)
+        # Detached prefetch is exercised while another request keeps the
+        # scheduler heartbeat active; a sole parked request uses layerwise
+        # foreground loading by policy.
+        h.scheduler._live_requests["compute"] = _fake_request(
+            "compute", [99] * CHUNK_TOKENS, num_computed_tokens=CHUNK_TOKENS
+        )
+        h.scheduler._total_blocks = 1000
         matched, is_async = h.scheduler.get_num_new_matched_tokens(req2, 0)
         assert matched == 3 * CHUNK_TOKENS and is_async is True
         block_holder = SimpleNamespace(get_block_ids=lambda: ([10, 11],))
@@ -905,13 +930,16 @@ class TestLoadSemantics:
         impl = h.worker._impl
         assert impl._load_keys == []          # 不进本步同步读
         assert impl._external_load_step is False
-        assert h.worker.get_finished(set())[1] == set()
-        assert impl._async_active is None
-        h.engine.begin_prefill_feeder(True)
-        for callback, name in enumerate(h.layer_names):
-            h.engine.advance_prefill_feeder(callback)
-            h.worker.wait_for_layer_load(name)
+        # Detached plans may finish immediately on the in-memory test store;
+        # real NVMe plans normally remain in flight until the feeder advances.
         _, recving = h.worker.get_finished(set())
+        if not recving:
+            assert impl._async_active is None
+            h.engine.begin_prefill_feeder(True)
+            for callback, name in enumerate(h.layer_names):
+                h.engine.advance_prefill_feeder(callback)
+                h.worker.wait_for_layer_load(name)
+            _, recving = h.worker.get_finished(set())
         assert recving == {"r2"}
         assert h.worker.get_block_ids_with_load_errors() == set()
         for i, key in enumerate(keys[:3]):
@@ -922,6 +950,24 @@ class TestLoadSemantics:
             SimpleNamespace(finished_recving={"r2"}, kv_connector_worker_meta=None)
         )
         assert not h.scheduler._async_outstanding
+
+    def test_profile_samples_are_returned_in_worker_metadata(self, monkeypatch):
+        h = _make_harness()
+        impl = h.worker._impl
+        monkeypatch.setattr(impl._engine, "_segment_bytes", SEG, raising=False)
+        impl._record_profile(
+            mode=1, chunks=2, layers=NUM_LAYERS, io_ms=4.0,
+            wall_ms=9.0, queue_ms=2.0, overlap_ratio=-1.0,
+        )
+        impl._prefetch_stats[:] = [1, 1, 1, 0]
+        impl._prefetch_wait_ms.append(9.0)
+        meta = impl.build_connector_worker_meta()
+        assert meta.profile_samples == [
+            (1, 2, NUM_LAYERS, 2 * NUM_LAYERS, 4.0, 9.0, 2.0,
+             2 * NUM_LAYERS * SEG, -1.0, -1.0)
+        ]
+        assert meta.prefetch_stats == (1, 1, 1, 0)
+        assert meta.prefetch_wait_ms == [9.0]
 
     def test_async_waiting_requests_keep_fifo_and_do_not_reload_on_repeated_metadata(self, monkeypatch):
         from tutti.integration.vllm.worker import _AsyncLoad
@@ -939,21 +985,78 @@ class TestLoadSemantics:
         monkeypatch.setattr(impl, "_release_async_load", lambda load: releases.append(load.req_id))
         impl._poll_async_loads()
         impl._kick_async_loads()
-        assert calls == []
-        impl._engine.begin_prefill_feeder(True)
-        impl._engine.advance_prefill_feeder(0)
-        impl._kick_async_loads()
-        assert calls == [((b"a" * 16,), [[10]])]
-        assert impl._async_queue == [second]
+        assert calls == [((b"a" * 16, b"b" * 16), [[10], [11]])]
+        assert impl._async_queue == []
         impl._enqueue_async_load(SimpleNamespace(req_id="first"))
-        assert calls == [((b"a" * 16,), [[10]])]
+        assert calls == [((b"a" * 16, b"b" * 16), [[10], [11]])]
         impl._async_finished.add("reported")
         impl._enqueue_async_load(SimpleNamespace(req_id="reported"))
         _, done = impl.get_finished({"second"})
-        assert done == {"second", "reported"}
+        assert done == {"reported"}
         assert impl._async_queue == []
-        assert releases == ["second"]
+        assert releases == []
+        assert impl._async_active.loads == [first, second]
+
+    def test_direct_waiting_plans_are_prepared_before_prefill_and_cancel_drains(self, monkeypatch):
+        from tutti.integration.vllm.worker import _AsyncLoad
+        h = _make_harness()
+        impl = h.worker._impl
+        first = _AsyncLoad("first", (b"a" * 16,), ((10,),))
+        second = _AsyncLoad("second", (b"b" * 16,), ((11,),))
+        impl._async_queue = [first, second]
+        plans, releases = [], []
+
+        class Plan:
+            state = None
+            failure = None
+
+            def poll(self):
+                return self.state
+
+            def read_ms(self):
+                return None
+
+            def cancel(self):
+                self.cancelled = True
+
+        def prepare(keys, tables, layers):
+            plan = Plan()
+            plans.append(plan)
+            return plan
+
+        monkeypatch.setattr(type(impl._engine), "direct", property(lambda self: True))
+        monkeypatch.setattr(impl._engine, "start_async_read_plan", prepare)
+        monkeypatch.setattr(impl, "_release_async_load", lambda load: releases.append(load.req_id))
+        impl._max_chunks_per_wave = 1
+        impl._kick_async_loads()
+        assert len(plans) == 2
+        assert impl._async_queue == []
         assert impl._async_active.loads == [first]
+        assert impl._async_pending[0].loads == [second]
+        impl._enqueue_async_load(SimpleNamespace(req_id="second"))
+        assert len(plans) == 2
+        assert impl.get_finished({"second"})[1] == set()
+        assert getattr(plans[1], "cancelled", False)
+        assert releases == []
+        plans[1].state = False
+        assert impl.get_finished(set())[1] == {"second"}
+        assert releases == ["second"]
+        assert impl.get_block_ids_with_load_errors() == {11}
+        assert impl._async_active.loads == [first]
+
+    def test_forward_tail_records_event_without_closing_on_last_layer(self, monkeypatch):
+        h = _make_harness()
+        impl = h.worker._impl
+        calls = []
+        monkeypatch.setattr(impl._engine, "finish_prefill_feeder", lambda: calls.append("finish"))
+        monkeypatch.setattr(impl._engine, "end_prefill_feeder", lambda: calls.append("close"))
+        impl._save_keys = []
+        impl.save_kv_layer(h.layer_names[-1])
+        assert calls == []
+        impl.wait_for_save()
+        assert calls == ["finish"]
+        impl.get_finished(set())
+        assert calls == ["finish", "finish"]
 
     def test_auto_load_mode_needs_running_batch_and_free_blocks(self, monkeypatch):
         """auto：只有它一个→同步；有别的请求在算且显存够→异步；池紧→同步。"""

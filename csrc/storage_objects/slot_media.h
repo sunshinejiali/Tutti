@@ -15,10 +15,10 @@
 // which is why every structure in this layer is sized in whole 4096-byte units
 // and why buffers come from posix_memalign rather than std::vector.
 //
-// This layer performs HOST-side metadata IO only: object headers, precreating
-// space, re-zeroing on reclaim. Payload IO is the caller's job via the
-// GPU-direct DataPath, using an ObjectPlacement. Keeping payload out of here is
-// what preserves the premise that KV data never passes through host memory.
+// This layer performs HOST-side metadata IO: object headers, precreating
+// space, re-zeroing on reclaim. Normal payload IO belongs to the GPU-direct
+// DataPath. Repairing an unpublished segment is the exception: it copies the
+// file's existing bytes to preserve data before the file is exposed to DMA.
 
 #include <cstddef>
 #include <cstdint>
@@ -64,11 +64,14 @@ private:
 // materialise_segment_file creates `path` at exactly `file_bytes` and writes
 // REAL ZEROS over it, fsyncs, verifies FIEMAP (no holes/unwritten extents, at
 // most 124 extents -- the resolver's limit) and then publishes `<path>.ready`
-// (file_bytes, st_dev, st_ino). Real zeros, not fallocate: the resolver
-// fail-closed rejects UNWRITTEN extents because DMA cannot target them.
+// (file_bytes, st_dev, st_ino). Preallocation only reserves space; real writes
+// must initialise it, because the resolver rejects UNWRITTEN extents.
 // Creation is serialised per mount (flock on <mount>/.tutti_segment_precreate.lock):
 // concurrent large allocations on ext4 fragment far beyond the extent limit.
 // Idempotent: a ready file is left alone.
+// A file missing its ready marker is verified in place first. Invalid layouts
+// are copied byte-for-byte into a preallocated temporary file and atomically
+// replaced only after verification, preserving data if publication crashed.
 Status materialise_segment_file(const std::string& path, std::uint64_t file_bytes);
 
 // Probe only (never creates): *out = true iff `path` is `file_bytes` long and

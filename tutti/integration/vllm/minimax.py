@@ -1,4 +1,30 @@
-"""MiniMax M3 eager attention callbacks, installed without patching vLLM."""
+"""MiniMax M3 runtime KV callbacks with optional compiled projections."""
+
+
+class _CompiledForward:
+    def __init__(self, layer, name):
+        import logging
+        import torch
+        from torch._dynamo.backends.registry import lookup_backend
+
+        self.layer = layer
+        self.original = layer.forward
+        self.name = name
+        inductor = lookup_backend("inductor")
+        def backend(graph, inputs):
+            result = inductor(graph, inputs)
+            logging.getLogger(__name__).info(
+                "TUTTI_COMPILE_GRAPH layer=%s nodes=%d", name, len(list(graph.graph.nodes)))
+            return result
+        compiled = torch.compile(self.original, backend=backend, fullgraph=True, dynamic=True)
+        def forward(*args, **kwargs):
+            from vllm.compilation.wrapper import _compilation_context
+            with _compilation_context():
+                return compiled(*args, **kwargs)
+        layer.forward = forward
+
+    def remove(self):
+        self.layer.forward = self.original
 
 
 def install_cache_callbacks(vllm_config, connector, caches):
@@ -34,6 +60,10 @@ def install_cache_callbacks(vllm_config, connector, caches):
 
             handles.append(layer.register_forward_pre_hook(before))
             handles.append(layer.register_forward_hook(after))
+            if not getattr(getattr(vllm_config, "model_config", None), "enforce_eager", True):
+                for projection in ("qkv_proj", "o_proj"):
+                    handles.append(_CompiledForward(getattr(layer, projection),
+                                                    f"{names[-1]}.{projection}"))
     except Exception:
         for handle in handles:
             handle.remove()

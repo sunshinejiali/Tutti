@@ -153,3 +153,47 @@ def test_callback_hooks_wait_both_caches_then_save_both(monkeypatch):
     events.clear()
     module(torch.tensor(1))
     assert events == ["compute"]
+
+
+def test_compiled_projection_replay_preserves_runtime_kv_callbacks(monkeypatch):
+    import vllm.forward_context
+    from tutti.integration.vllm.minimax import install_cache_callbacks
+    from torch._dynamo.backends import registry
+    events, graphs = [], []
+    def backend(graph, inputs):
+        graphs.append(graph)
+        return graph.forward
+    monkeypatch.setattr(registry, "lookup_backend", lambda name: backend)
+    class Projection(torch.nn.Module):
+        def forward(self, x):
+            return x.sin() + 1
+    class Attention(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.indexer = SimpleNamespace(index_cache=SimpleNamespace(prefix="index"))
+            self.qkv_proj = Projection()
+            self.o_proj = Projection()
+        def forward(self, x):
+            return self.o_proj(self.qkv_proj(x))
+    module = Attention()
+    originals = (module.qkv_proj.forward, module.o_proj.forward)
+    connector = SimpleNamespace(_impl=SimpleNamespace(_kv_group_layer_names=("index", "main")),
+        has_connector_metadata=lambda: True,
+        wait_for_layer_load=lambda key: events.append(("wait", key)),
+        save_kv_layer=lambda key, tensor, meta: events.append(("save", key)))
+    config = SimpleNamespace(model_config=SimpleNamespace(enforce_eager=False),
+        compilation_config=SimpleNamespace(static_forward_context={"main": module}))
+    monkeypatch.setattr(vllm.forward_context, "get_forward_context", lambda: SimpleNamespace(attn_metadata={}))
+    handles = install_cache_callbacks(config, connector, {"index": object(), "main": object()})
+    try:
+        for size in (4, 7, 4):
+            value = torch.arange(size, dtype=torch.float32)
+            expected = (value.sin() + 1).sin() + 1
+            torch.testing.assert_close(module(value), expected)
+        assert graphs
+        assert events == [("wait", "index"), ("wait", "main"),
+                          ("save", "index"), ("save", "main")] * 3
+    finally:
+        for handle in handles:
+            handle.remove()
+    assert (module.qkv_proj.forward, module.o_proj.forward) == originals

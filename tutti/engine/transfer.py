@@ -76,6 +76,20 @@ class DirectTransfer:
                           target_plan=target_plan)
         return method(list(keys), layer_idx, list(block_tables))
 
+    def try_load_layer(self, keys, layer_idx: int, block_tables, target_plan=None):
+        method = getattr(self._backend, "try_get_paged_batch", None)
+        if not callable(method):
+            raise DirectTransferUnavailable("direct backend lacks nonblocking paged reads")
+        if target_plan is not None:
+            return method(list(keys), layer_idx, list(block_tables), target_plan=target_plan)
+        return method(list(keys), layer_idx, list(block_tables))
+
+    def try_store_layer(self, keys, layer_idx: int, block_tables):
+        method = getattr(self._backend, "try_put_paged_batch", None)
+        if not callable(method):
+            raise DirectTransferUnavailable("direct backend lacks nonblocking paged writes")
+        return method(list(keys), layer_idx, list(block_tables))
+
     def store_layer(self, keys, layer_idx: int, block_tables):
         method = getattr(self._backend, "put_paged_batch", None)
         if not callable(method):
